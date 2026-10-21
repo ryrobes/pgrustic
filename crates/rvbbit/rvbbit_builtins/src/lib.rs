@@ -6,7 +6,8 @@
 
 use datum::Datum;
 use rvbbit_oids::{
-    DUMP_NAME, DUMP_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID, RESTORE_NAME, RESTORE_OID,
+    DUMP_NAME, DUMP_OID, EXTRACT_NAME, EXTRACT_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID,
+    RESTORE_NAME, RESTORE_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -26,6 +27,31 @@ pub fn rvbbit_means(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgRes
     let oid = flinfo.as_ref().map(|f| f.fn_oid).unwrap_or(MEANS_OID);
     let matched = rvbbit_dispatch::means_oid(oid, &left, &right)?;
     Ok(Datum::from_bool(matched))
+}
+
+/// Text scalar for a semantic function whose SQL return type is `text`.
+/// Hutch parses the model output as JSON. One argument, exposed to the
+/// prompt as `{{input}}`. Callers cast to `jsonb` when they want a document.
+pub fn rvbbit_extract(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    if fcinfo.nargs() == 0 {
+        return Err(Box::new(types_error::PgError::error(
+            "rvbbit_extract requires the source text".to_string(),
+        )));
+    }
+    // SAFETY: strict, so argument 0 is non-null text. Extra arguments are
+    // appended so a multi-arg function still reaches the model.
+    let mut input = String::new();
+    for i in 0..fcinfo.nargs() {
+        let packed = unsafe { fcinfo.arg_varlena_packed(i)? };
+        if i > 0 {
+            input.push('\n');
+        }
+        input.push_str(&String::from_utf8_lossy(packed.data()));
+    }
+    let oid = flinfo.as_ref().map(|f| f.fn_oid).unwrap_or(EXTRACT_OID);
+    let text = rvbbit_dispatch::extract_text(oid, &input)?;
+    Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), text.as_bytes())?))
 }
 
 pub fn rvbbit_dump_sql(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
@@ -86,5 +112,13 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: true,
         retset: false,
         func: rvbbit_get_semfn_def as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: EXTRACT_OID,
+        name: EXTRACT_NAME,
+        nargs: 1,
+        strict: true,
+        retset: false,
+        func: rvbbit_extract as PGFunction,
     },
 ];

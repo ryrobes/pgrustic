@@ -7,8 +7,9 @@
 //! concurrency cap, taken from the catalog row (4 for the default mock).
 //!
 //! The wire format is `rvbbit-hutch-v1` (`rvbbit_contract`). MEANS posts
-//! `/v1/predict` with `X-Rvbbit-Cache: mode=off` and does not call
-//! `/v1/cache/lookup`, so a 10k batch stays one HTTP call per 32 rows.
+//! `/v1/predict` once per batch and does not call `/v1/cache/lookup`.
+//! The cache header mode comes from the catalog (`memoize` → `read-write`,
+//! `off` → `off`). A 10k batch stays one HTTP call per 32 rows.
 //! In-flight HTTP is not aborted; the wait returns at the next 20ms poll.
 
 use std::collections::HashMap;
@@ -159,12 +160,40 @@ pub fn submit(func_oid: u32, items: &[(String, String)]) -> PgResult<Ticket> {
         auth,
         &ep,
         body,
-        cache_header(CacheMode::Off, None, None),
+        cache_header(cache_mode_of(&ep), None, None),
     )
 }
 
-/// `POST /v1/cache/lookup`. Not used by MEANS; the hot path sends `mode=off`
-/// and lets hutch skip the cache. Exposed so the pool speaks the contract.
+/// One extract call. `input` is the first text argument (`{{input}}`).
+/// The catalog prompt and system text ride on the item. Not batched in SQL;
+/// hutch still accepts a multi-item body, which the tests use directly.
+pub fn extract_text(func_oid: u32, input: &str) -> PgResult<String> {
+    let ep = rvbbit_resolve::endpoint_for(func_oid);
+    let inputs = serde_json::json!({ "input": input });
+    let body = encode_items(&ep, Operation::Extract, &[inputs]).map_err(pg)?;
+    let auth = bearer(&ep).map_err(pg)?;
+    let ticket = enqueue(
+        format!("{}/v1/extract", ep.base_url.trim_end_matches('/')),
+        auth,
+        &ep,
+        body,
+        cache_header(cache_mode_of(&ep), None, None),
+    )?;
+    let raw = wait_raw(ticket)?;
+    decode_json_text(&raw.body).map_err(pg)
+}
+
+fn cache_mode_of(ep: &Endpoint) -> CacheMode {
+    match ep.cache_mode.as_str() {
+        "off" => CacheMode::Off,
+        "refresh" => CacheMode::Refresh,
+        _ => CacheMode::ReadWrite,
+    }
+}
+
+/// `POST /v1/cache/lookup`. Not used by MEANS. The hot path sends the
+/// catalog cache mode on the operation POST and does not add a lookup hop.
+/// Exposed so the pool speaks the contract.
 pub fn cache_lookup(base_url: &str, keys: &[String]) -> PgResult<CacheLookupResponse> {
     let ep = rvbbit_resolve::default_endpoint();
     let body = serde_json::to_string(&CacheLookupRequest { keys: keys.to_vec() })
@@ -244,9 +273,18 @@ fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
 }
 
 fn encode_predict(ep: &Endpoint, items: &[(String, String)]) -> Result<String, String> {
-    let mut req_items = Vec::with_capacity(items.len());
-    for (i, (input, criterion)) in items.iter().enumerate() {
-        let inputs = serde_json::json!({ "criterion": criterion, "input": input });
+    let inputs: Vec<serde_json::Value> = items
+        .iter()
+        .map(|(input, criterion)| serde_json::json!({ "criterion": criterion, "input": input }))
+        .collect();
+    encode_items(ep, Operation::Predict, &inputs)
+}
+
+fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value]) -> Result<String, String> {
+    let system = if ep.system_prompt.is_empty() { None } else { Some(ep.system_prompt.clone()) };
+    let prompt = if ep.user_prompt.is_empty() { None } else { Some(ep.user_prompt.clone()) };
+    let mut req_items = Vec::with_capacity(inputs.len());
+    for (i, inputs) in inputs.iter().enumerate() {
         let cache_key = client_cache_key_hex(&CacheKeyParts {
             fn_name: &ep.fn_name,
             fn_version: ep.fn_version,
@@ -258,26 +296,39 @@ fn encode_predict(ep: &Endpoint, items: &[(String, String)]) -> Result<String, S
             max_tokens: ep.max_tokens,
             take_index: 0,
             seed: "",
-            inputs: &inputs,
+            inputs,
         });
+        let criterion = inputs.get("criterion").and_then(|v| v.as_str()).map(|s| s.to_string());
         req_items.push(ItemRequest {
             key: i.to_string(),
             cache_key,
-            inputs,
-            criterion: Some(criterion.clone()),
-            system: None,
-            prompt: None,
+            inputs: inputs.clone(),
+            criterion,
+            system: system.clone(),
+            prompt: prompt.clone(),
         });
     }
     let req = BatchRequest {
         contract: CONTRACT_VERSION.to_string(),
-        operation: Operation::Predict,
+        operation,
         model: ep.model.clone(),
         temperature: ep.temperature,
         max_tokens: ep.max_tokens,
         items: req_items,
     };
     serde_json::to_string(&req).map_err(|e| format!("hutch encode: {e}"))
+}
+
+fn decode_json_text(text: &str) -> Result<String, String> {
+    let parsed: BatchResponse = serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let item = parsed.outputs.first().ok_or_else(|| "hutch extract returned no items".to_string())?;
+    if let Some(err) = &item.error {
+        return Err(format!("hutch item 0: {} {}", err.code, err.message));
+    }
+    match &item.value {
+        Some(value) => Ok(value.to_string()),
+        None => Err("hutch extract item has no value".into()),
+    }
 }
 
 fn empty_predict(ep: &Endpoint) -> String {

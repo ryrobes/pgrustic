@@ -27,6 +27,8 @@ pub struct Endpoint {
     pub system_prompt: String,
     pub user_prompt: String,
     pub return_type: String,
+    /// Catalog `cache_mode`: `memoize`, `refresh`, or `off`.
+    pub cache_mode: String,
 }
 
 #[derive(Clone, Debug)]
@@ -162,5 +164,7 @@ pub fn default_endpoint() -> Endpoint {
         system_prompt: String::new(),
         user_prompt: String::new(),
         return_type: "boolean".into(),
+        // Pre-catalog fallback. Catalog rows send their own mode.
+        cache_mode: "off".into(),
     }
 }

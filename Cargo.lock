@@ -17124,6 +17124,7 @@ dependencies = [
  "rvbbit_catalog",
  "rvbbit_dispatch",
  "rvbbit_oids",
+ "rvbbit_resolve",
  "types_error",
  "types_fmgr",
  "varlena",
@@ -17164,6 +17165,16 @@ dependencies = [
  "rvbbit_resolve",
  "serde_json",
  "types_error",
+ "ureq",
+]
+
+[[package]]
+name = "rvbbit_hutch_lite"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "rvbbit_contract",
+ "serde_json",
  "ureq",
 ]
 

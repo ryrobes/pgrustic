@@ -27,7 +27,7 @@ for the catalog). Plus dependency lines in the manifests below and
 | `crates/backend/executor/execmain/src/semantic.rs` | **New file in an upstream crate.** The batch loop has to call `exec_proc_node`, projection, and slots. Putting it in `execmain` avoids an `execmain` ↔ `rvbbit_exec` cycle. |
 | `crates/backend/commands/explain/src/node.rs` | A MEANS Result prints as `Semantic Filter`. Batch size and concurrency come from the catalog endpoint (32 and 4 after bootstrap). ANALYZE counters are unchanged. |
 | `crates/backend/utils/adt/ruleutils/src/lib.rs` | Deparse of oid 9020 still prints `rvbbit_means(...)` without a `pg_proc` lookup. A catalog oid deparses through the normal `pg_proc` path as `rvbbit.means(...)`. |
-| `crates/_support/seams_init/src/lib.rs` | Registers builtins 9020–9023, installs the catalog ensure/execute hooks, and starts the dispatch pool at server boot. |
+| `crates/_support/seams_init/src/lib.rs` | Registers builtins 9020–9024, installs the catalog ensure/execute hooks, and starts the dispatch pool at server boot. |
 | `crates/_support/types/nodes/src/parsenodes.rs` | `ObjectType::OBJECT_RVBBIT` is appended after `OBJECT_VIEW`. Existing discriminants, including `OBJECT_VIEW`, stay put. It is not a C object type (`objtype_from_i32` still stops at `OBJECT_VIEW`, and the nodes `check_enum` list is unchanged). |
 | `crates/backend/commands/seclabel/src/lib.rs` | Exhaustive `ObjectType` match: `OBJECT_RVBBIT` does not support security labels. |
 | `crates/backend/parser/parser_driver/src/lib.rs` | If a script contains rvbbit DDL, those statements become `DefineStmt` `OBJECT_RVBBIT`. Scripts with no rvbbit DDL are handed to gram.y unchanged. |
@@ -52,15 +52,16 @@ Manifests (dependency lines only):
 
 | Crate | Role |
 | --- | --- |
-| `crates/rvbbit/rvbbit_oids` | Builtin oids 9020–9023, default batch size 32, concurrency 4, pool size 8. |
+| `crates/rvbbit/rvbbit_oids` | Builtin oids 9020–9024, default batch size 32, concurrency 4, pool size 8. |
 | `crates/rvbbit/rvbbit_plan` | Walks the plan and lifts MEANS quals off base scans onto a Result. Cheap quals stay on the scan. |
 | `crates/rvbbit/rvbbit_dispatch` | Fixed OS thread pool, `ureq` (no tokio), bounded queue, cancel-aware wait. Each job carries the catalog backend URL, auth, timeout, and concurrency. |
-| `crates/rvbbit/rvbbit_builtins` | `rvbbit_means`, `rvbbit_dump_sql`, `rvbbit_restore_sql`, `rvbbit_get_semfn_def`. |
+| `crates/rvbbit/rvbbit_builtins` | `rvbbit_means`, `rvbbit_extract`, `rvbbit_dump_sql`, `rvbbit_restore_sql`, `rvbbit_get_semfn_def`. |
 | `crates/rvbbit/rvbbit_contract` | `rvbbit-hutch-v1` request and response types and cache key v1. No engine dependencies. |
 | `crates/rvbbit/rvbbit_parse` | Recursive descent for rvbbit DDL. Keywords exist only here. |
 | `crates/rvbbit/rvbbit_resolve` | Process-local catalog cache and the function pointers `seams_init` installs. Breaks the parser → SPI cycle. |
 | `crates/rvbbit/rvbbit_catalog` | Schema `rvbbit`, DDL, `pg_depend`, grants, comments, `dump_sql` / `restore_sql`. |
 | `crates/rvbbit/hutch_mock` | HTTP stand-in for `rvbbit-hutch-v1`. `POST /v1/means` is an alias of `/v1/predict` and accepts the batch body, not the spike's JSON array. |
+| `crates/rvbbit/rvbbit_hutch_lite` | Early real hutch. OpenAI-compatible chat (OpenRouter), in-memory cache, single-flight. `TAKES` / `PICK`, embed, rerank, and decide are stubbed. |
 | `crates/rvbbit/grammar/rvbbit.y` | Standalone bison grammar. Not linked into the engine. |
 
 ## Syntax
@@ -154,6 +155,13 @@ object-class properties.
 `rvbbit.dump_sql()` / `rvbbit.restore_sql(text)` are the supported dump
 round trip. Stock `pg_dump` does not emit this metadata.
 
-MEANS posts with `X-Rvbbit-Cache: mode=off` and does not call
-`/v1/cache/lookup`. Adding that hop would change the 313-call benchmark.
-The wire shapes are in `docs/rvbbit/HUTCH_CONTRACT.md`.
+MEANS posts the catalog `cache_mode` on the operation POST (`memoize`
+→ `mode=read-write`) and does not call `/v1/cache/lookup`. Adding that
+hop would change the 313-call benchmark. The mock ignores the header, so
+the benchmark count is unchanged. The pre-catalog fallback still sends
+`mode=off`. The wire shapes are in `docs/rvbbit/HUTCH_CONTRACT.md`.
+
+Hutch-lite (`crates/rvbbit/rvbbit_hutch_lite`) adds no `gram.y` splice and
+no new upstream file. The only engine edit for it is the `seams_init`
+comment that names builtin oid 9024 (`rvbbit_extract`). `TAKES` / `PICK`
+stay unimplemented in the parser until milestone M5.

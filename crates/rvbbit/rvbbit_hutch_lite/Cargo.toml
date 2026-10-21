@@ -1,0 +1,21 @@
+[package]
+name = "rvbbit_hutch_lite"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hutch_lite"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1"
+rvbbit_contract = { path = "../rvbbit_contract" }
+serde_json = "1"
+ureq = "2.12"
+
+[dev-dependencies]
+serde_json = "1"

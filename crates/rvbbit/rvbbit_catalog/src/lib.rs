@@ -122,16 +122,18 @@ fn bootstrap_means() -> PgResult<()> {
 
 fn reload() -> PgResult<()> {
     let rows = query(
-        "SELECT o.word, f.procoid::text, f.name, f.version::text, \
+        "SELECT COALESCE(o.word, f.name), f.procoid::text, f.name, f.version::text, \
                 COALESCE(f.system_prompt, ''), COALESCE(f.user_prompt, ''), f.rettype, \
                 COALESCE(f.temperature, 0)::text, f.max_tokens::text, \
                 COALESCE(m.remote_name, 'mock'), b.url, b.auth_env, \
                 COALESCE(b.batch_size, 32)::text, COALESCE(b.max_concurrent, 4)::text, \
-                COALESCE(b.timeout_ms, 30000)::text, COALESCE(b.retries, 5)::text \
-         FROM rvbbit.semop o \
-         JOIN rvbbit.semfn f ON f.name = o.func_name AND f.nsp = 'rvbbit' \
+                COALESCE(b.timeout_ms, 30000)::text, COALESCE(b.retries, 5)::text, \
+                COALESCE(f.cache_mode, 'memoize') \
+         FROM rvbbit.semfn f \
+         LEFT JOIN rvbbit.semop o ON o.func_name = f.name \
          LEFT JOIN rvbbit.model m ON m.name = f.model_name \
-         LEFT JOIN rvbbit.backend b ON b.oid = m.backend_oid",
+         LEFT JOIN rvbbit.backend b ON b.oid = m.backend_oid \
+         WHERE f.nsp = 'rvbbit'",
     )?;
     let mut entries = Vec::with_capacity(rows.len());
     for r in rows {
@@ -170,6 +172,10 @@ fn reload() -> PgResult<()> {
                 system_prompt: cell(&r, 4),
                 user_prompt: cell(&r, 5),
                 return_type: cell(&r, 6),
+                cache_mode: {
+                    let mode = cell(&r, 16);
+                    if mode.is_empty() { "memoize".into() } else { mode }
+                },
             },
         });
     }
@@ -835,9 +841,19 @@ fn create_proc(name: &str, args: &[Arg], returns: &str) -> PgResult<String> {
         .map(|a| format!("{} {}", qident(&a.name), a.typ))
         .collect::<Vec<_>>()
         .join(", ");
+    let prosrc = match returns.trim().to_ascii_lowercase().as_str() {
+        "boolean" | "bool" => "rvbbit_means",
+        // JSON is parsed by hutch and returned as text. Cast in SQL for jsonb.
+        "text" => "rvbbit_extract",
+        other => {
+            return Err(pg(format!(
+                "semantic function return type {other} is not supported yet; use boolean or text"
+            )))
+        }
+    };
     exec(&format!(
         "CREATE OR REPLACE FUNCTION rvbbit.{}({sig}) RETURNS {returns} \
-         LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_means'",
+         LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS '{prosrc}'",
         qident(name)
     ))?;
     scalar(&format!(

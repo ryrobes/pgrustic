@@ -24,10 +24,15 @@ Transport is plain HTTP. No HTTP/2 requirement, no tokio.
 | `X-Rvbbit-Cache` | `key=<hex>; ttl=<seconds>; mode=read-write\|refresh\|off`. `key` and `ttl` are omitted when absent. |
 
 `X-Rvbbit-Cache` mode applies to every item in the batch. Per-item keys
-are `items[].cache_key` in the body, not the header. pgrustic MEANS sends
-`mode=off` and does not set `key` or `ttl`. That is deliberate: a
-pre-flight `POST /v1/cache/lookup` would add a hop the 10k-row benchmark
-does not have.
+are `items[].cache_key` in the body, not the header. pgrustic sends the
+catalog `cache_mode` on that same operation POST and does not set `key`
+or `ttl`. `memoize` (the column default) is `mode=read-write`, `refresh`
+is `mode=refresh`, and `off` is `mode=off`. The pre-catalog fallback
+endpoint, used before any backend row exists, still sends `mode=off`.
+There is no pre-flight `POST /v1/cache/lookup`: that hop would change the
+10k-row benchmark. The mock ignores the header and counts every POST, so
+that benchmark's call count is unchanged. Hutch-lite honors the header
+inside the POST and does not call the provider again on a hit.
 
 A backend whose `auth_env` is set, and whose environment does not contain
 that variable (or contains an empty value), fails the statement before any
@@ -238,14 +243,51 @@ Resolution is operator → semantic function → model → backend.
 
 - URL: `{backend.url}/v1/predict` (trailing slash stripped)
 - model, temperature, max_tokens, function name, function version: the catalog row
-- cache header: `mode=off`
+- cache header: the catalog `cache_mode` (`memoize` → `mode=read-write`, `refresh` → `mode=refresh`, `off` → `mode=off`). The pre-catalog fallback sends `mode=off`
 - one item per distinct `(input, criterion)` pair in the batch
 - `inputs` object keys `input` and `criterion`
 - take index 0, empty seed
 - no call to `/v1/cache/lookup`
 
+A text semantic function posts the same header to `{backend.url}/v1/extract`,
+one HTTP call per row, with `inputs.input` set to the concatenated text
+arguments. Hutch returns JSON; the SQL function returns that JSON as
+`text`.
+
 A bool `value` of JSON `true`/`false` is the predicate result. A non-bool
 value fails the batch. Item errors fail the batch.
+
+## Hutch-lite
+
+`crates/rvbbit/rvbbit_hutch_lite` is an in-tree server that speaks this
+contract over plain HTTP and forwards `predict`, `extract`, and
+`classify` to an OpenAI-compatible chat endpoint (OpenRouter by default).
+It is not the private hutch. No JSON field was added.
+
+What it implements:
+
+- `POST /v1/predict` (and the `/v1/means` alias), `/v1/extract`, `/v1/classify`
+- batched items, per-item errors, siblings may succeed
+- in-memory cache. The storage key is `storage_key(client_key, tenant)` from `rvbbit_contract`. The client key already mixes operation identity (function name and version), template hash, model, temperature, max_tokens, take index, seed, and canonical inputs. Tenant is mixed only on the hutch side: blake3 hex of the bearer token, or `HUTCH_TENANT` (default `local`) when the request has no bearer
+- single-flight for concurrent misses of the same storage key
+- `POST /v1/cache/lookup`, `/put`, `/purge`, `/stats` in memory. Put is inline, not a background writer queue
+- `GET /stats` is lite instrumentation. It adds `provider_calls` and `requests` on top of the cache counters. `GET` or `POST /v1/cache/stats` stays the contract shape and does not include those two fields
+
+What it stubs:
+
+- `TAKES` / `PICK` have no route. The SQL parser still errors with “not implemented until milestone M5”. Take index on the wire is 0
+- `embed`, `rerank`, and `decide` return a per-item error `code=unsupported` and do not call the provider
+- a wrong or missing `X-Rvbbit-Contract` is accepted, same as the mock
+- client disconnect does not cancel an in-flight provider call
+- `POST /reset` clears the process cache. That route is for tests and the demo
+
+The upstream API key is `OPENROUTER_API_KEY`, read by hutch-lite and never
+logged. `OPENROUTER_BASE_URL` overrides the chat base (default
+`https://openrouter.ai/api/v1`); the call is `{base}/chat/completions`.
+`HUTCH_MODEL` (default `openai/gpt-4o-mini`) is used when the request
+model is empty or `mock`. Any other request model is sent through.
+`BACKEND AUTH ENV` is the bearer for hutch itself. Leave it null for
+hutch-lite; do not put the OpenRouter key there.
 
 ## What the real hutch has to change
 

@@ -12,6 +12,7 @@ datum = { path = "../../_support/types/datum" }
 rvbbit_catalog = { path = "../rvbbit_catalog" }
 rvbbit_dispatch = { path = "../rvbbit_dispatch" }
 rvbbit_oids = { path = "../rvbbit_oids" }
+rvbbit_resolve = { path = "../rvbbit_resolve" }
 types_error = { path = "../../_support/types/types_error" }
 types_fmgr = { path = "../../_support/types/fmgr" }
 varlena = { path = "../../backend/utils/adt/varlena" }
