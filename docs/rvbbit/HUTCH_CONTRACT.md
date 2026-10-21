@@ -266,7 +266,8 @@ the function name.
 
 A text function with `LABELS ('a', 'b', ...)` (at least two labels) is
 `rvbbit_classify` (oid 9026). It posts `/v1/classify` with `item.labels`
-set. The SQL result is JSON text `{"label","score","scores"}`. Text
+set. A label may carry a description: `LABELS ('bigfoot' AS 'an unidentified large primate or sasquatch', 'known animal')`.
+The SQL result is JSON text `{"label","score","scores"}`. Text
 without `LABELS` stays `rvbbit_extract` on `/v1/extract`.
 
 The client cache key is unchanged for functions with no labels. Dispatch
@@ -302,7 +303,7 @@ Decision calls:
 - URL: `OPENROUTER_DECISIONS_URL`, or derived from `OPENROUTER_BASE_URL`. A base ending in `/api/v1` (the OpenRouter default `https://openrouter.ai/api/v1`) becomes `{root}/api/alpha/decisions`. A base ending in `/v1` (the crate tests) becomes `{origin}/alpha/decisions`. Anything else is `{base}/alpha/decisions`
 - Model: empty or `mock` becomes `HUTCH_DECISION_MODEL` (default `typesafe/jev-1.14`). Any other slug, including `~typesafe/jev-latest`, is sent unchanged. Chat still uses `HUTCH_MODEL` (default `openai/gpt-4o-mini`) for extract and for classify with no labels
 - MEANS / decide: one `noul` question, id `matches`. State is `{text, criterion}`. `score` is the mean `noul` (0 to 1). The boolean is that mean compared with `HUTCH_DECISION_THRESHOLD` (default 0.5). Published noul answers have no separate confidence field; `noul` is the score
-- Fixed-label classify: one `choice` question, id `label`, criteria equal to the declared labels. `scores` is the probability map restricted to those labels. `score` is the winning label's probability. The published `choice` loses to argmax, and `confidence` is not that probability. `confidence` is copied onto the chosen label only when the map omits it
+- Fixed-label classify: one `choice` question, id `label`. `criteria` is an object of label to description. An array is HTTP 400. A label with no description uses `The text is best described as {label}.` SQL may set one with `LABELS ('bigfoot' AS 'an unidentified large primate or sasquatch', ...)`. `scores` is the probability map restricted to those labels. `score` is the winning label's probability. The published `choice` loses to argmax, and `confidence` is not that probability. `confidence` is copied onto the chosen label only when the map omits it
 - Stack: optional `decision.models`, `decision.takes` (default `HUTCH_DECISION_TAKES`, clamp 1..=8), `decision.combine` (`mean` or `vote`). SQL does not emit this. `TAKES` / `PICK` still fail in the parser until M5. The take index is in the memo key and is not sent. Temperature and `max_tokens` are not sent and are not part of the decision memo key
 - Vote: more yes-votes than no-votes, where a vote is `noul >= threshold`. A tie uses the mean. The reported score is still the mean
 - Cost, classify: one Decisions request per item per take per stacked model. Jev charges input tokens only (about $0.042 per million); output tokens are free. N labels do not multiply the request count, because `choice` returns every label's probability in that one call. A binary-only model would need N `noul` calls (one per label, one-vs-rest) and then argmax. That fallback is not implemented. Jev's `choice` question is multi-class

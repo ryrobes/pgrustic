@@ -227,6 +227,8 @@ pub struct FnClauses {
     pub version: Option<i64>,
     /// Fixed classify labels. Empty means extract (chat), not classify.
     pub labels: Vec<String>,
+    /// Parallel to [`Self::labels`]. `None` means the default description.
+    pub label_descriptions: Vec<Option<String>>,
 }
 
 impl Default for FnClauses {
@@ -241,6 +243,7 @@ impl Default for FnClauses {
             tests: Vec::new(),
             version: None,
             labels: Vec::new(),
+            label_descriptions: Vec::new(),
         }
     }
 }
@@ -820,13 +823,27 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw(Kw::Labels) {
                 self.expect_sym('(')?;
                 let mut labels = Vec::new();
+                let mut descriptions = Vec::new();
                 if !self.at_sym(')') {
                     loop {
                         let label = self.string()?;
                         if label.is_empty() {
                             return Err("classify label is empty".into());
                         }
+                        if labels.iter().any(|existing| existing == &label) {
+                            return Err(format!("classify label \"{label}\" is duplicated"));
+                        }
+                        let description = if self.eat_kw(Kw::As) {
+                            let text = self.string()?;
+                            if text.is_empty() {
+                                return Err("classify label description is empty".into());
+                            }
+                            Some(text)
+                        } else {
+                            None
+                        };
                         labels.push(label);
+                        descriptions.push(description);
                         if !self.eat_sym(',') {
                             break;
                         }
@@ -837,6 +854,7 @@ impl<'a> Parser<'a> {
                     return Err("classify label set needs at least two labels".into());
                 }
                 c.labels = labels;
+                c.label_descriptions = descriptions;
             } else if self.eat_kw(Kw::Steps) || self.eat_kw(Kw::Takes) || self.eat_kw(Kw::Ward) {
                 return Err(format!(
                     "{} is not implemented until milestone M5",
@@ -1734,6 +1752,26 @@ mod tests {
                     clauses.labels,
                     vec!["bigfoot".to_string(), "known animal".to_string(), "unclear".to_string()]
                 );
+                assert!(clauses.label_descriptions.iter().all(|d| d.is_none()));
+            }
+            other => panic!("{other:?}"),
+        }
+        let described = parse_command(
+            "CREATE SEMANTIC FUNCTION kind(notes text) RETURNS text LABELS (\
+             'bigfoot' AS 'an unidentified large primate or sasquatch', \
+             'known animal', \
+             'unclear' AS 'not enough to tell')",
+        )
+        .unwrap();
+        match described {
+            Command::CreateFunction { clauses, .. } => {
+                assert_eq!(clauses.labels[0], "bigfoot");
+                assert_eq!(
+                    clauses.label_descriptions[0].as_deref(),
+                    Some("an unidentified large primate or sasquatch")
+                );
+                assert_eq!(clauses.label_descriptions[1], None);
+                assert_eq!(clauses.label_descriptions[2].as_deref(), Some("not enough to tell"));
             }
             other => panic!("{other:?}"),
         }

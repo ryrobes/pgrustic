@@ -135,6 +135,7 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
         system: None,
         prompt: None,
         labels: None,
+        label_descriptions: None,
     }
 }
 
@@ -155,7 +156,15 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
     let decisions = header.lines().next().unwrap_or("").contains("decisions");
     if decisions {
         let payload = if text.contains("\"type\":\"choice\"") {
-            choice_json(text)
+            match choice_json(text) {
+                Ok(body) => body,
+                Err(message) => {
+                    return (
+                        400,
+                        format!(r#"{{"error":{{"message":"{message}"}}}}"#),
+                    );
+                }
+            }
         } else {
             format!(
                 r#"{{"answers":{{"matches":{{"type":"noul","noul":{}}}}}}}"#,
@@ -208,20 +217,40 @@ fn noul_for(text: &str) -> &'static str {
     }
 }
 
-fn choice_json(text: &str) -> String {
+fn choice_json(text: &str) -> Result<String, String> {
+    let body: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("choice body is not json: {e}"))?;
+    let criteria = body
+        .pointer("/questions/label/criteria")
+        .ok_or("choice question has no criteria")?;
+    let Some(map) = criteria.as_object() else {
+        return Err("questions.label.criteria must be an object".into());
+    };
+    if map.values().any(|v| !v.is_string()) {
+        return Err("questions.label.criteria values must be strings".into());
+    }
+    if text.contains("CUSTOMDESC") {
+        let got = map.get("bigfoot").and_then(|v| v.as_str()).unwrap_or("");
+        if got != "CUSTOMDESC" {
+            return Err(format!("bigfoot description was {got}"));
+        }
+    }
     if text.contains("typesafe/high") {
-        return r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":1.0,"known animal":0.0,"unclear":0.0},"confidence":0.5}}}"#.into();
+        return Ok(r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":1.0,"known animal":0.0,"unclear":0.0},"confidence":0.5}}}"#.into());
     }
     if text.contains("typesafe/low") {
-        return r#"{"answers":{"label":{"type":"choice","choice":"known animal","probabilities":{"bigfoot":0.0,"known animal":1.0,"unclear":0.0},"confidence":0.5}}}"#.into();
+        return Ok(r#"{"answers":{"label":{"type":"choice","choice":"known animal","probabilities":{"bigfoot":0.0,"known animal":1.0,"unclear":0.0},"confidence":0.5}}}"#.into());
     }
     if text.contains("STRAY") {
-        return r#"{"answers":{"label":{"type":"choice","choice":"cryptid","probabilities":{"bigfoot":0.25,"known animal":0.5,"unclear":0.25,"cryptid":1.0},"confidence":0.5}}}"#.into();
+        return Ok(r#"{"answers":{"label":{"type":"choice","choice":"cryptid","probabilities":{"bigfoot":0.25,"known animal":0.5,"unclear":0.25,"cryptid":1.0},"confidence":0.5}}}"#.into());
     }
     if text.contains("CONFONLY") {
-        return r#"{"answers":{"label":{"type":"choice","choice":"unclear","confidence":0.5}}}"#.into();
+        return Ok(r#"{"answers":{"label":{"type":"choice","choice":"unclear","confidence":0.5}}}"#.into());
     }
-    r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":0.75,"known animal":0.25,"unclear":0.0},"confidence":0.5}}}"#.into()
+    let bigfoot = map.get("bigfoot").and_then(|v| v.as_str()).unwrap_or("");
+    if bigfoot != "The text is best described as bigfoot." && !text.contains("CUSTOMDESC") {
+        return Err(format!("default bigfoot description was {bigfoot}"));
+    }
+    Ok(r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":0.75,"known animal":0.25,"unclear":0.0},"confidence":0.5}}}"#.into())
 }
 
 fn labels() -> Vec<String> {
@@ -394,6 +423,18 @@ fn decision_stack_alias_and_classify() {
     assert_eq!(scores["known animal"], serde_json::json!(0.25));
     assert_eq!(scores["unclear"], serde_json::json!(0.0));
     assert!(scores.get("cryptid").is_none());
+
+    let mut custom = kind.clone();
+    custom.items[0] = item("CUSTOMDESC tracks", None);
+    custom.items[0].labels = Some(labels());
+    custom.items[0].label_descriptions = Some(vec![
+        "CUSTOMDESC".into(),
+        "a recognized species".into(),
+        "not enough to tell".into(),
+    ]);
+    let custom_got = post(&format!("{}/v1/classify", h.hutch), "off", &custom);
+    assert!(custom_got.outputs[0].error.is_none(), "{:?}", custom_got.outputs[0].error);
+    assert_eq!(custom_got.outputs[0].value, Some(serde_json::json!("bigfoot")));
 
     let mut stray = kind.clone();
     stray.items[0] = item("STRAY", None);

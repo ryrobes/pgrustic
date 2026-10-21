@@ -19,7 +19,7 @@ It then runs, in order:
 
 - `notes MEANS 'a large hairy biped was seen'` on model `jev` (one batched `/v1/predict`; hutch fans that out to one Decisions `noul` call per row)
 - `rvbbit.means_score(notes, 'a large hairy biped was seen')` (same prompt and the same `noul` body, so the decision memo should add no provider calls; the column is the yes-probability)
-- `rvbbit.kind(notes)` with `LABELS ('bigfoot', 'known animal', 'unclear')` (one Decisions `choice` call per row; the column is JSON `{"label","score","scores"}`)
+- `rvbbit.kind(notes)` with `LABELS ('bigfoot' AS '...', 'known animal' AS '...', 'unclear' AS '...')` (one Decisions `choice` call per row; the column is JSON `{"label","score","scores"}`)
 - `rvbbit.creature(notes)` on the chat model (one `/v1/extract` per row)
 
 and runs them again. The second pass must not increase `provider_calls`.

@@ -345,6 +345,13 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
             system: system.clone(),
             prompt: prompt.clone(),
             labels: if ep.labels.is_empty() { None } else { Some(ep.labels.clone()) },
+            label_descriptions: {
+                if ep.label_descriptions.iter().all(|d| d.is_empty()) {
+                    None
+                } else {
+                    Some(ep.label_descriptions.clone())
+                }
+            },
         });
     }
     let req = BatchRequest {
@@ -363,10 +370,26 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
 /// already hashes. Empty labels leave the schema unchanged.
 fn return_schema(ep: &Endpoint) -> String {
     if ep.labels.is_empty() {
-        ep.return_type.clone()
-    } else {
-        format!("{} labels={}", ep.return_type, ep.labels.join("\u{1f}"))
+        return ep.return_type.clone();
     }
+    if ep.label_descriptions.iter().all(|d| d.is_empty()) {
+        return format!("{} labels={}", ep.return_type, ep.labels.join("\u{1f}"));
+    }
+    let parts = ep
+        .labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let desc = ep.label_descriptions.get(i).map(|s| s.as_str()).unwrap_or("");
+            if desc.is_empty() {
+                label.clone()
+            } else {
+                format!("{label}\u{1e}{desc}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    format!("{} labels={}", ep.return_type, parts)
 }
 
 fn decode_classify(text: &str) -> Result<String, String> {

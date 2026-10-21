@@ -400,10 +400,11 @@ fn run_item(
         Operation::Predict | Operation::Decide | Operation::Extract | Operation::Classify => {}
     }
     let labels = item.labels.clone().unwrap_or_default();
+    let descriptions = item.label_descriptions.clone().unwrap_or_default();
     let fixed_classify = operation == Operation::Classify && labels.len() >= 2;
     let plan = (matches!(operation, Operation::Predict | Operation::Decide) || fixed_classify)
         .then(|| decision_plan(&server.cfg, req));
-    let storage = storage_for(&item.cache_key, tenant, plan.as_ref(), &labels);
+    let storage = storage_for(&item.cache_key, tenant, plan.as_ref(), &labels, &descriptions);
     let ttl = mode.ttl.unwrap_or(server.cfg.default_ttl);
     let compute = || provider_call(server, tenant, operation, req, item, mode.mode);
     match mode.mode {
@@ -854,6 +855,7 @@ fn choice_body(model: &str, item: &ItemRequest) -> Result<String, ItemError> {
         ));
     }
     let input = json_str(&item.inputs, "input").unwrap_or_else(|| item.inputs.to_string());
+    let criteria = choice_criteria(&labels, item.label_descriptions.as_deref());
     let body = serde_json::json!({
         "model": model,
         "state": { "text": input },
@@ -861,11 +863,32 @@ fn choice_body(model: &str, item: &ItemRequest) -> Result<String, ItemError> {
             "label": {
                 "type": "choice",
                 "instructions": choice_instructions(item, &labels),
-                "criteria": labels,
+                "criteria": criteria,
             }
         }
     });
     serde_json::to_string(&body).map_err(|e| item_err("provider", &e.to_string()))
+}
+
+/// Decisions `choice.criteria` is an object of label to description.
+/// An array is HTTP 400. A blank description becomes a short sentence
+/// that names the label.
+fn choice_criteria(labels: &[String], descriptions: Option<&[String]>) -> serde_json::Map<String, serde_json::Value> {
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let custom = descriptions
+                .and_then(|d| d.get(i))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let text = match custom {
+                Some(s) => s.to_string(),
+                None => format!("The text is best described as {label}."),
+            };
+            (label.clone(), serde_json::Value::String(text))
+        })
+        .collect()
 }
 
 fn choice_instructions(item: &ItemRequest, labels: &[String]) -> String {
@@ -1233,6 +1256,7 @@ fn storage_for(
     tenant: &str,
     plan: Option<&DecisionPlan>,
     labels: &[String],
+    descriptions: &[String],
 ) -> String {
     let base = storage_of(client_hex, tenant);
     if plan.is_none() && labels.is_empty() {
@@ -1254,6 +1278,10 @@ fn storage_for(
     if !labels.is_empty() {
         tag.push('\n');
         tag.push_str(&labels.join("\n"));
+    }
+    if descriptions.iter().any(|d| !d.is_empty()) {
+        tag.push('\n');
+        tag.push_str(&descriptions.join("\n"));
     }
     hex32(&blake3::hash(tag.as_bytes()).into())
 }
@@ -1411,6 +1439,16 @@ mod tests {
             decisions_url_from_base("http://127.0.0.1:9/v1"),
             "http://127.0.0.1:9/alpha/decisions"
         );
+    }
+
+    #[test]
+    fn choice_criteria_is_an_object_of_descriptions() {
+        let labels = vec!["bigfoot".into(), "unclear".into()];
+        let map = choice_criteria(&labels, Some(&["an unidentified large primate".into(), " ".into()]));
+        assert_eq!(map["bigfoot"], serde_json::json!("an unidentified large primate"));
+        assert_eq!(map["unclear"], serde_json::json!("The text is best described as unclear."));
+        let plain = choice_criteria(&labels, None);
+        assert_eq!(plain["bigfoot"], serde_json::json!("The text is best described as bigfoot."));
     }
 
     #[test]

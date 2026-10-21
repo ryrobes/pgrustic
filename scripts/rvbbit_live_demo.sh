@@ -185,7 +185,11 @@ CREATE SEMANTIC FUNCTION means_score(text text, criterion text) RETURNS double p
   TEMPERATURE 0 CACHE memoize;
 CREATE SEMANTIC FUNCTION kind(notes text) RETURNS text
   MODEL jev
-  LABELS ('bigfoot', 'known animal', 'unclear')
+  LABELS (
+    'bigfoot' AS 'an unidentified large primate or sasquatch',
+    'known animal' AS 'a recognized species such as a deer, bear, or owl',
+    'unclear' AS 'the report does not identify a creature'
+  )
   TEMPERATURE 0 CACHE memoize;
 CREATE SEMANTIC FUNCTION creature(notes text) RETURNS text
   MODEL chat

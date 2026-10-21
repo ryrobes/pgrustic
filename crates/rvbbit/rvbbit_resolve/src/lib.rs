@@ -31,6 +31,8 @@ pub struct Endpoint {
     pub cache_mode: String,
     /// Declared classify labels. Empty for MEANS, score, and extract.
     pub labels: Vec<String>,
+    /// Parallel to [`Self::labels`]. Empty string means the default sentence.
+    pub label_descriptions: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,5 +171,6 @@ pub fn default_endpoint() -> Endpoint {
         // Pre-catalog fallback. Catalog rows send their own mode.
         cache_mode: "off".into(),
         labels: Vec::new(),
+        label_descriptions: Vec::new(),
     }
 }

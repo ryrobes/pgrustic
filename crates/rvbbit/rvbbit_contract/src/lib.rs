@@ -141,6 +141,11 @@ pub struct ItemRequest {
     /// the same key. This field is not hashed on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
+    /// Optional description for each [`Self::labels`] entry, same order.
+    /// An empty string uses the default criteria sentence. Omitted when
+    /// every description is empty, so label-only cache keys stay put.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_descriptions: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

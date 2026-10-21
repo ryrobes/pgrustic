@@ -155,6 +155,7 @@ fn reload() -> PgResult<()> {
             let v = r.get(11).and_then(|c| c.clone());
             if v.as_deref().unwrap_or("").is_empty() { None } else { v }
         };
+        let (labels, label_descriptions) = parse_labels(&cell(&r, 17));
         entries.push(Resolved {
             word,
             func_oid,
@@ -177,7 +178,8 @@ fn reload() -> PgResult<()> {
                     let mode = cell(&r, 16);
                     if mode.is_empty() { "memoize".into() } else { mode }
                 },
-                labels: parse_labels(&cell(&r, 17)),
+                labels,
+                label_descriptions,
             },
         });
     }
@@ -363,7 +365,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
         temp = opt_f64(clauses.temperature.or(Some(0.0))),
         cache = qlit(clauses.cache.as_deref().unwrap_or("memoize")),
         tests = tests,
-        labels = labels_sql(&clauses.labels),
+        labels = labels_sql(&clauses.labels, &clauses.label_descriptions),
     );
     let oid = if let Some(oid) = existing {
         clear_deps("semfn", &oid)?;
@@ -386,7 +388,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
             cache = qlit(clauses.cache.as_deref().unwrap_or("memoize")),
             tests = if clauses.tests.is_empty() { "NULL".to_string() } else { qlit(&clauses.tests.join("\n")) },
             ver = clauses.version.unwrap_or(1),
-            labels = labels_sql(&clauses.labels),
+            labels = labels_sql(&clauses.labels, &clauses.label_descriptions),
         ))?;
         oid
     };
@@ -1198,9 +1200,21 @@ fn render_function(r: &[Option<String>]) -> String {
         cell(r, 3)
     );
     if let Some(raw) = cell_opt(r, 12) {
-        let labels = parse_labels(&raw);
+        let (labels, descriptions) = parse_labels(&raw);
         if !labels.is_empty() {
-            let quoted = labels.iter().map(|l| qlit(l)).collect::<Vec<_>>().join(", ");
+            let quoted = labels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let desc = descriptions.get(i).map(|s| s.as_str()).unwrap_or("");
+                    if desc.is_empty() {
+                        qlit(l)
+                    } else {
+                        format!("{} AS {}", qlit(l), qlit(desc))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             s.push_str(&format!(" LABELS ({quoted})"));
         }
     }
@@ -1366,20 +1380,64 @@ fn version_expr(version: Option<i64>) -> String {
     }
 }
 
-fn labels_sql(labels: &[String]) -> String {
+fn labels_sql(labels: &[String], descriptions: &[Option<String>]) -> String {
     if labels.is_empty() {
-        "NULL".into()
-    } else {
-        qlit(&serde_json::to_string(labels).unwrap_or_else(|_| "[]".into()))
+        return "NULL".into();
     }
+    let any = descriptions.iter().any(|d| d.as_ref().is_some_and(|s| !s.is_empty()));
+    let json = if !any {
+        serde_json::to_string(labels).unwrap_or_else(|_| "[]".into())
+    } else {
+        let rows: Vec<serde_json::Value> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("label".into(), serde_json::Value::String(name.clone()));
+                if let Some(desc) = descriptions.get(i).and_then(|d| d.as_ref()).filter(|s| !s.is_empty()) {
+                    obj.insert("description".into(), serde_json::Value::String(desc.clone()));
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+    };
+    qlit(&json)
 }
 
-fn parse_labels(raw: &str) -> Vec<String> {
+/// Names and parallel descriptions. A string array has blank descriptions.
+/// Objects use `label` and optional `description`.
+fn parse_labels(raw: &str) -> (Vec<String>, Vec<String>) {
     let raw = raw.trim();
     if raw.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut names = Vec::new();
+    let mut descriptions = Vec::new();
+    for item in items {
+        match item {
+            serde_json::Value::String(name) => {
+                names.push(name.clone());
+                descriptions.push(String::new());
+            }
+            serde_json::Value::Object(obj) => {
+                let Some(name) = obj.get("label").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let desc = obj.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                names.push(name.to_string());
+                descriptions.push(desc);
+            }
+            _ => {}
+        }
+    }
+    (names, descriptions)
 }
 
 fn cell(row: &[Option<String>], i: usize) -> String {
