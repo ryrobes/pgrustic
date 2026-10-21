@@ -203,7 +203,7 @@ SQL
 
 run_sql "catalog and sightings (no model calls)" "$RUNDIR/setup.sql"
 # Counters start at zero so pass 1 is only the two queries below.
-curl -sf "http://127.0.0.1:$HUTCH_PORT/reset" >/dev/null
+curl -sf -X POST "http://127.0.0.1:$HUTCH_PORT/reset" >/dev/null
 run_sql "pass 1 MEANS + EXTRACT" "$RUNDIR/queries.sql"
 S1=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats")
 C1=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/v1/cache/stats")
