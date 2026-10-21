@@ -8,8 +8,8 @@ set-once seams, and the Result executor is not a plugin.
 
 ## Upstream files touched
 
-13 existing or new files under the upstream tree, plus dependency lines in
-7 manifests and `Cargo.lock`. The source count is inside the ~15 target.
+14 existing or new files under the upstream tree, plus dependency lines in
+8 manifests and `Cargo.lock`. The source count is inside the ~15 target.
 Manifest edits are path dependencies only.
 
 | File | Why |
@@ -26,6 +26,7 @@ Manifest edits are path dependencies only.
 | `crates/backend/executor/execmain/src/lib.rs` | Declares the `semantic` module. |
 | `crates/backend/executor/execmain/src/semantic.rs` | **New file in an upstream crate.** The batch loop has to call `exec_proc_node`, projection, and slots. Putting it in `execmain` avoids an `execmain` ↔ `rvbbit_exec` cycle. |
 | `crates/backend/commands/explain/src/node.rs` | A MEANS Result prints as `Semantic Filter` with batch size, concurrency, and ANALYZE counters. |
+| `crates/backend/utils/adt/ruleutils/src/lib.rs` | Deparse prints `rvbbit_means(...)` without a `pg_proc` lookup. The normal path SearchSysCache's the oid and errors. |
 | `crates/_support/seams_init/src/lib.rs` | Registers the oid-9020 builtin and starts the dispatch pool at server boot. |
 
 Manifests (dependency lines only):
@@ -37,6 +38,7 @@ Manifests (dependency lines only):
 - `crates/backend/optimizer/plan/planner/Cargo.toml`
 - `crates/backend/executor/execmain/Cargo.toml`
 - `crates/backend/commands/explain/Cargo.toml`
+- `crates/backend/utils/adt/ruleutils/Cargo.toml`
 - `crates/_support/seams_init/Cargo.toml`
 
 ## New crates

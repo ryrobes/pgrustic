@@ -27,9 +27,22 @@ PGPORT=${PGPORT:-55432}
 PGUSER=${PGUSER:-postgres}
 OUT=${REGRESS_OUT:-/tmp/pgrust-regress}
 SCHEDULE=${SCHEDULE:-parallel_schedule}
+# pgrust resolves LANGUAGE C libraries by basename against its builtin
+# registry, but only after stat() succeeds. Upstream SQL loads regress.so
+# from PG_LIBDIR; a placeholder file at --dlpath is enough.
+DLPATH=${REGRESS_DLPATH:-/tmp/pgrust-dl}
 
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$DLPATH"
+: > "$DLPATH/regress.so"
 export PATH="$PG_BIN:$PATH"
+
+# --use-existing does not create the database. A schedule expects the
+# objects from a fresh `regression` database, so recreate it unless the
+# caller set REGRESS_KEEP_DB=1.
+if [[ "${REGRESS_KEEP_DB:-0}" != 1 ]]; then
+  dropdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" --if-exists "${PGDATABASE:-regression}"
+  createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "${PGDATABASE:-regression}"
+fi
 
 args=(
   --use-existing
@@ -40,8 +53,12 @@ args=(
   --dbname="${PGDATABASE:-regression}"
   --inputdir="$REGRESS_IN"
   --outputdir="$OUT"
+  --dlpath="$DLPATH"
 )
 if [[ $# -eq 0 ]]; then
+  if [[ "$SCHEDULE" != /* ]]; then
+    SCHEDULE="$REGRESS_IN/$SCHEDULE"
+  fi
   args+=(--schedule="$SCHEDULE")
 fi
 

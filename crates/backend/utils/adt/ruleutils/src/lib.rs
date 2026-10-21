@@ -502,6 +502,11 @@ pub(crate) fn generate_function_name(
     has_variadic: bool,
     in_group_by: bool,
 ) -> PgResult<String> {
+    // No pg_proc row. The name is fixed; qualifying it would SearchSysCache
+    // and error. EXPLAIN prints `rvbbit_means(input, criterion)`.
+    if funcid == rvbbit_oids::MEANS_OID {
+        return Ok(quote_identifier(rvbbit_oids::MEANS_NAME).into_owned());
+    }
     let proname = lsyscache::get_func_name(mcx, funcid)?
         .ok_or_else(|| cache_lookup_failed("function", funcid))?;
     let proname = proname.as_str().to_owned();

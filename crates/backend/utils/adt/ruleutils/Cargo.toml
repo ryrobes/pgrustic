@@ -12,6 +12,7 @@ nodes_core = { path = "../../../nodes/nodes_core" }
 amapi = { path = "../../../access/index/amapi" }
 arrayfuncs = { path = "../arrayfuncs" }
 cache_syscache = { path = "../../cache/cache_syscache" }
+rvbbit_oids = { path = "../../../../rvbbit/rvbbit_oids" }
 partdesc = { path = "../../../partitioning/partdesc" }
 pg_depend = { path = "../../../catalog/pg_depend" }
 catalog_namespace = { path = "../../../catalog/catalog_namespace" }

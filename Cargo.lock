@@ -16966,6 +16966,7 @@ dependencies = [
  "rewrite_handler_seams",
  "rewrite_manip",
  "ruleutils_seams",
+ "rvbbit_oids",
  "snapmgr",
  "stack_depth_core",
  "syscache_seams",
