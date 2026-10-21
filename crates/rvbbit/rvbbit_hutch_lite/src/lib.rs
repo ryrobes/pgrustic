@@ -175,7 +175,7 @@ struct Scored {
     generation_id: Option<String>,
     /// Meters for this invocation. Cleared before the value is stored.
     calls: Vec<CallMeter>,
-    /// Set when two or more takes of one model agreed.
+    /// Set when there were two or more takes. True only when they agreed.
     identical_takes: Option<bool>,
 }
 
@@ -225,6 +225,7 @@ impl Scored {
             model: entry.model,
             generation_id: None,
             calls: Vec::new(),
+            identical_takes: None,
         }
     }
 }
@@ -791,6 +792,7 @@ fn decision_plan(cfg: &Config, req: &BatchRequest) -> DecisionPlan {
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .map(|s| choose_decision_model(cfg, &s))
         .collect();
     if models.is_empty() {
         models.push(choose_decision_model(cfg, &req.model));
@@ -861,6 +863,10 @@ fn decision_scored(
         for call in &mut calls {
             call.identical = Some(identical);
         }
+        // `decision_http` already wrote these meters, with `identical`
+        // still absent. Stamp the log so `rvbbit.calls` stores false
+        // when the takes disagree, not null.
+        stamp_logged_identical(server, &calls);
     }
     let (matched, mean) = combine_noul(plan.combine, plan.threshold, &scores);
     let mut scored = Scored::from_calls(
@@ -884,9 +890,11 @@ fn plan_phrasings(plan: &DecisionPlan) -> Vec<String> {
 }
 
 /// True when every model+phrasing that was asked more than once returned
-/// the same fingerprint. A single take does not count. Jev's repeated
-/// takes of one phrasing set this even when another phrasing scores
-/// differently. A take that disagrees with its siblings clears it.
+/// the same fingerprint. A single take does not count, and the caller
+/// leaves the flag absent. A live Jev run of one phrasing varied by about
+/// 0.03 across takes, so this was false. A second phrasing moved UFO row 2
+/// from about 0.67 to about 0.83, more than the take-to-take spread.
+/// A take that disagrees with its siblings clears the flag.
 fn identical_prints(prints: &[(String, String)]) -> bool {
     let mut repeated = false;
     for (i, (model, fp)) in prints.iter().enumerate() {
@@ -969,6 +977,7 @@ fn choice_scored(
         for meter in &mut meters {
             meter.identical = Some(identical);
         }
+        stamp_logged_identical(server, &meters);
     }
     let mut scores = serde_json::Map::new();
     let mut best_label = labels[0].clone();
@@ -1036,9 +1045,10 @@ fn decision_http(
         return fetch_decision(server, operation, tenant, model, kind, &body, item.node.clone());
     }
     // Take index is part of the memo key so stacked repeats each call the
-    // provider. It is not sent: the Decisions API has no take field, and
-    // Jev is not documented as sampling. Temperature and max_tokens are
-    // also not sent and are not part of this key.
+    // provider. It is not sent: the Decisions API has no take field.
+    // A live Jev run still varied by about 0.03 across same-model takes.
+    // Temperature and max_tokens are also not sent and are not part of
+    // this key.
     let key = format!("{tenant}\n{take}\n{body}");
     let started = Instant::now();
     let flight = {
@@ -1591,6 +1601,32 @@ fn record_call(server: &Server, meter: &CallMeter) {
     cache.calls.push_back(meter.clone());
 }
 
+/// The call log is written inside the provider fetch, before a stack
+/// knows whether its takes agreed. Copy `identical` onto those rows.
+/// `Some(false)` serializes; leaving the field absent is what made the
+/// SQL column null.
+fn stamp_logged_identical(server: &Server, calls: &[CallMeter]) {
+    let mut cache = lock(&server.cache);
+    for logged in cache.calls.iter_mut() {
+        if let Some(src) = calls.iter().find(|c| meter_identity(logged, c)) {
+            logged.identical = src.identical;
+        }
+    }
+}
+
+fn meter_identity(logged: &CallMeter, src: &CallMeter) -> bool {
+    logged.timestamp == src.timestamp
+        && logged.op == src.op
+        && logged.model == src.model
+        && logged.cache == src.cache
+        && logged.latency_ms == src.latency_ms
+        && logged.generation_id == src.generation_id
+        && logged.cost_usd == src.cost_usd
+        && logged.score == src.score
+        && logged.node == src.node
+        && logged.tenant == src.tenant
+}
+
 fn fill_generation(server: &Server, usage: &mut ProviderUsage) {
     let Some(id) = usage.generation_id.clone() else {
         return;
@@ -1879,6 +1915,7 @@ fn lookup_hit_meter(tenant: &str, stored: &Scored) -> CallMeter {
         generation_id: stored.generation_id.clone(),
         node: None,
         score: stored.score,
+        identical: stored.identical_takes,
         payload: audit_payload(),
     }
 }

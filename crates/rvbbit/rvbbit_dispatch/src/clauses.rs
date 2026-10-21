@@ -5,7 +5,9 @@
 //! failed `UNTIL` starts another RetryWave. `CHECK` drops takes.
 //! `FALLBACK` redispatches once. `BUDGET` aborts when the wave's cost
 //! would pass the cap. Same-model takes with equal scores are reported
-//! as identical, which is what a deterministic Jev does.
+//! as identical. A live Jev run varied by about 0.03 across takes, so
+//! identical was false. A second phrasing moved one row from about 0.67
+//! to about 0.83, more than extra takes did.
 
 use std::sync::Mutex;
 

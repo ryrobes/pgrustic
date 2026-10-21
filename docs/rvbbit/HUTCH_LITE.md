@@ -72,8 +72,12 @@ argmax. That fallback is not implemented.
 wins over `DEFAULT CLAUSES` on the function, which wins over the
 `semantic.*` GUCs. The reducer runs in dispatch (Reduce, RetryWave,
 CHECK, FALLBACK, BUDGET). Hutch fans takes, models, and phrasings out
-inside one batch. Same-model takes that return the same score set
-`identical` on the call row. `semantic.budget` aborts the session when
+inside one batch. Same-model takes set `identical` on the call row:
+true when the scores match, false when they differ. A single take leaves
+it null. A live Jev run varied by about 0.03 across takes of one phrasing,
+so `identical` was false. A second phrasing moved UFO row 2 from about
+0.67 to about 0.83, more than extra takes moved it. `semantic.budget`
+aborts the session when
 `rvbbit.calls` cost would pass the cap. Embed and rerank are per-item
 `unsupported`. Decide is the same `noul` path as predict.
 

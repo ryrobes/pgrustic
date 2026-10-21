@@ -199,9 +199,10 @@ pub struct ItemResponse {
     pub calls: Option<Vec<CallMeter>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ItemError>,
-    /// True when two or more takes of the same model returned the same
-    /// score. A deterministic model (Jev) sets this. Absent when the
-    /// item was a single take.
+    /// Whether two or more takes of the same model returned the same
+    /// score. False when they differed. Absent when the item was a
+    /// single take. A live Jev run varied by about 0.03, so this was
+    /// false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identical_takes: Option<bool>,
 }
@@ -248,8 +249,8 @@ pub struct CallMeter {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
-    /// True when this call was one of several same-model takes that
-    /// agreed. Absent on a single take.
+    /// Whether this call was one of several same-model takes that
+    /// agreed. False when they differed. Absent on a single take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identical: Option<bool>,
     /// Decision-tree node that caused this call. Absent for MEANS,

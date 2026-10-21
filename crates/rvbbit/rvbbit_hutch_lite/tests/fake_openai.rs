@@ -3,6 +3,8 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+static VARY_N: AtomicU64 = AtomicU64::new(0);
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -199,7 +201,11 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
             }
             format!(
                 r#"{{"answers":{{"matches":{{"type":"noul","noul":{}}}}}}}"#,
-                noul_for(text)
+                if text.contains("VARYSCORE") {
+                    vary_noul()
+                } else {
+                    noul_for(text).to_string()
+                }
             )
         };
         return (200, decorate_decision(&payload, text));
@@ -292,6 +298,11 @@ fn check_noul(text: &str) -> Result<(), String> {
         return Err("noul instructions are empty".into());
     }
     Ok(())
+}
+
+fn vary_noul() -> String {
+    let n = VARY_N.fetch_add(1, Ordering::SeqCst);
+    format!("{:.2}", 0.50 + (n % 10) as f64 * 0.03)
 }
 
 fn noul_for(text: &str) -> &'static str {
@@ -613,6 +624,93 @@ fn lookup_credits_saved_cost_without_double_counting_misses() {
     assert!(
         predict_hits(&after) >= 1,
         "lookup hit should show up in latency_by_op_model: {after}"
+    );
+}
+
+fn calls_of(url: &str, limit: u32) -> Vec<serde_json::Value> {
+    let text = ureq::get(&format!("{url}/v1/calls?limit={limit}"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    parsed["calls"].as_array().cloned().unwrap_or_default()
+}
+
+#[test]
+fn stacked_mock_model_is_sent_as_jev() {
+    let h = harness(Some("test-key"));
+    let mut req = predict("MOCKMODEL", "biped");
+    req.decision = Some(DecisionStack {
+        models: vec!["mock".into()],
+        takes: Some(1),
+        combine: None,
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let got = post(&format!("{}/v1/predict", h.hutch), "off", &req);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    assert_eq!(
+        got.outputs[0].score,
+        Some(0.75),
+        "a stacking model of mock must be rewritten to jev, not sent upstream"
+    );
+    let call = &got.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(call.model, "typesafe/jev-1.14");
+}
+
+#[test]
+fn differing_takes_log_identical_false() {
+    let h = harness(Some("test-key"));
+    let mut once = predict("TRUE_CASE", "biped");
+    once.decision = Some(DecisionStack {
+        models: Vec::new(),
+        takes: Some(1),
+        combine: None,
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let single = post(&format!("{}/v1/predict", h.hutch), "off", &once);
+    assert!(single.outputs[0].identical_takes.is_none());
+    let logged = calls_of(&h.hutch, 1);
+    assert!(logged[0].get("identical").is_none(), "a single take stays null: {logged:?}");
+
+    let mut agree = predict("TRUE_CASE", "same");
+    agree.items[0].cache_key = format!("{}agree", agree.items[0].cache_key);
+    agree.decision = Some(DecisionStack {
+        models: Vec::new(),
+        takes: Some(2),
+        combine: Some("mean".into()),
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let same = post(&format!("{}/v1/predict", h.hutch), "off", &agree);
+    assert_eq!(same.outputs[0].identical_takes, Some(true));
+    let agreed = calls_of(&h.hutch, 2);
+    assert!(agreed.iter().all(|c| c["identical"] == true), "{agreed:?}");
+
+    let mut vary = predict("VARYSCORE", "drift");
+    vary.items[0].cache_key = format!("{}vary", vary.items[0].cache_key);
+    vary.decision = Some(DecisionStack {
+        models: Vec::new(),
+        takes: Some(2),
+        combine: Some("mean".into()),
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let drifted = post(&format!("{}/v1/predict", h.hutch), "off", &vary);
+    assert_eq!(drifted.outputs[0].identical_takes, Some(false));
+    let row_calls = drifted.outputs[0].calls.as_ref().unwrap();
+    assert!(row_calls.iter().all(|c| c.identical == Some(false)));
+    let logged = calls_of(&h.hutch, 2);
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert!(
+        logged.iter().all(|c| c["identical"] == false),
+        "differing takes must log false, not null: {logged:?}"
     );
 }
 
