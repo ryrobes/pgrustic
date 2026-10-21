@@ -117,7 +117,7 @@ pub fn meter_log_line(meter: &CallMeter, api_key: &str) -> String {
         opt_num(meter.tokens_out),
         opt_f64(meter.cost_usd),
         opt_f64(meter.cost_saved_usd),
-        meter.provider_latency_ms,
+        opt_num(meter.provider_latency_ms),
         meter.latency_ms,
         log_token(&meter.cache),
         meter.items,
@@ -280,7 +280,7 @@ mod tests {
             tokens_out: None,
             cost_usd: Some(0.25),
             cost_saved_usd: Some(0.0),
-            provider_latency_ms: 4,
+            provider_latency_ms: Some(4),
             latency_ms: 5,
             cache: "miss".into(),
             items: 1,
@@ -292,6 +292,7 @@ mod tests {
         assert!(line.starts_with("hutch_call "));
         assert!(!line.contains("sk-secret"), "{line}");
         assert!(line.contains("model=[redacted]"), "{line}");
+        assert!(line.contains("provider_latency_ms=4"), "{line}");
         assert!(line.contains("tokens_out=-"), "{line}");
         assert!(line.contains("generation_id=-"), "{line}");
     }

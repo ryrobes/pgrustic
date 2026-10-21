@@ -13,31 +13,54 @@ This VM does not have a key. Run the demo on a machine that does.
 
 `scripts/rvbbit_live_demo.sh` builds pgrustic and hutch-lite, starts both
 on ports that do not collide with the spike (Postgres `55433`, hutch
-`8098`), creates a fresh database, and loads six bigfoot-style sightings.
+`8098`), creates a fresh database, and loads the committed fixtures
+`crates/rvbbit/fixtures/bigfoot_sightings.csv` and
+`crates/rvbbit/fixtures/ufo_sightings.csv` (200 rows each, not the full
+source files). Semantic queries run on an 8-row copy of each so a
+`WHERE ... MEANS` cannot scan the whole fixture.
 
-It then runs, in order:
+It then runs, in order, on those 8 rows:
 
 - `notes MEANS 'a large hairy biped was seen'` on model `jev` (one batched `/v1/predict`; hutch fans that out to one Decisions `noul` call per row)
-- `rvbbit.means_score(notes, 'a large hairy biped was seen')` (same prompt and the same `noul` body, so the decision memo should add no provider calls; the column is the yes-probability)
+- `rvbbit.means_score` of that same criterion (same prompt and the same `noul` body, so the decision memo should add no provider calls; the column is the yes-probability; `/stats` `hits` increases)
+- `rvbbit.means_score` of a looser criterion, `a sound, a dark shape, or any unusual event was noticed` (a different body, so another `noul` per row). On the old six-row set, wood knocks plus a dark biped scored the tight MEANS at 0.22 and CLASSIFY bigfoot at 0.93. The two score columns are that comparison on the fixture rows
 - `rvbbit.kind(notes)` with `LABELS ('bigfoot' AS '...', 'known animal' AS '...', 'unclear' AS '...')` (one Decisions `choice` call per row; the column is JSON `{"label","score","scores"}`)
 - `rvbbit.creature(notes)` on the chat model (one `/v1/extract` per row)
+- `ufo_sample.notes MEANS 'an ordinary aircraft, satellite, or star'` and `rvbbit.ufo_kind(notes)` (one `noul` and one `choice` per UFO row)
 
 and runs them again. The second pass must not increase `provider_calls`
-or `total_cost_usd`. `hits` and `cost_saved_usd` must rise. Eighteen
-provider calls is the expected first pass (six `noul`, six `choice`,
-six chat). The score rows are memo hits: cost 0, and `cost_saved` equal
-to the original `noul` charge. The script prints `GET /stats` (including
-`latency_by_op_model`) and:
+or `total_cost_usd`. `hits` and `cost_saved_usd` must rise. Forty-eight
+provider calls is the expected first pass (24 bigfoot `noul`, 8 bigfoot
+`choice`, 8 chat, 8 UFO `noul`, 8 UFO `choice`). The tight score rows
+are memo hits: cost 0, and `cost_saved` equal to the original `noul`
+charge. The script aborts above 60 provider calls. It prints `GET /stats`
+(including `latency_by_op_model`, where `calls` is misses and `hits` is
+cache reuse) and:
 
 ```sql
-SELECT op, model, sum(cost), avg(latency_ms) FROM rvbbit.calls GROUP BY 1, 2;
+SELECT cache, op, model, sum(cost), avg(provider_latency_ms)
+FROM rvbbit.calls
+GROUP BY 1, 2, 3;
 ```
+
+`avg(provider_latency_ms)` ignores hits. On a hit that column is null.
+`avg(latency_ms)` still includes hutch time for hits, so the grouped
+query keeps `cache` in the key.
 
 `rvbbit.calls` is a view. `rvbbit.call_log()` reads `GET /v1/calls` from
 each hutch backend. It is the last 1024 calls in that process, not a
 stored table, and `POST /reset` clears it.
 
-It aborts above forty provider calls, or when pass 1 recorded no USD cost.
+It aborts above sixty provider calls, or when pass 1 recorded no USD cost.
+
+A rough token count (each word, plus each punctuation mark) on a
+demo-shaped `noul` body for one short sighting: the non-text scaffold
+went from 109 tokens to 63 (−42%). The full JSON went from 125 tokens
+/ 362 bytes to 79 tokens / 240 bytes. A `choice` body with three labels
+went from 124 scaffold tokens to 85 (−31%). Live runs had been about
+340 input tokens per `noul` versus about 66 for chat; the provider
+adds its own prompt on top of this JSON, and the duplicated criterion
+was the part we were sending twice.
 
 Fixed-label classify is one Decisions request per row, not one per label.
 Jev's `choice` question returns every label's probability. Output tokens

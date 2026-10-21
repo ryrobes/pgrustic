@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build pgrustic + hutch-lite and run live MEANS, score, CLASSIFY, and EXTRACT queries.
+# Build pgrustic + hutch-lite and run live MEANS, score, CLASSIFY, and EXTRACT
+# queries on a fixture subset (crates/rvbbit/fixtures, 200 rows each).
 #
 # Prerequisites on a fresh Ubuntu box (see docs/rvbbit/HUTCH_LITE.md):
 #   sudo apt-get update
@@ -155,7 +156,7 @@ echo "hutch startup: $(head -n 1 "$HUTCH_LOG")"
 
 PSQL=(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -v ON_ERROR_STOP=1 -X)
 
-echo "=== catalog + six sightings ==="
+echo "=== catalog + fixture subset (semantic queries see 8 rows each) ==="
 "${PSQL[@]}" -d postgres -c "DROP DATABASE IF EXISTS rvbbit_live" -c "CREATE DATABASE rvbbit_live"
 
 run_sql() {
@@ -196,22 +197,65 @@ CREATE SEMANTIC FUNCTION creature(notes text) RETURNS text
   SYSTEM \$\$Return only a JSON object with keys creature and confidence. creature is a short lowercase noun. confidence is a number from 0 to 1. No markdown.\$\$
   PROMPT \$\$What creature is described? Text: {{input}}\$\$
   TEMPERATURE 0 MAX TOKENS 100 CACHE memoize;
-CREATE TABLE sightings (id int PRIMARY KEY, notes text NOT NULL);
-INSERT INTO sightings (id, notes) VALUES
-  (1, 'A tall hairy figure crossed the logging road on two legs and left huge prints.'),
-  (2, 'We heard wood knocks, then a dark biped stepped over the creek.'),
-  (3, 'A deer bolted through the ferns at dusk.'),
-  (4, 'An owl called from the ridge and nothing else moved.'),
-  (5, 'Something ape-like stood at the tree line and walked upright into the timber.'),
-  (6, 'Campers reported a black bear turning over a cooler.');
+CREATE SEMANTIC FUNCTION ufo_kind(notes text) RETURNS text
+  MODEL jev
+  LABELS (
+    'aircraft' AS 'an airplane, helicopter, or other aircraft',
+    'satellite' AS 'a satellite or the International Space Station',
+    'astronomical' AS 'a star, planet, meteor, or other astronomical object',
+    'unexplained' AS 'not a known aircraft, satellite, or astronomical object'
+  )
+  TEMPERATURE 0 CACHE memoize;
+CREATE TABLE bigfoot (
+  id int PRIMARY KEY,
+  bfroid int,
+  class text,
+  title text,
+  state text,
+  county text,
+  season text,
+  observed text,
+  environment text
+);
+\copy bigfoot FROM '${ROOT}/crates/rvbbit/fixtures/bigfoot_sightings.csv' WITH (FORMAT csv, HEADER true)
+CREATE TABLE sightings AS
+  SELECT id, observed AS notes, class, title, state
+  FROM bigfoot
+  WHERE id <= 8
+  ORDER BY id;
+CREATE TABLE ufo (
+  id int PRIMARY KEY,
+  source_id int,
+  city text,
+  state text,
+  shape text,
+  comments text
+);
+\copy ufo FROM '${ROOT}/crates/rvbbit/fixtures/ufo_sightings.csv' WITH (FORMAT csv, HEADER true)
+CREATE TABLE ufo_sample AS
+  SELECT id, comments AS notes, city, state, shape
+  FROM ufo
+  WHERE id <= 8
+  ORDER BY id;
 SQL
 
 cat >"$RUNDIR/queries.sql" <<'SQL'
 \pset pager off
-SELECT id FROM sightings
+-- Tight criterion: a large hairy biped was seen.
+-- Loose criterion: a sound, a dark shape, or any unusual event.
+-- On the old six-row set, wood knocks plus a dark biped scored
+-- MEANS 0.22 and CLASSIFY bigfoot 0.93. These two scores show that gap.
+-- sightings and ufo_sample are 8-row copies, so a WHERE MEANS cannot
+-- fan out over the 200-row fixture tables.
+SELECT id, class FROM sightings
 WHERE notes MEANS 'a large hairy biped was seen'
 ORDER BY id;
-SELECT id, rvbbit.means_score(notes, 'a large hairy biped was seen') AS score
+SELECT id, class,
+       rvbbit.means_score(notes, 'a large hairy biped was seen') AS tight_score
+FROM sightings
+ORDER BY id;
+SELECT id, class,
+       rvbbit.means_score(notes, 'a sound, a dark shape, or any unusual event was noticed') AS loose_score
 FROM sightings
 ORDER BY id;
 SELECT id, rvbbit.kind(notes) AS kind
@@ -220,18 +264,25 @@ ORDER BY id;
 SELECT id, rvbbit.creature(notes) AS extracted
 FROM sightings
 ORDER BY id;
-SELECT op, model,
+SELECT id, shape FROM ufo_sample
+WHERE notes MEANS 'an ordinary aircraft, satellite, or star'
+ORDER BY id;
+SELECT id, shape, rvbbit.ufo_kind(notes) AS kind
+FROM ufo_sample
+ORDER BY id;
+SELECT cache, op, model,
        count(*) AS calls,
        sum(cost) AS cost,
        sum(cost_saved) AS cost_saved,
-       avg(latency_ms) AS latency_ms
+       avg(latency_ms) AS hutch_ms,
+       avg(provider_latency_ms) AS provider_ms
 FROM rvbbit.calls
-GROUP BY op, model
-ORDER BY op, model;
+GROUP BY cache, op, model
+ORDER BY cache, op, model;
 SQL
 
 run_sql "catalog and sightings (no model calls)" "$RUNDIR/setup.sql"
-# Counters start at zero so pass 1 is only the two queries below.
+# Counters start at zero so pass 1 is only the queries below.
 curl -sf -X POST "http://127.0.0.1:$HUTCH_PORT/reset" >/dev/null
 run_sql "pass 1 MEANS + score + CLASSIFY + EXTRACT" "$RUNDIR/queries.sql"
 S1=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats")
@@ -262,8 +313,8 @@ print(
 )
 print("pass 1 latency_by_op_model", json.dumps(a.get("latency_by_op_model"), sort_keys=True))
 print("pass 2 latency_by_op_model", json.dumps(b.get("latency_by_op_model"), sort_keys=True))
-if a["provider_calls"] > 40:
-    sys.exit(f"pass 1 used {a['provider_calls']} provider calls; cap is 40")
+if a["provider_calls"] > 60:
+    sys.exit(f"pass 1 used {a['provider_calls']} provider calls; cap is 60")
 if b["provider_calls"] != a["provider_calls"]:
     sys.exit("provider_calls increased on the rerun")
 if b["hits"] <= a["hits"]:

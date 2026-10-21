@@ -183,6 +183,12 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
                 }
             }
         } else {
+            if let Err(message) = check_noul(text) {
+                return (
+                    400,
+                    format!(r#"{{"error":{{"message":"{message}"}}}}"#),
+                );
+            }
             format!(
                 r#"{{"answers":{{"matches":{{"type":"noul","noul":{}}}}}}}"#,
                 noul_for(text)
@@ -259,6 +265,25 @@ fn near(got: Option<f64>, expect: f64) -> bool {
     got.is_some_and(|n| (n - expect).abs() < 1e-12)
 }
 
+fn check_noul(text: &str) -> Result<(), String> {
+    let body: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("noul body is not json: {e}"))?;
+    let state = body.get("state").ok_or("noul question has no state")?;
+    if !state.is_string() {
+        return Err("noul state must be the input string".into());
+    }
+    if body.pointer("/questions/matches/criteria").is_some() {
+        return Err("noul criteria must be omitted".into());
+    }
+    let instructions = body
+        .pointer("/questions/matches/instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if instructions.is_empty() {
+        return Err("noul instructions are empty".into());
+    }
+    Ok(())
+}
+
 fn noul_for(text: &str) -> &'static str {
     if text.contains("ALIAS") {
         if text.contains("~typesafe/jev-latest") && !text.contains("typesafe/jev-1.14") {
@@ -311,8 +336,12 @@ fn choice_json(text: &str) -> Result<String, String> {
         return Ok(r#"{"answers":{"label":{"type":"choice","choice":"unclear","confidence":0.5}}}"#.into());
     }
     let bigfoot = map.get("bigfoot").and_then(|v| v.as_str()).unwrap_or("");
-    if bigfoot != "The text is best described as bigfoot." && !text.contains("CUSTOMDESC") {
+    if bigfoot != "bigfoot" && !text.contains("CUSTOMDESC") {
         return Err(format!("default bigfoot description was {bigfoot}"));
+    }
+    let state = body.get("state").ok_or("choice question has no state")?;
+    if !state.is_string() {
+        return Err("choice state must be the input string".into());
     }
     Ok(r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":0.75,"known animal":0.25,"unclear":0.0},"confidence":0.5}}}"#.into())
 }
@@ -364,15 +393,18 @@ fn predict_extract_cache_and_errors() {
     assert_eq!(hit.cache, "hit");
     assert!(near(hit.cost_usd, 0.0));
     assert!(near(hit.cost_saved_usd, 0.00000336), "{:?}", hit.cost_saved_usd);
-    assert_eq!(hit.provider_latency_ms, 0);
+    assert!(hit.provider_latency_ms.is_none());
     assert_eq!(hit.tokens_in, Some(0));
     let stats = ureq::get(&format!("{}/stats", h.hutch)).call().unwrap().into_string().unwrap();
     let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
     assert!(near(stats["total_cost_usd"].as_f64(), 0.00000336 * 2.0), "{stats}");
     assert!(near(stats["cost_saved_usd"].as_f64(), 0.00000336), "{stats}");
+    assert_eq!(stats["hits"], 1, "contract-cache reuse is a hit: {stats}");
     assert!(stats["latency_by_op_model"].as_array().unwrap().iter().any(|row| {
-        row["op"] == "predict" && row["calls"].as_u64() == Some(2)
-    }));
+        row["op"] == "predict"
+            && row["calls"].as_u64() == Some(2)
+            && row["hits"].as_u64() == Some(1)
+    }), "{stats}");
     let recent = ureq::get(&format!("{}/v1/calls?limit=1", h.hutch))
         .call()
         .unwrap()
@@ -508,8 +540,15 @@ fn decision_stack_alias_and_classify() {
     assert_eq!(first.outputs[0].calls.as_ref().unwrap()[0].cache, "miss");
     let memo_hit = &second.outputs[0].calls.as_ref().unwrap()[0];
     assert_eq!(memo_hit.cache, "hit");
+    assert!(memo_hit.provider_latency_ms.is_none());
     assert!(near(memo_hit.cost_usd, 0.0));
     assert!(near(memo_hit.cost_saved_usd, 0.00000336), "{:?}", memo_hit.cost_saved_usd);
+    let stats = ureq::get(&format!("{}/stats", h.hutch)).call().unwrap().into_string().unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["hits"], 1, "decision-memo reuse counts as a hit: {stats}");
+    assert!(stats["latency_by_op_model"].as_array().unwrap().iter().any(|row| {
+        row["op"] == "predict" && row["hits"].as_u64() == Some(1)
+    }), "{stats}");
 
     let mut kind = predict("BIGFOOT tracks", "ignored");
     kind.operation = Operation::Classify;
@@ -607,7 +646,7 @@ fn missing_inline_cost_uses_the_generation_endpoint() {
     assert_eq!(call.tokens_in, Some(50));
     assert_eq!(call.tokens_out, Some(10));
     assert_eq!(call.generation_id.as_deref(), Some("gen-nocost-1"));
-    assert!(call.latency_ms >= call.provider_latency_ms);
+    assert!(call.latency_ms >= call.provider_latency_ms.expect("miss has provider latency"));
     let stats = ureq::get(&format!("{}/stats", h.hutch)).call().unwrap().into_string().unwrap();
     let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
     assert_eq!(stats["provider_calls"], 1, "generation lookup is not a provider call");

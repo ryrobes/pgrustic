@@ -17,7 +17,7 @@
 
 mod cost;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
@@ -209,6 +209,9 @@ struct Cache {
     cost_saved_usd: f64,
     /// Provider latency of misses, last [`CALL_LOG_CAP`] per op+model.
     latency_samples: HashMap<(String, String), VecDeque<u64>>,
+    /// Decision-memo and contract-cache hits per op+model. Same reuse
+    /// that `rvbbit.calls` records as `cache=hit`.
+    latency_hits: HashMap<(String, String), u64>,
 }
 
 impl Cache {
@@ -227,6 +230,7 @@ impl Cache {
             total_cost_usd: 0.0,
             cost_saved_usd: 0.0,
             latency_samples: HashMap::new(),
+            latency_hits: HashMap::new(),
         }
     }
 }
@@ -843,6 +847,11 @@ fn decision_http(
     let flight = {
         let mut cache = lock(&server.cache);
         if let Some(text) = cache.decision_memo.get(&key).cloned() {
+            // Same event as a contract-cache hit: `/stats` hits, the call
+            // log, and `latency_by_op_model.hits` all count it. The saved
+            // cost stays on this meter. A later contract-cache hit of a
+            // value produced only from the memo does not add it again.
+            cache.hits += 1;
             drop(cache);
             let usage = usage_from_body(&text);
             let meter = saved_meter(operation, tenant, model, &usage, "hit", started);
@@ -950,22 +959,17 @@ fn noul_body(model: &str, item: &ItemRequest) -> Result<String, ItemError> {
         .or_else(|| json_str(&item.inputs, "criterion"))
         .unwrap_or_default();
     let instructions = decision_instructions(item, &criterion);
-    let true_criteria = if criterion.is_empty() {
-        "The text matches the criterion.".to_string()
-    } else {
-        criterion.clone()
-    };
+    // `state` is the input string. The criterion is in `instructions`
+    // once. `noul.criteria` is optional and, when present, must be
+    // exactly true/false. Omitting it keeps that object from repeating
+    // the question in the provider's prompt.
     let body = serde_json::json!({
         "model": model,
-        "state": { "text": input, "criterion": criterion },
+        "state": input,
         "questions": {
             "matches": {
                 "type": "noul",
-                "instructions": instructions,
-                "criteria": {
-                    "true": true_criteria,
-                    "false": "The text does not match the criterion."
-                }
+                "instructions": instructions
             }
         }
     });
@@ -984,7 +988,7 @@ fn choice_body(model: &str, item: &ItemRequest) -> Result<String, ItemError> {
     let criteria = choice_criteria(&labels, item.label_descriptions.as_deref());
     let body = serde_json::json!({
         "model": model,
-        "state": { "text": input },
+        "state": input,
         "questions": {
             "label": {
                 "type": "choice",
@@ -997,8 +1001,8 @@ fn choice_body(model: &str, item: &ItemRequest) -> Result<String, ItemError> {
 }
 
 /// Decisions `choice.criteria` is an object of label to description.
-/// An array is HTTP 400. A blank description becomes a short sentence
-/// that names the label.
+/// An array is HTTP 400. A blank description is the label itself.
+/// SQL `LABELS ('bigfoot' AS '...')` still sends the custom text.
 fn choice_criteria(labels: &[String], descriptions: Option<&[String]>) -> serde_json::Map<String, serde_json::Value> {
     labels
         .iter()
@@ -1010,14 +1014,14 @@ fn choice_criteria(labels: &[String], descriptions: Option<&[String]>) -> serde_
                 .filter(|s| !s.is_empty());
             let text = match custom {
                 Some(s) => s.to_string(),
-                None => format!("The text is best described as {label}."),
+                None => label.clone(),
             };
             (label.clone(), serde_json::Value::String(text))
         })
         .collect()
 }
 
-fn choice_instructions(item: &ItemRequest, labels: &[String]) -> String {
+fn choice_instructions(item: &ItemRequest, _labels: &[String]) -> String {
     let prompt = item
         .prompt
         .as_deref()
@@ -1028,7 +1032,9 @@ fn choice_instructions(item: &ItemRequest, labels: &[String]) -> String {
         (Some(system), Some(prompt)) => format!("{system}\n{prompt}"),
         (Some(system), None) => system,
         (None, Some(prompt)) => prompt,
-        (None, None) => format!("Which one label fits the text? Labels: {}.", labels.join(", ")),
+        // The label list is the criteria object. Repeating it here
+        // only adds input tokens.
+        (None, None) => "Which label fits?".into(),
     }
 }
 
@@ -1039,18 +1045,45 @@ fn decision_instructions(item: &ItemRequest, criterion: &str) -> String {
         .map(|p| substitute(p, &item.inputs))
         .filter(|s| !s.is_empty());
     let system = item.system.clone().filter(|s| !s.is_empty());
-    match (system, prompt) {
+    let base = match (system, prompt) {
         (Some(system), Some(prompt)) => format!("{system}\n{prompt}"),
         (Some(system), None) => system,
         (None, Some(prompt)) => prompt,
-        (None, None) => {
-            if criterion.is_empty() {
-                "Does the text match the criterion?".into()
-            } else {
-                format!("Does the text match this criterion? {criterion}")
+        (None, None) => String::new(),
+    };
+    if base.is_empty() {
+        if criterion.is_empty() {
+            "yes or no".into()
+        } else {
+            criterion.to_string()
+        }
+    } else if !criterion.is_empty() && !base.contains(criterion) {
+        format!("{base}\n{criterion}")
+    } else {
+        base
+    }
+}
+
+/// Whitespace-delimited words, with each punctuation mark counted alone.
+/// Used to compare prompt scaffolds. Not the provider's tokenizer.
+#[cfg(test)]
+fn rough_tokens(text: &str) -> usize {
+    let mut n = 0usize;
+    let mut in_word = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            if !in_word {
+                n += 1;
+                in_word = true;
+            }
+        } else {
+            in_word = false;
+            if !c.is_whitespace() {
+                n += 1;
             }
         }
     }
+    n
 }
 
 /// `answers.matches.noul` is P(yes), from 0 to 1. Published noul answers
@@ -1207,7 +1240,7 @@ fn miss_meter(
         tokens_out: usage.tokens_out,
         cost_usd: usage.cost_usd,
         cost_saved_usd: Some(0.0),
-        provider_latency_ms: provider_ms,
+        provider_latency_ms: Some(provider_ms),
         latency_ms,
         cache: "miss".into(),
         items: 1,
@@ -1239,7 +1272,7 @@ fn saved_meter(
         tokens_out: Some(0),
         cost_usd: Some(0.0),
         cost_saved_usd: usage.cost_usd,
-        provider_latency_ms: 0,
+        provider_latency_ms: None,
         latency_ms: elapsed_ms(started),
         cache: cache.into(),
         items: 1,
@@ -1268,7 +1301,7 @@ fn meter_cached(
         tokens_out: Some(0),
         cost_usd: Some(0.0),
         cost_saved_usd: stored.produced_cost_usd,
-        provider_latency_ms: 0,
+        provider_latency_ms: None,
         latency_ms: elapsed_ms(started),
         cache: cache.into(),
         items: 1,
@@ -1293,14 +1326,21 @@ fn record_call(server: &Server, meter: &CallMeter) {
         cache.cost_saved_usd += saved;
     }
     if meter.cache == "miss" {
-        let samples = cache
-            .latency_samples
-            .entry((meter.op.clone(), meter.model.clone()))
-            .or_default();
-        if samples.len() == CALL_LOG_CAP {
-            samples.pop_front();
+        if let Some(ms) = meter.provider_latency_ms {
+            let samples = cache
+                .latency_samples
+                .entry((meter.op.clone(), meter.model.clone()))
+                .or_default();
+            if samples.len() == CALL_LOG_CAP {
+                samples.pop_front();
+            }
+            samples.push_back(ms);
         }
-        samples.push_back(meter.provider_latency_ms);
+    } else if meter.cache == "hit" {
+        *cache
+            .latency_hits
+            .entry((meter.op.clone(), meter.model.clone()))
+            .or_default() += 1;
     }
     if cache.calls.len() == CALL_LOG_CAP {
         cache.calls.pop_front();
@@ -1601,14 +1641,27 @@ fn stats_json(server: &Server, lite: bool) -> String {
         .count() as u64;
     if lite {
         let mut latency = Vec::new();
-        for ((op, model), samples) in &cache.latency_samples {
-            let values: Vec<u64> = samples.iter().copied().collect();
+        let mut keys = BTreeSet::new();
+        keys.extend(cache.latency_samples.keys().cloned());
+        keys.extend(cache.latency_hits.keys().cloned());
+        for (op, model) in keys {
+            let values: Vec<u64> = cache
+                .latency_samples
+                .get(&(op.clone(), model.clone()))
+                .map(|samples| samples.iter().copied().collect())
+                .unwrap_or_default();
+            let hits = cache
+                .latency_hits
+                .get(&(op.clone(), model.clone()))
+                .copied()
+                .unwrap_or(0);
             latency.push(serde_json::json!({
                 "op": op,
                 "model": model,
                 "p50_ms": percentile(&values, 0.50),
                 "p95_ms": percentile(&values, 0.95),
                 "calls": values.len(),
+                "hits": hits,
             }));
         }
         latency.sort_by(|a, b| {
@@ -1788,9 +1841,128 @@ mod tests {
         let labels = vec!["bigfoot".into(), "unclear".into()];
         let map = choice_criteria(&labels, Some(&["an unidentified large primate".into(), " ".into()]));
         assert_eq!(map["bigfoot"], serde_json::json!("an unidentified large primate"));
-        assert_eq!(map["unclear"], serde_json::json!("The text is best described as unclear."));
+        assert_eq!(map["unclear"], serde_json::json!("unclear"));
         let plain = choice_criteria(&labels, None);
-        assert_eq!(plain["bigfoot"], serde_json::json!("The text is best described as bigfoot."));
+        assert_eq!(plain["bigfoot"], serde_json::json!("bigfoot"));
+    }
+
+    fn demo_item(input: &str, criterion: &str) -> ItemRequest {
+        ItemRequest {
+            key: "0".into(),
+            cache_key: "00".into(),
+            inputs: serde_json::json!({"input": input, "criterion": criterion}),
+            criterion: Some(criterion.into()),
+            system: None,
+            prompt: Some("Does the text match the criterion?".into()),
+            labels: None,
+            label_descriptions: None,
+        }
+    }
+
+    /// Frozen body from before the scaffold trim. State repeated the
+    /// criterion, and `criteria.true` repeated it again.
+    fn legacy_noul_body(model: &str, input: &str, criterion: &str, instructions: &str) -> String {
+        serde_json::json!({
+            "model": model,
+            "state": { "text": input, "criterion": criterion },
+            "questions": {
+                "matches": {
+                    "type": "noul",
+                    "instructions": instructions,
+                    "criteria": {
+                        "true": criterion,
+                        "false": "The text does not match the criterion."
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn legacy_choice_body(model: &str, input: &str, labels: &[&str]) -> String {
+        let mut criteria = serde_json::Map::new();
+        for label in labels {
+            criteria.insert(
+                (*label).to_string(),
+                serde_json::json!(format!("The text is best described as {label}.")),
+            );
+        }
+        serde_json::json!({
+            "model": model,
+            "state": { "text": input },
+            "questions": {
+                "label": {
+                    "type": "choice",
+                    "instructions": "Which one label fits the text? Labels: bigfoot, known animal, unclear.",
+                    "criteria": criteria,
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn scaffold_tokens(body: &str, input: &str) -> usize {
+        rough_tokens(body).saturating_sub(rough_tokens(input))
+    }
+
+    #[test]
+    fn noul_scaffold_is_smaller_than_the_legacy_body() {
+        let model = "typesafe/jev-1.14";
+        let input = "A tall hairy figure crossed the logging road on two legs and left huge prints.";
+        let criterion = "a large hairy biped was seen";
+        let item = demo_item(input, criterion);
+        let new_body = noul_body(model, &item).unwrap();
+        let old_body = legacy_noul_body(
+            model,
+            input,
+            criterion,
+            "Does the text match the criterion?",
+        );
+        let old_scaffold = scaffold_tokens(&old_body, input);
+        let new_scaffold = scaffold_tokens(&new_body, input);
+        assert_eq!(old_scaffold, 109, "{old_body}");
+        assert_eq!(new_scaffold, 63, "{new_body}");
+        assert_eq!(rough_tokens(&old_body), 125, "{old_body}");
+        assert_eq!(rough_tokens(&new_body), 79, "{new_body}");
+        assert!(
+            new_scaffold * 10 <= old_scaffold * 6,
+            "noul scaffold tokens {old_scaffold} -> {new_scaffold}; full {old} -> {new}",
+            old = rough_tokens(&old_body),
+            new = rough_tokens(&new_body),
+        );
+        assert_eq!(new_body.matches(criterion).count(), 1, "{new_body}");
+        assert_eq!(old_body.matches(criterion).count(), 2, "{old_body}");
+        assert!(new_body.contains(r#""state":"A tall hairy figure"#), "{new_body}");
+        assert!(!new_body.contains("criteria"), "{new_body}");
+        assert!(!new_body.contains("does not match"), "{new_body}");
+
+        let mut already = item.clone();
+        already.prompt = Some(format!("Criterion: {criterion}"));
+        let once = noul_body(model, &already).unwrap();
+        assert_eq!(once.matches(criterion).count(), 1, "{once}");
+
+        let mut bare = item.clone();
+        bare.prompt = None;
+        bare.criterion = Some(criterion.into());
+        let only = noul_body(model, &bare).unwrap();
+        assert_eq!(only.matches(criterion).count(), 1, "{only}");
+
+        let labels = ["bigfoot", "known animal", "unclear"];
+        let mut choice = item.clone();
+        choice.prompt = None;
+        choice.labels = Some(labels.iter().map(|s| (*s).to_string()).collect());
+        let new_choice = choice_body(model, &choice).unwrap();
+        let old_choice = legacy_choice_body(model, input, &labels);
+        let old_choice_scaffold = scaffold_tokens(&old_choice, input);
+        let new_choice_scaffold = scaffold_tokens(&new_choice, input);
+        assert_eq!(old_choice_scaffold, 124, "{old_choice}");
+        assert_eq!(new_choice_scaffold, 85, "{new_choice}");
+        assert!(
+            new_choice_scaffold * 10 <= old_choice_scaffold * 8,
+            "choice scaffold tokens {old_choice_scaffold} -> {new_choice_scaffold}"
+        );
+        assert!(new_choice.contains(r#""bigfoot":"bigfoot""#), "{new_choice}");
+        assert!(!new_choice.contains("best described"), "{new_choice}");
     }
 
     #[test]

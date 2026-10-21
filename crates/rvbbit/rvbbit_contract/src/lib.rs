@@ -142,8 +142,8 @@ pub struct ItemRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
     /// Optional description for each [`Self::labels`] entry, same order.
-    /// An empty string uses the default criteria sentence. Omitted when
-    /// every description is empty, so label-only cache keys stay put.
+    /// An empty string uses the label itself. Omitted when every
+    /// description is empty, so label-only cache keys stay put.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_descriptions: Option<Vec<String>>,
 }
@@ -205,9 +205,12 @@ pub struct CallMeter {
     /// USD avoided. 0 on a miss. Absent when the original charge is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_saved_usd: Option<f64>,
-    /// Milliseconds spent in the inference HTTP call. 0 on a cache hit.
-    /// A generation-metadata GET is not included.
-    pub provider_latency_ms: u64,
+    /// Milliseconds spent in the inference HTTP call.
+    /// Absent on a cache hit and on a single-flight waiter, so
+    /// `avg(provider_latency_ms)` is the miss average. A
+    /// generation-metadata GET is not included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_latency_ms: Option<u64>,
     /// Milliseconds spent in hutch for this call, including a generation
     /// lookup when one was required.
     pub latency_ms: u64,
