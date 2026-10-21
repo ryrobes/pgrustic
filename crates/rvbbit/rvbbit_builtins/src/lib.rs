@@ -6,8 +6,8 @@
 
 use datum::Datum;
 use rvbbit_oids::{
-    DUMP_NAME, DUMP_OID, EXTRACT_NAME, EXTRACT_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID,
-    RESTORE_NAME, RESTORE_OID,
+    CLASSIFY_NAME, CLASSIFY_OID, DUMP_NAME, DUMP_OID, EXTRACT_NAME, EXTRACT_OID, GETDEF_NAME,
+    GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RESTORE_NAME, RESTORE_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -51,6 +51,45 @@ pub fn rvbbit_extract(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgR
     }
     let oid = flinfo.as_ref().map(|f| f.fn_oid).unwrap_or(EXTRACT_OID);
     let text = rvbbit_dispatch::extract_text(oid, &input)?;
+    Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), text.as_bytes())?))
+}
+
+/// `double precision` semantic function. Same inputs as MEANS. Returns
+/// the decision yes-probability instead of the boolean.
+pub fn rvbbit_means_score(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: the builtin is strict, so both arguments are non-null text.
+    let (left, right) = unsafe {
+        (
+            fcinfo.arg_varlena_packed(0)?.data(),
+            fcinfo.arg_varlena_packed(1)?.data(),
+        )
+    };
+    let left = String::from_utf8_lossy(left);
+    let right = String::from_utf8_lossy(right);
+    let oid = flinfo.as_ref().map(|f| f.fn_oid).unwrap_or(MEANS_SCORE_OID);
+    let score = rvbbit_dispatch::means_score(oid, &left, &right)?;
+    Ok(Datum::from_f64(score))
+}
+
+/// Text scalar for a semantic function with a fixed `LABELS` set.
+/// The returned text is JSON `{label, score, scores}`.
+pub fn rvbbit_classify(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    if fcinfo.nargs() == 0 {
+        return Err(Box::new(types_error::PgError::error(
+            "rvbbit_classify requires the source text".to_string(),
+        )));
+    }
+    let mut input = String::new();
+    for i in 0..fcinfo.nargs() {
+        let packed = unsafe { fcinfo.arg_varlena_packed(i)? };
+        if i > 0 {
+            input.push('\n');
+        }
+        input.push_str(&String::from_utf8_lossy(packed.data()));
+    }
+    let oid = flinfo.as_ref().map(|f| f.fn_oid).unwrap_or(CLASSIFY_OID);
+    let text = rvbbit_dispatch::classify_text(oid, &input)?;
     Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), text.as_bytes())?))
 }
 
@@ -120,5 +159,21 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: true,
         retset: false,
         func: rvbbit_extract as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: MEANS_SCORE_OID,
+        name: MEANS_SCORE_NAME,
+        nargs: 2,
+        strict: true,
+        retset: false,
+        func: rvbbit_means_score as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CLASSIFY_OID,
+        name: CLASSIFY_NAME,
+        nargs: 1,
+        strict: true,
+        retset: false,
+        func: rvbbit_classify as PGFunction,
     },
 ];

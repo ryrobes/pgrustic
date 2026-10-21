@@ -225,6 +225,8 @@ pub struct FnClauses {
     pub cache: Option<String>,
     pub tests: Vec<String>,
     pub version: Option<i64>,
+    /// Fixed classify labels. Empty means extract (chat), not classify.
+    pub labels: Vec<String>,
 }
 
 impl Default for FnClauses {
@@ -238,6 +240,7 @@ impl Default for FnClauses {
             cache: None,
             tests: Vec::new(),
             version: None,
+            labels: Vec::new(),
         }
     }
 }
@@ -814,6 +817,26 @@ impl<'a> Parser<'a> {
                 c.tests.push(format!("{name} EXPECT {expect} FOR {for_list}"));
             } else if self.eat_kw(Kw::Version) {
                 c.version = Some(self.int()?);
+            } else if self.eat_kw(Kw::Labels) {
+                self.expect_sym('(')?;
+                let mut labels = Vec::new();
+                if !self.at_sym(')') {
+                    loop {
+                        let label = self.string()?;
+                        if label.is_empty() {
+                            return Err("classify label is empty".into());
+                        }
+                        labels.push(label);
+                        if !self.eat_sym(',') {
+                            break;
+                        }
+                    }
+                }
+                self.expect_sym(')')?;
+                if labels.len() < 2 {
+                    return Err("classify label set needs at least two labels".into());
+                }
+                c.labels = labels;
             } else if self.eat_kw(Kw::Steps) || self.eat_kw(Kw::Takes) || self.eat_kw(Kw::Ward) {
                 return Err(format!(
                     "{} is not implemented until milestone M5",
@@ -926,7 +949,7 @@ impl<'a> Parser<'a> {
         // Stop before a clause keyword.
         let stop = [
             Kw::Model, Kw::System, Kw::Prompt, Kw::Max, Kw::Temperature, Kw::Cache, Kw::Test,
-            Kw::Version, Kw::Steps, Kw::Takes, Kw::Ward, Kw::As,
+            Kw::Version, Kw::Steps, Kw::Takes, Kw::Ward, Kw::As, Kw::Labels,
         ];
         let mut depth = 0i32;
         let mut parts = Vec::new();
@@ -1327,7 +1350,7 @@ enum Kw {
     Returns, System, Prompt, Max, Tokens, Temperature, Cache, Test, Expect, For,
     Leftarg, Rightarg, Symbol, Negator, Ask, Yes, No, Choose, When, Then, Meaning,
     Threshold, Using, As, Version, Set, Cascade, Restrict, Usage, Execute, To, From, Is,
-    Null, Steps, Takes, Ward,
+    Null, Steps, Takes, Ward, Labels,
 }
 
 impl Kw {
@@ -1402,6 +1425,7 @@ impl Kw {
             Kw::Steps => "steps",
             Kw::Takes => "takes",
             Kw::Ward => "ward",
+            Kw::Labels => "labels",
         }
     }
 
@@ -1476,6 +1500,7 @@ impl Kw {
             "steps" => Kw::Steps,
             "takes" => Kw::Takes,
             "ward" => Kw::Ward,
+            "labels" => Kw::Labels,
             _ => return None,
         })
     }
@@ -1692,9 +1717,30 @@ mod tests {
                 assert_eq!(clauses.system.as_deref(), Some("sys"));
                 assert_eq!(clauses.max_tokens, Some(16));
                 assert_eq!(clauses.tests.len(), 1);
+                assert!(clauses.labels.is_empty());
             }
             other => panic!("{other:?}"),
         }
+
+        let kind = parse_command(
+            "CREATE SEMANTIC FUNCTION kind(notes text) RETURNS text MODEL jev \
+             LABELS ('bigfoot', 'known animal', 'unclear')",
+        )
+        .unwrap();
+        match kind {
+            Command::CreateFunction { returns, clauses, .. } => {
+                assert_eq!(returns, "text");
+                assert_eq!(
+                    clauses.labels,
+                    vec!["bigfoot".to_string(), "known animal".to_string(), "unclear".to_string()]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let one = parse_command(
+            "CREATE SEMANTIC FUNCTION kind(notes text) RETURNS text LABELS ('only')",
+        );
+        assert!(one.unwrap_err().contains("at least two"));
 
         let op = parse_command(
             "CREATE SEMANTIC OPERATOR MEANS (LEFTARG = text, RIGHTARG = text, FUNCTION = means, SYMBOL = '~~?', NEGATOR = NOT MEANS)",

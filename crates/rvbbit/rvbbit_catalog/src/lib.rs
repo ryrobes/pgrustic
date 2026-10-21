@@ -53,7 +53,8 @@ pub fn semfn_def(name: &str) -> PgResult<Option<String>> {
     ensure_schema()?;
     let rows = query(&format!(
         "SELECT name, argnames::text, argtypes::text, rettype, model_name, system_prompt, \
-                user_prompt, max_tokens::text, temperature::text, cache_mode, tests, version::text \
+                user_prompt, max_tokens::text, temperature::text, cache_mode, tests, version::text, \
+                labels \
          FROM rvbbit.semfn WHERE nsp = 'rvbbit' AND name = {} ORDER BY name",
         qlit(name)
     ))?;
@@ -128,7 +129,7 @@ fn reload() -> PgResult<()> {
                 COALESCE(m.remote_name, 'mock'), b.url, b.auth_env, \
                 COALESCE(b.batch_size, 32)::text, COALESCE(b.max_concurrent, 4)::text, \
                 COALESCE(b.timeout_ms, 30000)::text, COALESCE(b.retries, 5)::text, \
-                COALESCE(f.cache_mode, 'memoize') \
+                COALESCE(f.cache_mode, 'memoize'), COALESCE(f.labels, '') \
          FROM rvbbit.semfn f \
          LEFT JOIN rvbbit.semop o ON o.func_name = f.name \
          LEFT JOIN rvbbit.model m ON m.name = f.model_name \
@@ -176,6 +177,7 @@ fn reload() -> PgResult<()> {
                     let mode = cell(&r, 16);
                     if mode.is_empty() { "memoize".into() } else { mode }
                 },
+                labels: parse_labels(&cell(&r, 17)),
             },
         });
     }
@@ -332,7 +334,10 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
     if existing.is_some() && !or_replace {
         return Err(pg(format!("semantic function \"{name}\" already exists")));
     }
-    let procoid = create_proc(name, args, returns)?;
+    if !clauses.labels.is_empty() && !is_text_return(returns) {
+        return Err(pg("LABELS is only valid on a text semantic function"));
+    }
+    let procoid = create_proc(name, args, returns, &clauses.labels)?;
     let tests = if clauses.tests.is_empty() {
         "NULL".to_string()
     } else {
@@ -346,7 +351,8 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
     let sets = format!(
         "argnames = {an}, argtypes = {at}, rettype = {rt}, model_name = {model}, \
          system_prompt = {sys}, user_prompt = {prompt}, max_tokens = {max}, temperature = {temp}, \
-         cache_mode = {cache}, tests = {tests}, procoid = {procoid}, version = {version_sql}",
+         cache_mode = {cache}, tests = {tests}, procoid = {procoid}, version = {version_sql}, \
+         labels = {labels}",
         an = text_array(&args.iter().map(|a| a.name.clone()).collect::<Vec<_>>()),
         at = text_array(&args.iter().map(|a| a.typ.clone()).collect::<Vec<_>>()),
         rt = qlit(returns),
@@ -357,6 +363,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
         temp = opt_f64(clauses.temperature.or(Some(0.0))),
         cache = qlit(clauses.cache.as_deref().unwrap_or("memoize")),
         tests = tests,
+        labels = labels_sql(&clauses.labels),
     );
     let oid = if let Some(oid) = existing {
         clear_deps("semfn", &oid)?;
@@ -365,8 +372,8 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
     } else {
         let oid = next_oid()?;
         exec(&format!(
-            "INSERT INTO rvbbit.semfn (oid, name, nsp, argnames, argtypes, rettype, model_name, system_prompt, user_prompt, max_tokens, temperature, cache_mode, tests, procoid, owner_name, version) \
-             VALUES ({oid}, {name}, 'rvbbit', {an}, {at}, {rt}, {model}, {sys}, {prompt}, {max}, {temp}, {cache}, {tests}, {procoid}, current_user, {ver})",
+            "INSERT INTO rvbbit.semfn (oid, name, nsp, argnames, argtypes, rettype, model_name, system_prompt, user_prompt, max_tokens, temperature, cache_mode, tests, procoid, owner_name, version, labels) \
+             VALUES ({oid}, {name}, 'rvbbit', {an}, {at}, {rt}, {model}, {sys}, {prompt}, {max}, {temp}, {cache}, {tests}, {procoid}, current_user, {ver}, {labels})",
             name = qlit(name),
             an = text_array(&args.iter().map(|a| a.name.clone()).collect::<Vec<_>>()),
             at = text_array(&args.iter().map(|a| a.typ.clone()).collect::<Vec<_>>()),
@@ -379,6 +386,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
             cache = qlit(clauses.cache.as_deref().unwrap_or("memoize")),
             tests = if clauses.tests.is_empty() { "NULL".to_string() } else { qlit(&clauses.tests.join("\n")) },
             ver = clauses.version.unwrap_or(1),
+            labels = labels_sql(&clauses.labels),
         ))?;
         oid
     };
@@ -835,7 +843,11 @@ fn fn_types(name: &str, args: &[Arg]) -> PgResult<Vec<String>> {
     Ok(parse_pg_array(&raw))
 }
 
-fn create_proc(name: &str, args: &[Arg], returns: &str) -> PgResult<String> {
+fn is_text_return(returns: &str) -> bool {
+    returns.trim().eq_ignore_ascii_case("text")
+}
+
+fn create_proc(name: &str, args: &[Arg], returns: &str, labels: &[String]) -> PgResult<String> {
     let sig = args
         .iter()
         .map(|a| format!("{} {}", qident(&a.name), a.typ))
@@ -843,11 +855,20 @@ fn create_proc(name: &str, args: &[Arg], returns: &str) -> PgResult<String> {
         .join(", ");
     let prosrc = match returns.trim().to_ascii_lowercase().as_str() {
         "boolean" | "bool" => "rvbbit_means",
+        "double precision" | "float8" | "float" => "rvbbit_means_score",
         // JSON is parsed by hutch and returned as text. Cast in SQL for jsonb.
-        "text" => "rvbbit_extract",
+        // A declared label set uses the decision model and returns
+        // {"label","score","scores"} as text.
+        "text" if labels.is_empty() => "rvbbit_extract",
+        "text" => {
+            if labels.len() < 2 {
+                return Err(pg("classify label set needs at least two labels"));
+            }
+            "rvbbit_classify"
+        }
         other => {
             return Err(pg(format!(
-                "semantic function return type {other} is not supported yet; use boolean or text"
+                "semantic function return type {other} is not supported yet; use boolean, double precision, or text"
             )))
         }
     };
@@ -872,6 +893,8 @@ fn ensure_schema() -> PgResult<()> {
             exec(sql)?;
         }
     }
+    // Clusters created before fixed-label classify have no labels column.
+    exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS labels text")?;
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'dump_sql'",
@@ -932,6 +955,7 @@ const SCHEMA_DDL: &[&str] = &[
         owner_name text NOT NULL,
         comment text,
         version int NOT NULL DEFAULT 1,
+        labels text,
         UNIQUE (nsp, name))",
     "CREATE TABLE IF NOT EXISTS rvbbit.semop (
         oid oid PRIMARY KEY,
@@ -1055,7 +1079,7 @@ fn render_dump() -> PgResult<String> {
     }
     let fns = query(
         "SELECT name, argnames::text, argtypes::text, rettype, model_name, system_prompt, user_prompt, \
-                max_tokens::text, temperature::text, cache_mode, tests, version::text, comment \
+                max_tokens::text, temperature::text, cache_mode, tests, version::text, labels, comment \
          FROM rvbbit.semfn WHERE nsp = 'rvbbit' ORDER BY name",
     )?;
     for r in &fns {
@@ -1162,6 +1186,13 @@ fn render_function(r: &[Option<String>]) -> String {
         args,
         cell(r, 3)
     );
+    if let Some(raw) = cell_opt(r, 12) {
+        let labels = parse_labels(&raw);
+        if !labels.is_empty() {
+            let quoted = labels.iter().map(|l| qlit(l)).collect::<Vec<_>>().join(", ");
+            s.push_str(&format!(" LABELS ({quoted})"));
+        }
+    }
     if let Some(model) = cell_opt(r, 4) {
         s.push_str(&format!(" MODEL {}", qident(&model)));
     }
@@ -1322,6 +1353,22 @@ fn version_expr(version: Option<i64>) -> String {
         Some(v) => v.to_string(),
         None => "version + 1".into(),
     }
+}
+
+fn labels_sql(labels: &[String]) -> String {
+    if labels.is_empty() {
+        "NULL".into()
+    } else {
+        qlit(&serde_json::to_string(labels).unwrap_or_else(|_| "[]".into()))
+    }
+}
+
+fn parse_labels(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 fn cell(row: &[Option<String>], i: usize) -> String {

@@ -29,6 +29,8 @@ pub struct Endpoint {
     pub return_type: String,
     /// Catalog `cache_mode`: `memoize`, `refresh`, or `off`.
     pub cache_mode: String,
+    /// Declared classify labels. Empty for MEANS, score, and extract.
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -166,5 +168,6 @@ pub fn default_endpoint() -> Endpoint {
         return_type: "boolean".into(),
         // Pre-catalog fallback. Catalog rows send their own mode.
         cache_mode: "off".into(),
+        labels: Vec::new(),
     }
 }

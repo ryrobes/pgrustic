@@ -183,6 +183,43 @@ pub fn extract_text(func_oid: u32, input: &str) -> PgResult<String> {
     decode_json_text(&raw.body).map_err(pg)
 }
 
+/// Fixed-label classify. The SQL function's declared labels ride on the
+/// endpoint. Hutch returns the winning label, its probability, and the
+/// per-label map. This function packs those into one JSON text value.
+pub fn classify_text(func_oid: u32, input: &str) -> PgResult<String> {
+    let ep = rvbbit_resolve::endpoint_for(func_oid);
+    let inputs = serde_json::json!({ "input": input });
+    let body = encode_items(&ep, Operation::Classify, &[inputs]).map_err(pg)?;
+    let auth = bearer(&ep).map_err(pg)?;
+    let ticket = enqueue(
+        format!("{}/v1/classify", ep.base_url.trim_end_matches('/')),
+        auth,
+        &ep,
+        body,
+        cache_header(cache_mode_of(&ep), None, None),
+    )?;
+    let raw = wait_raw(ticket)?;
+    decode_classify(&raw.body).map_err(pg)
+}
+
+/// One predict call that returns the decision score (yes-probability).
+/// Same wire body as MEANS. The boolean operator does not read `score`.
+pub fn means_score(func_oid: u32, input: &str, criterion: &str) -> PgResult<f64> {
+    let ep = rvbbit_resolve::endpoint_for(func_oid);
+    let inputs = serde_json::json!({ "input": input, "criterion": criterion });
+    let body = encode_items(&ep, Operation::Predict, &[inputs]).map_err(pg)?;
+    let auth = bearer(&ep).map_err(pg)?;
+    let ticket = enqueue(
+        format!("{}/v1/predict", ep.base_url.trim_end_matches('/')),
+        auth,
+        &ep,
+        body,
+        cache_header(cache_mode_of(&ep), None, None),
+    )?;
+    let raw = wait_raw(ticket)?;
+    decode_score(&raw.body).map_err(pg)
+}
+
 fn cache_mode_of(ep: &Endpoint) -> CacheMode {
     match ep.cache_mode.as_str() {
         "off" => CacheMode::Off,
@@ -285,12 +322,13 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
     let prompt = if ep.user_prompt.is_empty() { None } else { Some(ep.user_prompt.clone()) };
     let mut req_items = Vec::with_capacity(inputs.len());
     for (i, inputs) in inputs.iter().enumerate() {
+        let schema = return_schema(ep);
         let cache_key = client_cache_key_hex(&CacheKeyParts {
             fn_name: &ep.fn_name,
             fn_version: ep.fn_version,
             system_prompt: &ep.system_prompt,
             user_prompt: &ep.user_prompt,
-            return_schema: &ep.return_type,
+            return_schema: &schema,
             model: &ep.model,
             temperature: ep.temperature,
             max_tokens: ep.max_tokens,
@@ -306,6 +344,7 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
             criterion,
             system: system.clone(),
             prompt: prompt.clone(),
+            labels: if ep.labels.is_empty() { None } else { Some(ep.labels.clone()) },
         });
     }
     let req = BatchRequest {
@@ -315,8 +354,47 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
         temperature: ep.temperature,
         max_tokens: ep.max_tokens,
         items: req_items,
+        decision: None,
     };
     serde_json::to_string(&req).map_err(|e| format!("hutch encode: {e}"))
+}
+
+/// Fold a non-empty label set into the schema string that the cache key
+/// already hashes. Empty labels leave the schema unchanged.
+fn return_schema(ep: &Endpoint) -> String {
+    if ep.labels.is_empty() {
+        ep.return_type.clone()
+    } else {
+        format!("{} labels={}", ep.return_type, ep.labels.join("\u{1f}"))
+    }
+}
+
+fn decode_classify(text: &str) -> Result<String, String> {
+    let parsed: BatchResponse = serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let item = parsed.outputs.first().ok_or_else(|| "hutch classify returned no items".to_string())?;
+    if let Some(err) = &item.error {
+        return Err(format!("hutch item 0: {} {}", err.code, err.message));
+    }
+    let label = item
+        .value
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "hutch classify item has no label".to_string())?;
+    let packed = serde_json::json!({
+        "label": label,
+        "score": item.score,
+        "scores": item.scores,
+    });
+    Ok(packed.to_string())
+}
+
+fn decode_score(text: &str) -> Result<f64, String> {
+    let parsed: BatchResponse = serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let item = parsed.outputs.first().ok_or_else(|| "hutch predict returned no items".to_string())?;
+    if let Some(err) = &item.error {
+        return Err(format!("hutch item 0: {} {}", err.code, err.message));
+    }
+    item.score.ok_or_else(|| "hutch predict item has no score".into())
 }
 
 fn decode_json_text(text: &str) -> Result<String, String> {

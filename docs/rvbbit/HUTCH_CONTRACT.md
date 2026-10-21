@@ -257,37 +257,86 @@ arguments. Hutch returns JSON; the SQL function returns that JSON as
 A bool `value` of JSON `true`/`false` is the predicate result. A non-bool
 value fails the batch. Item errors fail the batch.
 
+`score` on a predict item is the yes-probability. SQL
+`RETURNS double precision` is `rvbbit_means_score` (oid 9025). It posts
+the same `/v1/predict` body as MEANS and returns `outputs[0].score`.
+Give it the same prompt as MEANS when the two should share a provider
+call: hutch-lite memos the Decisions HTTP body, which does not include
+the function name.
+
+A text function with `LABELS ('a', 'b', ...)` (at least two labels) is
+`rvbbit_classify` (oid 9026). It posts `/v1/classify` with `item.labels`
+set. The SQL result is JSON text `{"label","score","scores"}`. Text
+without `LABELS` stays `rvbbit_extract` on `/v1/extract`.
+
+The client cache key is unchanged for functions with no labels. Dispatch
+folds a non-empty label list into the return-schema string before
+hashing: `{return_type} labels=` plus the labels joined by U+001F.
+`ItemRequest.labels` is not a separate hashed field.
+
 ## Hutch-lite
 
 `crates/rvbbit/rvbbit_hutch_lite` is an in-tree server that speaks this
-contract over plain HTTP and forwards `predict`, `extract`, and
-`classify` to an OpenAI-compatible chat endpoint (OpenRouter by default).
-It is not the private hutch. No JSON field was added.
+contract over plain HTTP. It is not the private hutch. These JSON fields
+were added and are optional: `BatchRequest.decision`, `ItemRequest.labels`,
+`ItemResponse.score`, `ItemResponse.scores`. Older clients omit them.
+Lookup and put still store the value only; they do not store `score` or
+`scores`.
+
+Predict, decide, and fixed-label classify call OpenRouter's Decisions API
+(Jev by default). Extract, and classify with no label set, call an
+OpenAI-compatible chat endpoint.
 
 What it implements:
 
-- `POST /v1/predict` (and the `/v1/means` alias), `/v1/extract`, `/v1/classify`
+- `POST /v1/predict` (and the `/v1/means` alias), `/v1/decide`, `/v1/extract`, `/v1/classify`
 - batched items, per-item errors, siblings may succeed
-- in-memory cache. The storage key is `storage_key(client_key, tenant)` from `rvbbit_contract`. The client key already mixes operation identity (function name and version), template hash, model, temperature, max_tokens, take index, seed, and canonical inputs. Tenant is mixed only on the hutch side: blake3 hex of the bearer token, or `HUTCH_TENANT` (default `local`) when the request has no bearer
-- single-flight for concurrent misses of the same storage key
+- in-memory cache. The storage key starts from `storage_key(client_key, tenant)`. Decision calls then mix the resolved model list, take count, combine mode, threshold, and any non-empty label list. Tenant is blake3 hex of the bearer token, or `HUTCH_TENANT` (default `local`) when the request has no bearer
+- a separate memo of Decisions HTTP bodies, keyed by tenant, take index, and the request JSON. It is used only for `mode=read-write`, so MEANS and `means_score` share one provider call when both are memoize and the prompt and inputs match. `off` and `refresh` call the provider again
+- single-flight for concurrent misses of the same storage key and of the same decision body
 - `POST /v1/cache/lookup`, `/put`, `/purge`, `/stats` in memory. Put is inline, not a background writer queue
 - `GET /stats` is lite instrumentation. It adds `provider_calls` and `requests` on top of the cache counters. `GET` or `POST /v1/cache/stats` stays the contract shape and does not include those two fields
 
+Decision calls:
+
+- URL: `OPENROUTER_DECISIONS_URL`, or derived from `OPENROUTER_BASE_URL`. A base ending in `/api/v1` (the OpenRouter default `https://openrouter.ai/api/v1`) becomes `{root}/api/alpha/decisions`. A base ending in `/v1` (the crate tests) becomes `{origin}/alpha/decisions`. Anything else is `{base}/alpha/decisions`
+- Model: empty or `mock` becomes `HUTCH_DECISION_MODEL` (default `typesafe/jev-1.14`). Any other slug, including `~typesafe/jev-latest`, is sent unchanged. Chat still uses `HUTCH_MODEL` (default `openai/gpt-4o-mini`) for extract and for classify with no labels
+- MEANS / decide: one `noul` question, id `matches`. State is `{text, criterion}`. `score` is the mean `noul` (0 to 1). The boolean is that mean compared with `HUTCH_DECISION_THRESHOLD` (default 0.5). Published noul answers have no separate confidence field; `noul` is the score
+- Fixed-label classify: one `choice` question, id `label`, criteria equal to the declared labels. `scores` is the probability map restricted to those labels. `score` is the winning label's probability. The published `choice` loses to argmax, and `confidence` is not that probability. `confidence` is copied onto the chosen label only when the map omits it
+- Stack: optional `decision.models`, `decision.takes` (default `HUTCH_DECISION_TAKES`, clamp 1..=8), `decision.combine` (`mean` or `vote`). SQL does not emit this. `TAKES` / `PICK` still fail in the parser until M5. The take index is in the memo key and is not sent. Temperature and `max_tokens` are not sent and are not part of the decision memo key
+- Vote: more yes-votes than no-votes, where a vote is `noul >= threshold`. A tie uses the mean. The reported score is still the mean
+- Cost, classify: one Decisions request per item per take per stacked model. Jev charges input tokens only (about $0.042 per million); output tokens are free. N labels do not multiply the request count, because `choice` returns every label's probability in that one call. A binary-only model would need N `noul` calls (one per label, one-vs-rest) and then argmax. That fallback is not implemented. Jev's `choice` question is multi-class
+- Cost, MEANS: the same shape, one `noul` request per item per take per stacked model, not one request per row of a SQL batch on the wire from pgrustic. Hutch-lite fans the batch out
+
 What it stubs:
 
-- `TAKES` / `PICK` have no route. The SQL parser still errors with “not implemented until milestone M5”. Take index on the wire is 0
-- `embed`, `rerank`, and `decide` return a per-item error `code=unsupported` and do not call the provider
+- `TAKES` / `PICK` have no SQL syntax yet. The parser still errors with “not implemented until milestone M5”. Take index on the client cache key is 0. The `decision` object is the stack hook
+- `embed` and `rerank` return a per-item error `code=unsupported` and do not call the provider
 - a wrong or missing `X-Rvbbit-Contract` is accepted, same as the mock
 - client disconnect does not cancel an in-flight provider call
-- `POST /reset` clears the process cache. That route is for tests and the demo
+- `POST /reset` clears the process cache and the decision memo. That route is for tests and the demo
 
 The upstream API key is `OPENROUTER_API_KEY`, read by hutch-lite and never
 logged. `OPENROUTER_BASE_URL` overrides the chat base (default
-`https://openrouter.ai/api/v1`); the call is `{base}/chat/completions`.
-`HUTCH_MODEL` (default `openai/gpt-4o-mini`) is used when the request
-model is empty or `mock`. Any other request model is sent through.
+`https://openrouter.ai/api/v1`); chat is `{base}/chat/completions`.
 `BACKEND AUTH ENV` is the bearer for hutch itself. Leave it null for
 hutch-lite; do not put the OpenRouter key there.
+
+Sources for the Decisions API, read when this path was added:
+
+- <https://openrouter.ai/typesafe/jev-1.14>
+- <https://openrouter.ai/docs/guides/community/jev>
+- <https://openrouter.ai/docs/guides/community/jev-tutorial>
+- <https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request>
+- <https://github.com/OpenRouterTeam/skills/blob/main/skills/openrouter-decisions/references/decisions-api.md>
+- <https://docs.typesafe.ai/models> (the direct TypeSafe id is `jev-1.14.0`; OpenRouter's id is `typesafe/jev-1.14`)
+
+Uncertain, and called out so a later response shape can be checked:
+
+- Published `noul` examples omit `confidence`. The score is `noul`. A later `confidence` field would not replace it.
+- TypeSafe says the caller picks the threshold. Their tool-gating cookbook uses 0.8. This server defaults to 0.5.
+- `confidence` on a `choice` answer is not the probability of the winning label.
+- Jev is not documented as sampling. Repeated takes of the same body may return the same number. The take index still forces a separate call so a later sampling model can be stacked.
 
 ## What the real hutch has to change
 
@@ -308,4 +357,6 @@ items marked mock.
 11. 429 responses should include `Retry-After` as an integer number of seconds. pgrustic waits that long (capped at 2s) and retries within the backend attempt budget.
 12. Keep accepting the previous predict body until callers have moved, or gate it on the contract header. pgrustic no longer sends the spike's JSON array.
 
-Dependency: add `rvbbit_contract` (this repo's `crates/rvbbit/rvbbit_contract`) as a path or git dependency. The crate's public types are the ones named above: `BatchRequest`, `ItemRequest`, `BatchResponse`, `ItemResponse`, `ItemError`, `CacheLookupRequest`, `CacheLookupResponse`, `CacheHit`, `CachePutRequest`, `CachePutEntry`, `CachePutResponse`, `CachePurgeRequest`, `CachePurgeResponse`, `CacheStatsResponse`, `CacheKeyParts`, `client_cache_key`, `client_cache_key_hex`, `storage_key`, `canonical_json`, `cache_header`.
+The list above is otherwise unchanged. `score`, `scores`, `labels`, and `decision` are additive optional fields. A server that ignores them still answers MEANS with a boolean `value`.
+
+Dependency: add `rvbbit_contract` (this repo's `crates/rvbbit/rvbbit_contract`) as a path or git dependency. The crate's public types are the ones named above, plus `DecisionStack`: `BatchRequest`, `ItemRequest`, `BatchResponse`, `ItemResponse`, `ItemError`, `CacheLookupRequest`, `CacheLookupResponse`, `CacheHit`, `CachePutRequest`, `CachePutEntry`, `CachePutResponse`, `CachePurgeRequest`, `CachePurgeResponse`, `CacheStatsResponse`, `CacheKeyParts`, `client_cache_key`, `client_cache_key_hex`, `storage_key`, `canonical_json`, `cache_header`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build pgrustic + hutch-lite and run a few live MEANS / EXTRACT queries.
+# Build pgrustic + hutch-lite and run live MEANS, score, CLASSIFY, and EXTRACT queries.
 #
 # Prerequisites on a fresh Ubuntu box (see docs/rvbbit/HUTCH_LITE.md):
 #   sudo apt-get update
@@ -13,7 +13,9 @@
 # script forces CC=gcc CXX=g++.
 #
 # Required: OPENROUTER_API_KEY (never printed).
-# Optional: HUTCH_MODEL (default openai/gpt-4o-mini), OPENROUTER_BASE_URL,
+# Optional: HUTCH_MODEL (chat, default openai/gpt-4o-mini),
+#           HUTCH_DECISION_MODEL (MEANS and fixed-label CLASSIFY,
+#           default typesafe/jev-1.14), OPENROUTER_BASE_URL,
 #           HUTCH_TIMEOUT_MS (default 60000 inside hutch-lite).
 #
 # Ports: Postgres 55433, hutch 8098. The spike's 55432 / 8099 are left alone.
@@ -30,8 +32,10 @@ PGHOST=${PGHOST:-/tmp}
 PGUSER=${PGUSER:-postgres}
 PGDATA=${PGDATA:-/tmp/rvbbit-live-pg}
 RUNDIR=${RUNDIR:-/tmp/rvbbit-live-demo}
-MODEL=${HUTCH_MODEL:-openai/gpt-4o-mini}
-export HUTCH_MODEL="$MODEL"
+CHAT=${HUTCH_MODEL:-openai/gpt-4o-mini}
+DECISION=${HUTCH_DECISION_MODEL:-typesafe/jev-1.14}
+export HUTCH_MODEL="$CHAT"
+export HUTCH_DECISION_MODEL="$DECISION"
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
 export PATH="$PG_BIN:$PATH"
@@ -112,7 +116,7 @@ trap cleanup EXIT
 
 rm -rf "$PGDATA"
 
-echo "=== hutch-lite on 127.0.0.1:$HUTCH_PORT model=$MODEL api_key=set ==="
+echo "=== hutch-lite on 127.0.0.1:$HUTCH_PORT chat=$CHAT decision=$DECISION api_key=set ==="
 # Inherit OPENROUTER_API_KEY. Do not echo the environment.
 : >"$HUTCH_LOG"
 ./target/fast-profile/hutch_lite "$HUTCH_PORT" >"$HUTCH_LOG" 2>&1 &
@@ -168,16 +172,23 @@ run_sql() {
 
 cat >"$RUNDIR/setup.sql" <<SQL
 CREATE BACKEND live TYPE hutch URL 'http://127.0.0.1:${HUTCH_PORT}';
-CREATE MODEL cheap ON BACKEND live NAME '${MODEL//\'/\'\'}';
+CREATE MODEL jev ON BACKEND live NAME '${DECISION//\'/\'\'}';
+CREATE MODEL chat ON BACKEND live NAME '${CHAT//\'/\'\'}';
 CREATE SEMANTIC FUNCTION means(text text, criterion text) RETURNS boolean
-  MODEL cheap
-  SYSTEM \$\$Answer with only true or false.\$\$
-  PROMPT \$\$Does the text match the criterion? Criterion: {{criterion}}
-Text: {{input}}\$\$
-  TEMPERATURE 0 MAX TOKENS 8 CACHE memoize;
+  MODEL jev
+  PROMPT \$\$Does the text match the criterion?\$\$
+  TEMPERATURE 0 CACHE memoize;
 CREATE SEMANTIC OPERATOR means (LEFTARG = text, RIGHTARG = text, FUNCTION = means);
+CREATE SEMANTIC FUNCTION means_score(text text, criterion text) RETURNS double precision
+  MODEL jev
+  PROMPT \$\$Does the text match the criterion?\$\$
+  TEMPERATURE 0 CACHE memoize;
+CREATE SEMANTIC FUNCTION kind(notes text) RETURNS text
+  MODEL jev
+  LABELS ('bigfoot', 'known animal', 'unclear')
+  TEMPERATURE 0 CACHE memoize;
 CREATE SEMANTIC FUNCTION creature(notes text) RETURNS text
-  MODEL cheap
+  MODEL chat
   SYSTEM \$\$Return only a JSON object with keys creature and confidence. creature is a short lowercase noun. confidence is a number from 0 to 1. No markdown.\$\$
   PROMPT \$\$What creature is described? Text: {{input}}\$\$
   TEMPERATURE 0 MAX TOKENS 100 CACHE memoize;
@@ -196,6 +207,12 @@ cat >"$RUNDIR/queries.sql" <<'SQL'
 SELECT id FROM sightings
 WHERE notes MEANS 'a large hairy biped was seen'
 ORDER BY id;
+SELECT id, rvbbit.means_score(notes, 'a large hairy biped was seen') AS score
+FROM sightings
+ORDER BY id;
+SELECT id, rvbbit.kind(notes) AS kind
+FROM sightings
+ORDER BY id;
 SELECT id, rvbbit.creature(notes) AS extracted
 FROM sightings
 ORDER BY id;
@@ -204,7 +221,7 @@ SQL
 run_sql "catalog and sightings (no model calls)" "$RUNDIR/setup.sql"
 # Counters start at zero so pass 1 is only the two queries below.
 curl -sf -X POST "http://127.0.0.1:$HUTCH_PORT/reset" >/dev/null
-run_sql "pass 1 MEANS + EXTRACT" "$RUNDIR/queries.sql"
+run_sql "pass 1 MEANS + score + CLASSIFY + EXTRACT" "$RUNDIR/queries.sql"
 S1=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats")
 C1=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/v1/cache/stats")
 echo "=== after pass 1 ==="

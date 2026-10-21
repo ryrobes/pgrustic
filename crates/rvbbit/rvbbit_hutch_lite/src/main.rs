@@ -10,9 +10,11 @@ fn main() {
     let cfg = rvbbit_hutch_lite::Config::from_env();
     // Never print the API key. Presence only.
     eprintln!(
-        "hutch_lite listening on {addr} model={} openai_base={} api_key={}",
+        "hutch_lite listening on {addr} chat_model={} decision_model={} openai_base={} decisions_url={} api_key={}",
         cfg.default_model,
+        cfg.decision_model,
         cfg.openai_base,
+        cfg.decisions_url,
         if cfg.api_key.is_some() { "set" } else { "missing" }
     );
     if let Err(e) = rvbbit_hutch_lite::serve(&addr, cfg) {

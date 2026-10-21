@@ -84,6 +84,26 @@ pub fn cache_header(mode: CacheMode, key_hex: Option<&str>, ttl_secs: Option<u64
     parts.join("; ")
 }
 
+/// Optional stack of decision-model calls for `predict`, `decide`, and
+/// fixed-label `classify`. Absent means one call to `model` (or the
+/// server default). The SQL parser does not emit this yet; TAKES stays
+/// unimplemented until M5. Hutch-lite honors it when a client sends it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionStack {
+    /// Model slugs, in order. Empty means the request `model`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// Repeats of each model. Absent means the server default (1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes: Option<u32>,
+    /// `mean` (default) or `vote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combine: Option<String>,
+    /// Cut for a boolean. Absent means the server default (0.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BatchRequest {
     pub contract: String,
@@ -94,6 +114,10 @@ pub struct BatchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub items: Vec<ItemRequest>,
+    /// Decision pathway only (`predict`, `decide`, fixed-label `classify`).
+    /// Chat operations ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionStack>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -110,6 +134,13 @@ pub struct ItemRequest {
     pub system: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Declared labels for fixed-label classify. Absent or empty means
+    /// free-form classify (chat). Two or more labels use the decision
+    /// model. Callers fold a non-empty list into the return-schema
+    /// string before [`client_cache_key`] so unlabeled functions keep
+    /// the same key. This field is not hashed on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,6 +156,18 @@ pub struct ItemResponse {
     pub key: String,
     #[serde(default)]
     pub value: Option<serde_json::Value>,
+    /// Probability of `value`, when the operation has one.
+    /// Predict / decide use the decision model's yes-probability.
+    /// Fixed-label classify uses the winning label's probability, not
+    /// the model's separate confidence field. Absent on chat operations
+    /// and on errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    /// Per-label probabilities for fixed-label classify. Keys are the
+    /// declared labels. Absent on predict, extract, free-form classify,
+    /// and errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ItemError>,
 }

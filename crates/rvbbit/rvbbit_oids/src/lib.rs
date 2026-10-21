@@ -16,13 +16,22 @@ pub const MEANS_NAME: &str = "rvbbit_means";
 pub const DUMP_OID: u32 = 9021;
 pub const RESTORE_OID: u32 = 9022;
 pub const GETDEF_OID: u32 = 9023;
-/// `rvbbit_extract(text) -> text`. Body for non-boolean semantic functions.
+/// `rvbbit_extract(text) -> text`. Body for text semantic functions that
+/// have no label set.
 pub const EXTRACT_OID: u32 = 9024;
+/// `rvbbit_means_score(text, text) -> float8`. Same predict call as MEANS;
+/// returns the yes-probability.
+pub const MEANS_SCORE_OID: u32 = 9025;
+/// `rvbbit_classify(text) -> text`. Fixed-label classify. The SQL result
+/// is JSON text `{label, score, scores}`.
+pub const CLASSIFY_OID: u32 = 9026;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
 pub const GETDEF_NAME: &str = "rvbbit_get_semfn_def";
 pub const EXTRACT_NAME: &str = "rvbbit_extract";
+pub const MEANS_SCORE_NAME: &str = "rvbbit_means_score";
+pub const CLASSIFY_NAME: &str = "rvbbit_classify";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

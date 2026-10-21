@@ -8,8 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use rvbbit_contract::{
-    client_cache_key_hex, BatchRequest, BatchResponse, CacheKeyParts, ItemRequest, Operation,
-    CONTRACT_VERSION,
+    client_cache_key_hex, BatchRequest, BatchResponse, CacheKeyParts, DecisionStack, ItemRequest,
+    Operation, CONTRACT_VERSION,
 };
 use rvbbit_hutch_lite::Config;
 
@@ -27,10 +27,16 @@ fn harness(api_key: Option<&str>) -> Harness {
 
     let hutch_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let hutch_port = hutch_listener.local_addr().unwrap().port();
+    let openai_base = format!("http://127.0.0.1:{fake_port}/v1");
     let cfg = Config {
-        openai_base: format!("http://127.0.0.1:{fake_port}/v1"),
+        decisions_url: rvbbit_hutch_lite::decisions_url_from_base(&openai_base),
+        openai_base,
         api_key: api_key.map(|s| s.to_string()),
         default_model: "openai/gpt-4o-mini".into(),
+        decision_model: "typesafe/jev-1.14".into(),
+        decision_takes: 1,
+        decision_combine: "mean".into(),
+        decision_threshold: 0.5,
         timeout: Duration::from_secs(5),
         concurrency: 4,
         tenant: "local".into(),
@@ -91,33 +97,9 @@ fn serve_fake(listener: TcpListener, hits: Arc<AtomicU64>) {
             if text.contains("SLOW") {
                 thread::sleep(Duration::from_millis(250));
             }
-            let content = if text.contains("BAD_JSON") {
-                "not json at all".to_string()
-            } else if text.contains("JSON_CASE") {
-                "{\"creature\":\"sasquatch\",\"confidence\":0.8}".into()
-            } else if text.contains("FALSE_CASE") {
-                "false".into()
-            } else if text.contains("TRUE_CASE") || text.contains("SLOW") {
-                "true".into()
-            } else {
-                "false".into()
-            };
             // Echo the bearer so a redact test can prove the key does not
             // come back out when we force an error via the marker LEAK.
-            let (status, payload) = if text.contains("LEAK") {
-                (
-                    500,
-                    format!("{{\"error\":{{\"message\":\"echo {auth}\"}}}}"),
-                )
-            } else {
-                (
-                    200,
-                    format!(
-                        "{{\"choices\":[{{\"message\":{{\"content\":{}}}}}]}}",
-                        serde_json::to_string(&content).unwrap()
-                    ),
-                )
-            };
+            let (status, payload) = fake_payload(&header, &text, &auth);
             let resp = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()
@@ -152,6 +134,7 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
         criterion: criterion.map(|s| s.to_string()),
         system: None,
         prompt: None,
+        labels: None,
     }
 }
 
@@ -165,6 +148,86 @@ fn post(url: &str, mode: &str, req: &BatchRequest) -> BatchResponse {
     serde_json::from_str(&resp.into_string().unwrap()).unwrap()
 }
 
+fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
+    if text.contains("LEAK") {
+        return (500, format!("{{\"error\":{{\"message\":\"echo {auth}\"}}}}"));
+    }
+    let decisions = header.lines().next().unwrap_or("").contains("decisions");
+    if decisions {
+        let payload = if text.contains("\"type\":\"choice\"") {
+            choice_json(text)
+        } else {
+            format!(
+                r#"{{"answers":{{"matches":{{"type":"noul","noul":{}}}}}}}"#,
+                noul_for(text)
+            )
+        };
+        return (200, payload);
+    }
+    let content = if text.contains("BAD_JSON") {
+        "not json at all".to_string()
+    } else if text.contains("JSON_CASE") {
+        "{\"creature\":\"sasquatch\",\"confidence\":0.8}".into()
+    } else if text.contains("FREEFORM") {
+        "forest".into()
+    } else if text.contains("FALSE_CASE") {
+        "false".into()
+    } else if text.contains("TRUE_CASE") || text.contains("SLOW") {
+        "true".into()
+    } else {
+        "false".into()
+    };
+    (
+        200,
+        format!(
+            "{{\"choices\":[{{\"message\":{{\"content\":{}}}}}]}}",
+            serde_json::to_string(&content).unwrap()
+        ),
+    )
+}
+
+fn noul_for(text: &str) -> &'static str {
+    if text.contains("ALIAS") {
+        if text.contains("~typesafe/jev-latest") && !text.contains("typesafe/jev-1.14") {
+            "0.75"
+        } else {
+            "0.0"
+        }
+    } else if text.contains("MOCKMODEL") {
+        if text.contains("typesafe/jev-1.14") { "0.75" } else { "0.0" }
+    } else if text.contains("typesafe/high") {
+        "0.75"
+    } else if text.contains("typesafe/low") || text.contains("typesafe/repeat") {
+        "0.25"
+    } else if text.contains("FALSE_CASE") {
+        "0.25"
+    } else if text.contains("TRUE_CASE") || text.contains("SLOW") {
+        "0.75"
+    } else {
+        "0.25"
+    }
+}
+
+fn choice_json(text: &str) -> String {
+    if text.contains("typesafe/high") {
+        return r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":1.0,"known animal":0.0,"unclear":0.0},"confidence":0.5}}}"#.into();
+    }
+    if text.contains("typesafe/low") {
+        return r#"{"answers":{"label":{"type":"choice","choice":"known animal","probabilities":{"bigfoot":0.0,"known animal":1.0,"unclear":0.0},"confidence":0.5}}}"#.into();
+    }
+    if text.contains("STRAY") {
+        return r#"{"answers":{"label":{"type":"choice","choice":"cryptid","probabilities":{"bigfoot":0.25,"known animal":0.5,"unclear":0.25,"cryptid":1.0},"confidence":0.5}}}"#.into();
+    }
+    if text.contains("CONFONLY") {
+        return r#"{"answers":{"label":{"type":"choice","choice":"unclear","confidence":0.5}}}"#.into();
+    }
+    r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":0.75,"known animal":0.25,"unclear":0.0},"confidence":0.5}}}"#.into()
+}
+
+fn labels() -> Vec<String> {
+    vec!["bigfoot".into(), "known animal".into(), "unclear".into()]
+}
+
 fn predict(input: &str, criterion: &str) -> BatchRequest {
     let mut it = item(input, Some(criterion));
     it.key = "0".into();
@@ -175,6 +238,7 @@ fn predict(input: &str, criterion: &str) -> BatchRequest {
         temperature: 0.0,
         max_tokens: Some(16),
         items: vec![it],
+        decision: None,
     }
 }
 
@@ -183,8 +247,11 @@ fn predict_extract_cache_and_errors() {
     let h = harness(Some("test-key"));
     let yes = post(&format!("{}/v1/predict", h.hutch), "read-write", &predict("TRUE_CASE", "biped"));
     assert_eq!(yes.outputs[0].value, Some(serde_json::json!(true)));
+    assert_eq!(yes.outputs[0].score, Some(0.75));
+    assert!(yes.outputs[0].scores.is_none());
     let no = post(&format!("{}/v1/predict", h.hutch), "read-write", &predict("FALSE_CASE", "biped"));
     assert_eq!(no.outputs[0].value, Some(serde_json::json!(false)));
+    assert_eq!(no.outputs[0].score, Some(0.25));
     assert_eq!(h.provider_hits.load(Ordering::SeqCst), 2);
 
     let again = post(&format!("{}/v1/predict", h.hutch), "read-write", &predict("TRUE_CASE", "biped"));
@@ -252,6 +319,131 @@ fn upstream_error_does_not_echo_the_api_key() {
 }
 
 #[test]
+fn decision_stack_alias_and_classify() {
+    let h = harness(Some("test-key"));
+    let mut mean = predict("STACK", "biped");
+    mean.decision = Some(DecisionStack {
+        models: vec!["typesafe/high".into(), "typesafe/low".into()],
+        takes: None,
+        combine: Some("mean".into()),
+        threshold: None,
+    });
+    let got = post(&format!("{}/v1/predict", h.hutch), "off", &mean);
+    assert_eq!(got.outputs[0].value, Some(serde_json::json!(true)));
+    assert_eq!(got.outputs[0].score, Some(0.5));
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), 2);
+
+    let mut vote = mean.clone();
+    vote.decision.as_mut().unwrap().combine = Some("vote".into());
+    vote.decision.as_mut().unwrap().threshold = Some(0.5);
+    let tied = post(&format!("{}/v1/decide", h.hutch), "off", &vote);
+    assert_eq!(tied.outputs[0].value, Some(serde_json::json!(true)), "tie breaks on the mean");
+    assert_eq!(tied.outputs[0].score, Some(0.5));
+
+    vote.decision.as_mut().unwrap().threshold = Some(0.6);
+    let below = post(&format!("{}/v1/decide", h.hutch), "off", &vote);
+    assert_eq!(below.outputs[0].value, Some(serde_json::json!(false)));
+    assert_eq!(below.outputs[0].score, Some(0.5));
+
+    let mut repeats = predict("REPEAT", "biped");
+    repeats.decision = Some(DecisionStack {
+        models: vec!["typesafe/repeat".into()],
+        takes: Some(3),
+        combine: Some("mean".into()),
+        threshold: Some(0.5),
+    });
+    let before = h.provider_hits.load(Ordering::SeqCst);
+    let thrice = post(&format!("{}/v1/predict", h.hutch), "off", &repeats);
+    assert_eq!(thrice.outputs[0].value, Some(serde_json::json!(false)));
+    assert_eq!(thrice.outputs[0].score, Some(0.25));
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), before + 3);
+
+    let mut mocked = predict("MOCKMODEL", "biped");
+    mocked.model = "mock".into();
+    let resolved = post(&format!("{}/v1/predict", h.hutch), "off", &mocked);
+    assert_eq!(resolved.outputs[0].score, Some(0.75), "mock resolves to jev-1.14");
+
+    let mut alias = predict("ALIAS", "biped");
+    alias.model = "~typesafe/jev-latest".into();
+    let passed = post(&format!("{}/v1/predict", h.hutch), "off", &alias);
+    assert_eq!(passed.outputs[0].score, Some(0.75), "alias is not rewritten");
+
+    let mut shared = predict("TRUE_CASE", "memo");
+    shared.items[0].cache_key = "a".repeat(8);
+    let mut other = shared.clone();
+    other.items[0].cache_key = "b".repeat(8);
+    other.items[0].key = "1".into();
+    let hits = h.provider_hits.load(Ordering::SeqCst);
+    let _ = post(&format!("{}/v1/predict", h.hutch), "read-write", &shared);
+    let _ = post(&format!("{}/v1/predict", h.hutch), "read-write", &other);
+    assert_eq!(
+        h.provider_hits.load(Ordering::SeqCst),
+        hits + 1,
+        "identical decision bodies share one provider call"
+    );
+
+    let mut kind = predict("BIGFOOT tracks", "ignored");
+    kind.operation = Operation::Classify;
+    kind.model = "mock".into();
+    kind.items[0].labels = Some(labels());
+    let classified = post(&format!("{}/v1/classify", h.hutch), "off", &kind);
+    assert_eq!(classified.outputs[0].value, Some(serde_json::json!("bigfoot")));
+    assert_eq!(classified.outputs[0].score, Some(0.75), "winning score is the probability");
+    assert_ne!(classified.outputs[0].score, Some(0.5));
+    let scores = classified.outputs[0].scores.as_ref().unwrap();
+    assert_eq!(scores["known animal"], serde_json::json!(0.25));
+    assert_eq!(scores["unclear"], serde_json::json!(0.0));
+    assert!(scores.get("cryptid").is_none());
+
+    let mut stray = kind.clone();
+    stray.items[0] = item("STRAY", None);
+    stray.items[0].labels = Some(labels());
+    let stray_got = post(&format!("{}/v1/classify", h.hutch), "off", &stray);
+    assert_eq!(stray_got.outputs[0].value, Some(serde_json::json!("known animal")));
+    assert_eq!(stray_got.outputs[0].score, Some(0.5));
+    assert!(stray_got.outputs[0].scores.as_ref().unwrap().get("cryptid").is_none());
+
+    let mut conf = kind.clone();
+    conf.items[0] = item("CONFONLY", None);
+    conf.items[0].labels = Some(labels());
+    let conf_got = post(&format!("{}/v1/classify", h.hutch), "off", &conf);
+    assert_eq!(conf_got.outputs[0].value, Some(serde_json::json!("unclear")));
+    assert_eq!(conf_got.outputs[0].score, Some(0.5));
+
+    let mut stacked = kind.clone();
+    stacked.items[0] = item("STACKCHOICE", None);
+    stacked.items[0].labels = Some(labels());
+    stacked.decision = Some(DecisionStack {
+        models: vec!["typesafe/high".into(), "typesafe/low".into()],
+        takes: Some(1),
+        combine: None,
+        threshold: None,
+    });
+    let averaged = post(&format!("{}/v1/classify", h.hutch), "off", &stacked);
+    assert_eq!(averaged.outputs[0].value, Some(serde_json::json!("bigfoot")));
+    assert_eq!(averaged.outputs[0].score, Some(0.5));
+    assert_eq!(
+        averaged.outputs[0].scores.as_ref().unwrap()["known animal"],
+        serde_json::json!(0.5)
+    );
+
+    let mut one = kind.clone();
+    one.items[0].labels = Some(vec!["only".into()]);
+    let before = h.provider_hits.load(Ordering::SeqCst);
+    let bad = post(&format!("{}/v1/classify", h.hutch), "off", &one);
+    assert_eq!(bad.outputs[0].error.as_ref().unwrap().code, "invalid");
+    assert!(bad.outputs[0].error.as_ref().unwrap().message.contains("at least two"));
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), before);
+
+    let mut free = predict("FREEFORM", "ignored");
+    free.operation = Operation::Classify;
+    let open = post(&format!("{}/v1/classify", h.hutch), "off", &free);
+    assert_eq!(open.outputs[0].value, Some(serde_json::json!("forest")));
+    assert!(open.outputs[0].score.is_none());
+    assert!(open.outputs[0].scores.is_none());
+}
+
+#[test]
 fn missing_key_is_a_config_error_without_calling_upstream() {
     let h = harness(None);
     let body = serde_json::to_string(&predict("TRUE_CASE", "biped")).unwrap();
@@ -284,7 +476,10 @@ fn live_openrouter_means() {
     thread::spawn(move || {
         let _ = rvbbit_hutch_lite::serve_listener(listener, cfg);
     });
-    let req = predict("A large hairy biped crossed the logging road.", "a large biped was seen");
+    let mut req = predict("A large hairy biped crossed the logging road.", "a large biped was seen");
+    // Empty or `mock` selects HUTCH_DECISION_MODEL. A chat slug is not a
+    // decision model and would 400 on the Decisions API.
+    req.model = "mock".into();
     let body = serde_json::to_string(&req).unwrap();
     let resp = ureq::post(&format!("http://127.0.0.1:{port}/v1/predict"))
         .set("Content-Type", "application/json")
@@ -296,7 +491,10 @@ fn live_openrouter_means() {
             assert!(!text.contains(&key), "response echoed the api key");
             let parsed: BatchResponse = serde_json::from_str(&text).unwrap();
             assert!(parsed.outputs[0].error.is_none(), "{text}");
-            assert_eq!(parsed.outputs[0].value, Some(serde_json::json!(true)));
+            let value = parsed.outputs[0].value.as_ref().expect("value");
+            assert!(value.is_boolean(), "{text}");
+            let score = parsed.outputs[0].score.expect("score");
+            assert!((0.0..=1.0).contains(&score), "{score}");
         }
         Err(ureq::Error::Status(_, resp)) => {
             let text = resp.into_string().unwrap_or_default();

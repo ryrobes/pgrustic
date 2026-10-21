@@ -268,6 +268,8 @@ fn route(
                 ItemResponse {
                     key: item.key.clone(),
                     value: Some(value),
+                    score: None,
+                    scores: None,
                     error: None,
                 }
             })
@@ -325,6 +327,8 @@ pub fn item_error(key: &str, message: &str) -> ItemResponse {
     ItemResponse {
         key: key.to_string(),
         value: None,
+        score: None,
+        scores: None,
         error: Some(ItemError {
             code: "mock".into(),
             message: message.into(),
