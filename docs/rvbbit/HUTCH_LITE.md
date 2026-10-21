@@ -78,8 +78,20 @@ it null. A live Jev run varied by about 0.03 across takes of one phrasing,
 so `identical` was false. A second phrasing moved UFO row 2 from about
 0.67 to about 0.83, more than extra takes moved it. `semantic.budget`
 aborts the session when
-`rvbbit.calls` cost would pass the cap. Embed and rerank are per-item
+`rvbbit.calls` cost would pass the cap. Embed is still per-item
 `unsupported`. Decide is the same `noul` path as predict.
+
+`SUMMARIZE(expr)` and `CONSENSUS(expr, criterion)` are aggregates. The
+transition concatenates the group; the final calls hutch once.
+`SUMMARIZE` is a chat summary. `CONSENSUS` is one Jev yes/no over the
+joined text. `EXTRACT MANY kind FROM expr` rewrites to
+`jsonb_array_elements_text` of a JSON array, so it explodes into rows.
+`RERANK(document, query)` is a Jev noul relevance score (`float8`).
+`expr |> OP` is the same call with `expr` as the input: `|> MEANS`,
+`|> EXTRACT`, `|> EXTRACT MANY`, `|> CLASSIFY`, `|> RERANK`,
+`|> SUMMARIZE`, `|> CONSENSUS`. A clause tail on those ops is
+`rvbbit.apply_clauses`, including `WITH TAKES` on a summary or a rerank.
+`|>>` stays the geometric operator.
 
 ## Fresh Ubuntu
 

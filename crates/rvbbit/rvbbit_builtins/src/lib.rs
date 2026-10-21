@@ -8,9 +8,12 @@ use datum::Datum;
 use rvbbit_oids::{
     APPLY_CLAUSES_NAME, APPLY_CLAUSES_OID, CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_ENUM_NAME,
     CLASSIFY_ENUM_OID, CLASSIFY_LABELS_NAME, CLASSIFY_LABELS_OID, CLASSIFY_NAME, CLASSIFY_OID,
-    DECIDE_NAME, DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_NAME, EXTRACT_OID, EXTRACT_TYPED_NAME,
-    EXTRACT_TYPED_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME,
-    MEANS_SCORE_OID, RESTORE_NAME, RESTORE_OID,
+    CONSENSUS_FINAL_NAME, CONSENSUS_FINAL_OID, CONSENSUS_TRANS_NAME, CONSENSUS_TRANS_OID, DECIDE_NAME,
+    DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_MANY_NAME, EXTRACT_MANY_OID, EXTRACT_NAME, EXTRACT_OID,
+    EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID,
+    MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID,
+    SUMMARIZE_FINAL_NAME, SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID,
+    SUMMARIZE_TRANS_NAME, SUMMARIZE_TRANS_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -215,6 +218,66 @@ pub fn rvbbit_extract_typed(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo)
     }
 }
 
+pub fn rvbbit_summarize_trans(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let state = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let value = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let clauses = arg_text(fcinfo, 2)?.unwrap_or_default();
+    let next = rvbbit_dispatch::push_agg(&state, &value, "", &clauses);
+    text_datum(fcinfo, &next)
+}
+
+pub fn rvbbit_summarize_final(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let state = arg_text(fcinfo, 0)?.unwrap_or_default();
+    match rvbbit_dispatch::summarize_state(&state)? {
+        Some(text) => text_datum(fcinfo, &text),
+        None => Ok(fcinfo.return_null()),
+    }
+}
+
+pub fn rvbbit_summarize_text(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let input = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let clauses = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let text = rvbbit_dispatch::summarize_text(&input, &clauses)?;
+    text_datum(fcinfo, &text)
+}
+
+pub fn rvbbit_consensus_trans(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let state = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let value = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let criterion = arg_text(fcinfo, 2)?.unwrap_or_default();
+    let clauses = arg_text(fcinfo, 3)?.unwrap_or_default();
+    let next = rvbbit_dispatch::push_agg(&state, &value, &criterion, &clauses);
+    text_datum(fcinfo, &next)
+}
+
+pub fn rvbbit_consensus_final(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let state = arg_text(fcinfo, 0)?.unwrap_or_default();
+    match rvbbit_dispatch::consensus_state(&state)? {
+        Some(matched) => Ok(Datum::from_bool(matched)),
+        None => Ok(fcinfo.return_null()),
+    }
+}
+
+pub fn rvbbit_rerank(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let document = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let query = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let score = rvbbit_dispatch::rerank_score(&document, &query)?;
+    Ok(Datum::from_f64(score))
+}
+
+pub fn rvbbit_extract_many(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let kind = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let input = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let clauses = arg_text(fcinfo, 2)?.unwrap_or_default();
+    let text = rvbbit_dispatch::extract_many_json(&kind, &input, &clauses)?;
+    text_datum(fcinfo, &text)
+}
+
 /// Clause tail. `clauses` is the postfix text (`WITH TAKES 3 PICK BY VOTE`).
 /// The result is JSON `{winner, score, retries, identical, fallback}`.
 pub fn rvbbit_apply_clauses(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
@@ -415,5 +478,61 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: false,
         retset: false,
         func: rvbbit_apply_clauses as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: SUMMARIZE_TRANS_OID,
+        name: SUMMARIZE_TRANS_NAME,
+        nargs: 3,
+        strict: true,
+        retset: false,
+        func: rvbbit_summarize_trans as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: SUMMARIZE_FINAL_OID,
+        name: SUMMARIZE_FINAL_NAME,
+        nargs: 1,
+        strict: false,
+        retset: false,
+        func: rvbbit_summarize_final as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: SUMMARIZE_TEXT_OID,
+        name: SUMMARIZE_TEXT_NAME,
+        nargs: 2,
+        strict: false,
+        retset: false,
+        func: rvbbit_summarize_text as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CONSENSUS_TRANS_OID,
+        name: CONSENSUS_TRANS_NAME,
+        nargs: 4,
+        strict: true,
+        retset: false,
+        func: rvbbit_consensus_trans as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CONSENSUS_FINAL_OID,
+        name: CONSENSUS_FINAL_NAME,
+        nargs: 1,
+        strict: false,
+        retset: false,
+        func: rvbbit_consensus_final as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: RERANK_OID,
+        name: RERANK_NAME,
+        nargs: 2,
+        strict: true,
+        retset: false,
+        func: rvbbit_rerank as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: EXTRACT_MANY_OID,
+        name: EXTRACT_MANY_NAME,
+        nargs: 3,
+        strict: false,
+        retset: false,
+        func: rvbbit_extract_many as PGFunction,
     },
 ];

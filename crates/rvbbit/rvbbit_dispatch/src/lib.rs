@@ -495,6 +495,156 @@ fn typed_extract_endpoint(kind: &str) -> Endpoint {
     ep
 }
 
+fn summary_endpoint() -> Endpoint {
+    let mut ep = decision_endpoint();
+    ep.model = "mock".into();
+    ep.labels.clear();
+    ep.label_descriptions.clear();
+    ep.fn_name = "summarize".into();
+    ep.return_type = "text".into();
+    ep.extract_mode = Some("summary".into());
+    ep.system_prompt = "Summarize the notes in one or two sentences. No markdown.".into();
+    ep.user_prompt = "{{input}}".into();
+    ep.max_tokens = Some(128);
+    ep
+}
+
+fn many_endpoint(kind: &str) -> Endpoint {
+    let mut ep = decision_endpoint();
+    ep.model = "mock".into();
+    ep.labels.clear();
+    ep.label_descriptions.clear();
+    ep.fn_name = "extract_many".into();
+    ep.return_type = "text".into();
+    ep.extract_mode = Some("many".into());
+    ep.system_prompt = format!(
+        "Return a JSON array of short {kind} nouns. No markdown, no explanation."
+    );
+    ep.user_prompt = format!("List every {kind} in this text.\n{{{{input}}}}");
+    ep.max_tokens = Some(128);
+    ep
+}
+
+fn empty_agg() -> serde_json::Value {
+    serde_json::json!({"clauses": "", "extra": "", "parts": []})
+}
+
+fn read_agg(state: &str) -> (String, String, Vec<String>) {
+    let v = serde_json::from_str::<serde_json::Value>(state).unwrap_or_else(|_| empty_agg());
+    let clauses = v.get("clauses").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let extra = v.get("extra").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let parts = v
+        .get("parts")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (clauses, extra, parts)
+}
+
+/// Append one group row. `extra` is the consensus criterion. `clauses` is
+/// the M5 tail, stored once from the first row.
+pub fn push_agg(state: &str, value: &str, extra: &str, clauses: &str) -> String {
+    let mut v = serde_json::from_str::<serde_json::Value>(state).unwrap_or_else(|_| empty_agg());
+    if !v.is_object() {
+        v = empty_agg();
+    }
+    if v.get("clauses").and_then(|s| s.as_str()).unwrap_or("").is_empty() && !clauses.is_empty() {
+        v["clauses"] = serde_json::json!(clauses);
+    }
+    if v.get("extra").and_then(|s| s.as_str()).unwrap_or("").is_empty() && !extra.is_empty() {
+        v["extra"] = serde_json::json!(extra);
+    }
+    if !v.get("parts").is_some_and(|p| p.is_array()) {
+        v["parts"] = serde_json::json!([]);
+    }
+    v["parts"].as_array_mut().expect("parts").push(serde_json::json!(value));
+    v.to_string()
+}
+
+pub fn summarize_state(state: &str) -> PgResult<Option<String>> {
+    let (clauses, _extra, parts) = read_agg(state);
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(summarize_text(&parts.join("\n\n"), &clauses)?))
+}
+
+pub fn summarize_text(input: &str, clauses: &str) -> PgResult<String> {
+    if clauses.trim().is_empty() {
+        let ep = summary_endpoint();
+        let body = encode_items(&ep, Operation::Extract, &[serde_json::json!({ "input": input })])
+            .map_err(pg)?;
+        let raw = post_op(&ep, "extract", body)?;
+        let hit = decode_clause(&raw.body).map_err(pg)?;
+        if let Some(err) = hit.error {
+            return Err(pg(err));
+        }
+        return Ok(hit.value);
+    }
+    winner_of(&apply_clauses_text("summarize", input, "", clauses)?)
+}
+
+pub fn consensus_state(state: &str) -> PgResult<Option<bool>> {
+    let (clauses, extra, parts) = read_agg(state);
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let input = parts.join("\n\n");
+    if clauses.trim().is_empty() {
+        return Ok(Some(means_oid(rvbbit_oids::MEANS_OID, &input, &extra)?));
+    }
+    let winner = winner_of(&apply_clauses_text("consensus", &input, &extra, &clauses)?)?;
+    Ok(Some(winner == "true"))
+}
+
+pub fn rerank_score(document: &str, query: &str) -> PgResult<f64> {
+    let mut ep = decision_endpoint();
+    ep.fn_name = "rerank".into();
+    ep.model = "mock".into();
+    ep.system_prompt = "Is this document relevant to the query?".into();
+    ep.user_prompt.clear();
+    let body = encode_items(
+        &ep,
+        Operation::Rerank,
+        &[serde_json::json!({ "input": document, "criterion": query })],
+    )
+    .map_err(pg)?;
+    let raw = post_op(&ep, "rerank", body)?;
+    let hit = decode_clause(&raw.body).map_err(pg)?;
+    if let Some(err) = hit.error {
+        return Err(pg(err));
+    }
+    hit.score.ok_or_else(|| pg("rerank returned no score"))
+}
+
+pub fn extract_many_json(kind: &str, input: &str, clauses: &str) -> PgResult<String> {
+    if clauses.trim().is_empty() {
+        let ep = many_endpoint(kind);
+        let body = encode_items(&ep, Operation::Extract, &[serde_json::json!({ "input": input })])
+            .map_err(pg)?;
+        let raw = post_op(&ep, "extract", body)?;
+        let hit = decode_clause(&raw.body).map_err(pg)?;
+        if let Some(err) = hit.error {
+            return Err(pg(err));
+        }
+        return Ok(hit.value);
+    }
+    winner_of(&apply_clauses_text("extract_many", input, kind, clauses)?)
+}
+
+fn winner_of(report: &str) -> PgResult<String> {
+    let v: serde_json::Value = serde_json::from_str(report).map_err(|e| pg(e.to_string()))?;
+    Ok(match v.get("winner") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    })
+}
+
 fn decision_endpoint() -> Endpoint {
     let oid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
     rvbbit_resolve::endpoint_for(oid)
@@ -1405,6 +1555,32 @@ struct ClauseHit {
     error: Option<String>,
 }
 
+/// `summary_endpoint` and `many_endpoint` replace the endpoint after the
+/// clause knobs were copied. Put temperature, tokens, cache, and model back.
+fn reapply_clause_knobs(ep: &mut Endpoint, merged: &clauses::Clauses, model: Option<&str>) {
+    if let Some(model) = model {
+        if !model.is_empty() && model != "default" {
+            ep.model = model.to_string();
+        }
+    }
+    if let Some(t) = merged.temperature {
+        ep.temperature = t;
+    }
+    if let Some(n) = merged.max_tokens {
+        ep.max_tokens = Some(n);
+    }
+    if let Some(t) = merged.threshold {
+        ep.threshold = Some(t);
+    }
+    if let Some(cache) = merged.cache.as_deref() {
+        ep.cache_mode = match cache {
+            "off" => "off".into(),
+            "refresh" => "refresh".into(),
+            _ => "memoize".into(),
+        };
+    }
+}
+
 fn post_clause(
     ep: &Endpoint,
     kind: &str,
@@ -1437,9 +1613,24 @@ fn post_clause(
     }
     let (op, operation) = match kind {
         "classify" => ("classify", Operation::Classify),
-        "extract" => ("extract", Operation::Extract),
+        "extract" | "summarize" | "extract_many" => ("extract", Operation::Extract),
+        "rerank" => ("rerank", Operation::Rerank),
         _ => ("predict", Operation::Predict),
     };
+    if kind == "summarize" {
+        ep = summary_endpoint();
+        reapply_clause_knobs(&mut ep, merged, model);
+    } else if kind == "extract_many" {
+        ep = many_endpoint(extra);
+        reapply_clause_knobs(&mut ep, merged, model);
+    } else if kind == "rerank" {
+        ep.fn_name = "rerank".into();
+        ep.system_prompt = "Is this document relevant to the query?".into();
+        ep.user_prompt.clear();
+        if ep.model.is_empty() {
+            ep.model = "mock".into();
+        }
+    }
     if kind == "classify" {
         let labels: Vec<String> = extra.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
         if labels.len() >= 2 {
@@ -1447,7 +1638,7 @@ fn post_clause(
         }
     }
     let inputs = match kind {
-        "classify" => serde_json::json!({ "input": input }),
+        "classify" | "summarize" | "extract_many" => serde_json::json!({ "input": input }),
         "extract" => serde_json::json!({ "input": input }),
         _ => serde_json::json!({ "input": input, "criterion": extra }),
     };
@@ -1570,6 +1761,16 @@ mod tests {
         assert_eq!(coerce_extracted("bool", "YES").unwrap(), "true");
         assert_eq!(coerce_extracted("creature", "  sasquatch ").unwrap(), "sasquatch");
         assert!(coerce_extracted("float", "inf").is_err());
+    }
+
+    #[test]
+    fn agg_state_appends_parts_and_keeps_the_first_clause() {
+        let once = super::push_agg("", "alpha", "a large biped", "WITH TAKES 2");
+        let twice = super::push_agg(&once, "beta", "ignored", "");
+        let (clauses, extra, parts) = super::read_agg(&twice);
+        assert_eq!(clauses, "WITH TAKES 2");
+        assert_eq!(extra, "a large biped");
+        assert_eq!(parts, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
     #[test]

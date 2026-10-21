@@ -218,6 +218,10 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
         "sasquatch".into()
     } else if text.contains("FREEFORM") {
         "forest".into()
+    } else if text.contains("Summarize the notes") {
+        "a short summary of the notes".into()
+    } else if text.contains("JSON array of short") {
+        "[\"sasquatch\",\"truck\"]".into()
     } else if text.contains("FALSE_CASE") {
         "false".into()
     } else if text.contains("TRUE_CASE") || text.contains("SLOW") {
@@ -318,6 +322,8 @@ fn noul_for(text: &str) -> &'static str {
         "0.75"
     } else if text.contains("typesafe/low") || text.contains("typesafe/repeat") {
         "0.25"
+    } else if text.contains("relevant to the query") {
+        if text.contains("LOGGING") { "0.82" } else { "0.15" }
     } else if text.contains("FALSE_CASE") {
         "0.25"
     } else if text.contains("TRUE_CASE") || text.contains("SLOW") {
@@ -635,6 +641,70 @@ fn calls_of(url: &str, limit: u32) -> Vec<serde_json::Value> {
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
     parsed["calls"].as_array().cloned().unwrap_or_default()
+}
+
+#[test]
+fn rerank_summary_and_extract_many() {
+    let h = harness(Some("test-key"));
+    let mut rank = predict("LOGGING road at dusk", "logging road");
+    rank.operation = Operation::Rerank;
+    rank.model = "mock".into();
+    rank.items[0].system = Some("Is this document relevant to the query?".into());
+    rank.items[0].criterion = Some("logging road".into());
+    let got = post(&format!("{}/v1/rerank", h.hutch), "off", &rank);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    assert!(near(got.outputs[0].score, 0.82), "{:?}", got.outputs[0].score);
+    let call = &got.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(call.op, "rerank");
+    assert_eq!(call.model, "typesafe/jev-1.14");
+    assert!(near(call.cost_usd, 0.00000336), "{:?}", call.cost_usd);
+
+    let mut low = rank.clone();
+    low.items[0].inputs = serde_json::json!({"input": "lights over the lake", "criterion": "logging road"});
+    low.items[0].cache_key = format!("{}low", low.items[0].cache_key);
+    let miss = post(&format!("{}/v1/rerank", h.hutch), "off", &low);
+    assert!(near(miss.outputs[0].score, 0.15), "{:?}", miss.outputs[0].score);
+
+    let mut summary = predict("two notes about a road", "ignored");
+    summary.operation = Operation::Extract;
+    summary.items[0].extract_mode = Some("summary".into());
+    summary.items[0].cache_key = format!("{}sum", summary.items[0].cache_key);
+    let summed = post(&format!("{}/v1/extract", h.hutch), "off", &summary);
+    assert_eq!(
+        summed.outputs[0].value,
+        Some(serde_json::json!("a short summary of the notes"))
+    );
+    assert_eq!(summed.outputs[0].calls.as_ref().unwrap()[0].op, "extract");
+
+    let mut many = summary.clone();
+    many.items[0].extract_mode = Some("many".into());
+    many.items[0].system = Some("Return a JSON array of short creature nouns. No markdown.".into());
+    many.items[0].cache_key = format!("{}many", many.items[0].cache_key);
+    let listed = post(&format!("{}/v1/extract", h.hutch), "off", &many);
+    assert_eq!(
+        listed.outputs[0].value,
+        Some(serde_json::json!(["sasquatch", "truck"]))
+    );
+
+    let mut stacked = summary.clone();
+    stacked.items[0].extract_mode = Some("summary".into());
+    stacked.items[0].cache_key = format!("{}takes", stacked.items[0].cache_key);
+    stacked.decision = Some(DecisionStack {
+        models: vec!["mock".into()],
+        takes: Some(2),
+        combine: None,
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let taken = post(&format!("{}/v1/extract", h.hutch), "off", &stacked);
+    assert_eq!(taken.outputs[0].identical_takes, Some(true));
+    assert_eq!(
+        taken.outputs[0].value,
+        Some(serde_json::json!("a short summary of the notes"))
+    );
+    let logged = calls_of(&h.hutch, 2);
+    assert!(logged.iter().all(|c| c["identical"] == true), "{logged:?}");
 }
 
 #[test]

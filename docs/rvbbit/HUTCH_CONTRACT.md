@@ -405,7 +405,7 @@ Uncertain:
 What it stubs:
 
 - A clause tail is rewritten before gram.y. `WITH TAKES`, `PICK BY`, `RETRY`, `CHECK`, `FALLBACK`, `BUDGET`, `CACHE`, and `TIMEOUT` become `rvbbit.apply_clauses`. Plain `MEANS` and datetime `EXTRACT` stay. Take index on a single MEANS cache key is 0; a stacked tree puts `takes` and `phrasings` in the cache opts. The `decision` object is the stack hook
-- `embed` and `rerank` return a per-item error `code=unsupported` and do not call the provider
+- `embed` returns a per-item error `code=unsupported` and does not call the provider. `rerank` is a Jev `noul`: the document is `state`, the query is the criterion, and `score` is the relevance. `SUMMARIZE` and `EXTRACT MANY` are chat (`extract_mode` `summary` or `many`)
 - a wrong or missing `X-Rvbbit-Contract` is accepted, same as the mock
 - client disconnect does not cancel an in-flight provider call
 - `POST /reset` clears the process cache and the decision memo. That route is for tests and the demo

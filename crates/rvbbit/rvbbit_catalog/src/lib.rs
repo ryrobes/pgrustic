@@ -14,6 +14,87 @@ use rvbbit_parse::{Arg, Command, FnClauses, ObjKind, WithOpts};
 use rvbbit_resolve::{Endpoint, Resolved};
 use types_error::{PgError, PgResult};
 
+fn ensure_m6_ops() -> PgResult<()> {
+    for (name, args, ret, body) in [
+        (
+            "summarize_trans",
+            "state text, val text, clauses text",
+            "text",
+            "rvbbit_summarize_trans",
+        ),
+        (
+            "summarize_final",
+            "state text",
+            "text",
+            "rvbbit_summarize_final",
+        ),
+        (
+            "summarize_text",
+            "input text, clauses text",
+            "text",
+            "rvbbit_summarize_text",
+        ),
+        (
+            "consensus_trans",
+            "state text, val text, criterion text, clauses text",
+            "text",
+            "rvbbit_consensus_trans",
+        ),
+        (
+            "consensus_final",
+            "state text",
+            "boolean",
+            "rvbbit_consensus_final",
+        ),
+        ("rerank", "document text, query text", "float8", "rvbbit_rerank"),
+        (
+            "extract_many",
+            "kind text, input text, clauses text",
+            "text",
+            "rvbbit_extract_many",
+        ),
+    ] {
+        if scalar(&format!(
+            "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'rvbbit' AND p.proname = '{name}' AND p.prosrc = '{body}'",
+        ))?
+        .is_none()
+        {
+            exec(&format!(
+                "CREATE FUNCTION rvbbit.{name}({args}) RETURNS {ret} \
+                 LANGUAGE internal VOLATILE PARALLEL UNSAFE COST 1000000 AS '{body}'",
+            ))?;
+        }
+    }
+    if scalar(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = 'summarize' AND p.prokind = 'a'",
+    )?
+    .is_none()
+    {
+        exec(
+            "CREATE AGGREGATE rvbbit.summarize(text, text) ( \
+                SFUNC = rvbbit.summarize_trans, STYPE = text, \
+                FINALFUNC = rvbbit.summarize_final, \
+                INITCOND = '{\"clauses\":\"\",\"extra\":\"\",\"parts\":[]}' )",
+        )?;
+    }
+    if scalar(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = 'consensus' AND p.prokind = 'a'",
+    )?
+    .is_none()
+    {
+        exec(
+            "CREATE AGGREGATE rvbbit.consensus(text, text, text) ( \
+                SFUNC = rvbbit.consensus_trans, STYPE = text, \
+                FINALFUNC = rvbbit.consensus_final, \
+                INITCOND = '{\"clauses\":\"\",\"extra\":\"\",\"parts\":[]}' )",
+        )?;
+    }
+    Ok(())
+}
+
 pub fn ensure_and_load() -> PgResult<()> {
     ensure_schema()?;
     bootstrap_means()?;
@@ -1076,6 +1157,7 @@ fn ensure_schema() -> PgResult<()> {
             ))?;
         }
     }
+    ensure_m6_ops()?;
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'dump_sql'",

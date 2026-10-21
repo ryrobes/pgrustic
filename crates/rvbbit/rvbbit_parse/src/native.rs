@@ -4,8 +4,10 @@
 //! `EXTRACT(ident FROM a_expr)` and `func(args)`. This pass only rewrites
 //! spans gram.y cannot keep as datetime EXTRACT or as a plain function:
 //! `CLASSIFY(expr INTO labels)` / `CLASSIFY(expr AS type)` and a typed
-//! `EXTRACT`. A query with neither form is returned unchanged, so
-//! regression text stays byte-identical.
+//! `EXTRACT`. Also `SUMMARIZE`, `CONSENSUS`, `RERANK`, `EXTRACT MANY`,
+//! and `expr |> op`. A query with none of those forms is returned
+//! unchanged, so regression text stays byte-identical. `|>>` is a
+//! geometric operator and is not a pipe.
 //!
 //! `EXTRACT` is rewritten only for a scalar kind (`int`, `float`, `bool`,
 //! `text`, and the aliases below) or when `ON ERROR` is present. Any other
@@ -76,7 +78,13 @@ pub fn rewrite_native_semantic(sql: &str) -> Option<String> {
 
 fn mentions(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
-    lower.contains("classify") || lower.contains("extract") || lower.contains("means")
+    lower.contains("classify")
+        || lower.contains("extract")
+        || lower.contains("means")
+        || lower.contains("summarize")
+        || lower.contains("consensus")
+        || lower.contains("rerank")
+        || lower.contains("|>")
 }
 
 fn rewrite_all(sql: &str) -> String {
@@ -124,7 +132,23 @@ fn rewrite_all(sql: &str) -> String {
             let word = &sql[start..i];
             let folded = word.to_ascii_lowercase();
             let next = skip_ws(b, i);
-            if next < b.len() && b[next] == b'(' && (folded == "classify" || folded == "extract") {
+            if folded == "extract" {
+                let many_at = skip_ws(b, i);
+                if word_at(sql, many_at, "many") {
+                    if let Some((end, rewritten)) = rewrite_extract_many(sql, many_at + 4, None) {
+                        out.push_str(&rewritten);
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            if next < b.len()
+                && b[next] == b'('
+                && matches!(
+                    folded.as_str(),
+                    "classify" | "extract" | "summarize" | "consensus" | "rerank"
+                )
+            {
                 if let Some((end, rewritten)) = rewrite_call(&folded, sql, next) {
                     out.push_str(&rewritten);
                     i = end;
@@ -139,6 +163,12 @@ fn rewrite_all(sql: &str) -> String {
             }
             out.push_str(word);
             continue;
+        }
+        if b[i] == b'|' && i + 1 < b.len() && b[i + 1] == b'>' && (i + 2 >= b.len() || b[i + 2] != b'>') {
+            if let Some(end) = rewrite_pipe(sql, i, &mut out) {
+                i = end;
+                continue;
+            }
         }
         let ch = sql[i..].chars().next().unwrap_or('\u{fffd}');
         out.push(ch);
@@ -163,6 +193,12 @@ fn rewrite_call(kind: &str, sql: &str, paren: usize) -> Option<(usize, String)> 
     let tail = clause_tail(sql, end);
     if let Some((tail_end, _)) = &tail {
         end = *tail_end;
+    }
+    if matches!(kind, "summarize" | "consensus" | "rerank") {
+        if let Some(call) = rewrite_named_call(kind, &body, tail.as_ref().map(|(_, t)| t.as_str()).unwrap_or("")) {
+            return Some((end, call));
+        }
+        return None;
     }
     if kind == "classify" {
         let (expr, labels, enum_name) = split_classify(&body)?;
@@ -230,6 +266,277 @@ fn rewrite_means(sql: &str, means_end: usize, out: &mut String) -> Option<usize>
         sql_string(&tail),
     ));
     Some(tail_end)
+}
+
+fn rewrite_named_call(kind: &str, body: &str, clauses: &str) -> Option<String> {
+    let args = split_top_commas(body);
+    match kind {
+        "summarize" if args.len() == 1 => Some(format!(
+            "rvbbit.summarize(({}), {})",
+            args[0].trim(),
+            sql_string(clauses)
+        )),
+        "consensus" if args.len() == 2 => Some(format!(
+            "rvbbit.consensus(({}), ({}), {})",
+            args[0].trim(),
+            args[1].trim(),
+            sql_string(clauses)
+        )),
+        "rerank" if args.len() == 2 && clauses.is_empty() => {
+            Some(format!("rvbbit.rerank(({}), ({}))", args[0].trim(), args[1].trim()))
+        }
+        "rerank" if args.len() == 2 => Some(format!(
+            "rvbbit.apply_clauses('rerank', ({}), ({}), {})",
+            args[0].trim(),
+            args[1].trim(),
+            sql_string(clauses)
+        )),
+        _ => None,
+    }
+}
+
+/// `EXTRACT MANY kind FROM expr`, or the pipe form whose input is already known.
+fn rewrite_extract_many(sql: &str, after_many: usize, piped: Option<&str>) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    let kind_at = skip_ws(b, after_many);
+    let (kind_end, kind) = take_kind(sql, kind_at)?;
+    let (expr, mut end) = if let Some(piped) = piped {
+        (piped.to_string(), kind_end)
+    } else {
+        let from_at = skip_ws(b, kind_end);
+        if !word_at(sql, from_at, "from") {
+            return None;
+        }
+        let expr_at = skip_ws(b, from_at + 4);
+        let expr_end = simple_expr_end(sql, expr_at)?;
+        (sql[expr_at..expr_end].trim().to_string(), expr_end)
+    };
+    let tail = clause_tail(sql, end);
+    let clauses = tail.as_ref().map(|(_, t)| t.as_str()).unwrap_or("");
+    if let Some((tail_end, _)) = &tail {
+        end = *tail_end;
+    }
+    let call = if clauses.is_empty() {
+        format!(
+            "jsonb_array_elements_text((rvbbit.extract_many({}, ({}), ''))::jsonb)",
+            sql_string(&kind),
+            expr
+        )
+    } else {
+        format!(
+            "jsonb_array_elements_text((rvbbit.apply_clauses('extract_many', ({}), {}, {}))::jsonb)",
+            expr,
+            sql_string(&kind),
+            sql_string(clauses)
+        )
+    };
+    Some((end, call))
+}
+
+fn rewrite_pipe(sql: &str, pipe: usize, out: &mut String) -> Option<usize> {
+    let b = sql.as_bytes();
+    if pipe + 2 < b.len() && b[pipe + 2] == b'>' {
+        return None;
+    }
+    let verb_at = skip_ws(b, pipe + 2);
+    let verb_end = ident_end(b, verb_at)?;
+    let verb = sql[verb_at..verb_end].to_ascii_lowercase();
+    if !matches!(
+        verb.as_str(),
+        "means" | "extract" | "classify" | "rerank" | "summarize" | "consensus"
+    ) {
+        return None;
+    }
+    let left = pop_simple_expr(out)?;
+    let rewritten = match verb.as_str() {
+        "means" | "consensus" => pipe_means(sql, verb_end, &left),
+        "rerank" => pipe_binary(sql, verb_end, &left, "rerank"),
+        "summarize" => pipe_summarize(sql, verb_end, &left),
+        "extract" => pipe_extract(sql, verb_end, &left),
+        "classify" => pipe_classify(sql, verb_end, &left),
+        _ => None,
+    };
+    let Some((end, sql_out)) = rewritten else {
+        out.push_str(&left);
+        return None;
+    };
+    out.push_str(&sql_out);
+    Some(end)
+}
+
+fn pipe_means(sql: &str, at: usize, left: &str) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    let arg_at = skip_ws(b, at);
+    let arg_end = simple_expr_end(sql, arg_at)?;
+    let right = sql[arg_at..arg_end].trim();
+    let tail = clause_tail(sql, arg_end);
+    if let Some((end, clauses)) = tail {
+        return Some((
+            end,
+            format!(
+                "rvbbit.apply_clauses('means', ({left}), ({right}), {})",
+                sql_string(&clauses)
+            ),
+        ));
+    }
+    Some((arg_end, format!("({left}) MEANS ({right})")))
+}
+
+fn pipe_binary(sql: &str, at: usize, left: &str, kind: &str) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    let arg_at = skip_ws(b, at);
+    let arg_end = simple_expr_end(sql, arg_at)?;
+    let right = sql[arg_at..arg_end].trim();
+    let tail = clause_tail(sql, arg_end);
+    if let Some((end, clauses)) = tail {
+        return Some((
+            end,
+            format!(
+                "rvbbit.apply_clauses('{kind}', ({left}), ({right}), {})",
+                sql_string(&clauses)
+            ),
+        ));
+    }
+    let call = if kind == "rerank" {
+        format!("rvbbit.rerank(({left}), ({right}))")
+    } else {
+        format!("rvbbit.{kind}(({left}), ({right}))")
+    };
+    Some((arg_end, call))
+}
+
+fn pipe_summarize(sql: &str, at: usize, left: &str) -> Option<(usize, String)> {
+    let tail = clause_tail(sql, at);
+    let (end, clauses) = match tail {
+        Some((end, clauses)) => (end, clauses),
+        None => (at, String::new()),
+    };
+    Some((
+        end,
+        format!("rvbbit.summarize_text(({left}), {})", sql_string(&clauses)),
+    ))
+}
+
+fn pipe_extract(sql: &str, at: usize, left: &str) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    let next = skip_ws(b, at);
+    if word_at(sql, next, "many") {
+        return rewrite_extract_many(sql, next + 4, Some(left));
+    }
+    let (kind_end, kind) = take_kind(sql, next)?;
+    let (fallback, mut end) = on_error(sql, kind_end);
+    let fallback_sql = fallback.unwrap_or_else(|| "NULL".into());
+    let tail = clause_tail(sql, end);
+    if let Some((tail_end, clauses)) = tail {
+        end = tail_end;
+        return Some((
+            end,
+            format!(
+                "rvbbit.apply_clauses('extract', ({left}), {}, {})",
+                sql_string(&kind),
+                sql_string(&clauses)
+            ),
+        ));
+    }
+    Some((
+        end,
+        format!(
+            "rvbbit.extract_typed({}, ({left}), {fallback_sql})",
+            sql_string(&kind)
+        ),
+    ))
+}
+
+fn pipe_classify(sql: &str, at: usize, left: &str) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    let mut i = skip_ws(b, at);
+    let mut labels = Vec::new();
+    loop {
+        let end = simple_expr_end(sql, i)?;
+        labels.push(literal_text(sql[i..end].trim()));
+        i = skip_ws(b, end);
+        if i < b.len() && b[i] == b',' {
+            i = skip_ws(b, i + 1);
+            continue;
+        }
+        break;
+    }
+    if labels.len() < 2 {
+        return None;
+    }
+    let joined = labels.join("\u{1f}");
+    let tail = clause_tail(sql, i);
+    if let Some((end, clauses)) = tail {
+        return Some((
+            end,
+            format!(
+                "rvbbit.apply_clauses('classify', ({left}), {}, {})",
+                sql_string(&joined),
+                sql_string(&clauses)
+            ),
+        ));
+    }
+    Some((
+        i,
+        format!("rvbbit.classify(({left}), {}, NULL)", sql_string(&joined)),
+    ))
+}
+
+fn take_kind(sql: &str, at: usize) -> Option<(usize, String)> {
+    let end = simple_expr_end(sql, at)?;
+    let kind = literal_text(sql[at..end].trim());
+    if kind.is_empty() {
+        return None;
+    }
+    Some((end, kind))
+}
+
+fn literal_text(token: &str) -> String {
+    let t = token.trim();
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        t[1..t.len() - 1].replace("''", "'")
+    } else {
+        t.to_string()
+    }
+}
+
+fn ident_end(b: &[u8], i: usize) -> Option<usize> {
+    if i >= b.len() || !is_ident_start(b[i]) {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < b.len() && is_ident_cont(b[j]) {
+        j += 1;
+    }
+    Some(j)
+}
+
+fn split_top_commas(body: &str) -> Vec<String> {
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            i = end_quote(b, i);
+            continue;
+        }
+        if b[i] == b'(' {
+            depth += 1;
+        } else if b[i] == b')' {
+            depth -= 1;
+        } else if b[i] == b',' && depth == 0 {
+            out.push(body[start..i].trim().to_string());
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let last = body[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
 }
 
 fn clause_tail(sql: &str, at: usize) -> Option<(usize, String)> {
@@ -728,6 +1035,47 @@ mod tests {
         assert!(out.contains("WITH TAKES 3 PICK BY VOTE"));
         assert!(out.contains("FROM ufo"));
         assert!(!out.to_ascii_lowercase().contains(" means "));
+    }
+
+    #[test]
+    fn m6_aggregate_rerank_extract_many_and_pipe() {
+        let sum = rewrite_native_semantic("SELECT SUMMARIZE(notes) FROM t GROUP BY kind").unwrap();
+        assert_eq!(sum, "SELECT rvbbit.summarize((notes), '') FROM t GROUP BY kind");
+        let summed = rewrite_native_semantic(
+            "SELECT SUMMARIZE(notes) WITH TAKES 2 FROM t GROUP BY kind",
+        )
+        .unwrap();
+        assert!(summed.contains("rvbbit.summarize((notes), 'WITH TAKES 2')"), "{summed}");
+        let vote = rewrite_native_semantic(
+            "SELECT CONSENSUS(notes, 'a large biped was seen') FROM t GROUP BY kind",
+        )
+        .unwrap();
+        assert!(vote.contains("rvbbit.consensus((notes), ('a large biped was seen'), '')"), "{vote}");
+        let rank = rewrite_native_semantic("SELECT RERANK(notes, 'logging road') FROM t").unwrap();
+        assert_eq!(rank, "SELECT rvbbit.rerank((notes), ('logging road')) FROM t");
+        let ranked = rewrite_native_semantic(
+            "SELECT notes |> RERANK 'logging road' WITH TAKES 2 FROM t",
+        )
+        .unwrap();
+        assert!(
+            ranked.contains("rvbbit.apply_clauses('rerank', (notes), ('logging road'), 'WITH TAKES 2')"),
+            "{ranked}"
+        );
+        let many = rewrite_native_semantic("SELECT EXTRACT MANY creature FROM notes FROM t").unwrap();
+        assert!(
+            many.contains("jsonb_array_elements_text((rvbbit.extract_many('creature', (notes), ''))::jsonb)"),
+            "{many}"
+        );
+        assert!(many.ends_with(" FROM t"), "{many}");
+        let piped = rewrite_native_semantic("SELECT notes |> EXTRACT creature FROM t").unwrap();
+        assert_eq!(piped, "SELECT rvbbit.extract_typed('creature', (notes), NULL) FROM t");
+        let means = rewrite_native_semantic(
+            "SELECT notes |> MEANS 'a large biped was seen' WITH TAKES 2 FROM t",
+        )
+        .unwrap();
+        assert!(means.contains("rvbbit.apply_clauses('means'"), "{means}");
+        let geom = "SELECT p |>> q FROM box_temp";
+        assert!(rewrite_native_semantic(geom).is_none(), "geometric |>> is not a pipe");
     }
 
     #[test]

@@ -43,6 +43,20 @@ pub const CLASSIFY_ENUM_OID: u32 = 9031;
 /// `rvbbit_apply_clauses(text, text, text, text) -> text`.
 /// Clause tail on a semantic call. The SQL result is a JSON report.
 pub const APPLY_CLAUSES_OID: u32 = 9032;
+/// `rvbbit_summarize_trans(text, text, text) -> text`.
+pub const SUMMARIZE_TRANS_OID: u32 = 9033;
+/// `rvbbit_summarize_final(text) -> text`.
+pub const SUMMARIZE_FINAL_OID: u32 = 9034;
+/// `rvbbit_consensus_trans(text, text, text, text) -> text`.
+pub const CONSENSUS_TRANS_OID: u32 = 9035;
+/// `rvbbit_consensus_final(text) -> bool`.
+pub const CONSENSUS_FINAL_OID: u32 = 9036;
+/// `rvbbit_rerank(text, text) -> float8`.
+pub const RERANK_OID: u32 = 9037;
+/// `rvbbit_extract_many(text, text, text) -> text`. JSON array.
+pub const EXTRACT_MANY_OID: u32 = 9038;
+/// `rvbbit_summarize_text(text, text) -> text`. Per-row summary (the pipe).
+pub const SUMMARIZE_TEXT_OID: u32 = 9039;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -56,6 +70,13 @@ pub const CLASSIFY_LABELS_NAME: &str = "rvbbit_classify_labels";
 pub const EXTRACT_TYPED_NAME: &str = "rvbbit_extract_typed";
 pub const CLASSIFY_ENUM_NAME: &str = "rvbbit_classify_enum";
 pub const APPLY_CLAUSES_NAME: &str = "rvbbit_apply_clauses";
+pub const SUMMARIZE_TRANS_NAME: &str = "rvbbit_summarize_trans";
+pub const SUMMARIZE_FINAL_NAME: &str = "rvbbit_summarize_final";
+pub const CONSENSUS_TRANS_NAME: &str = "rvbbit_consensus_trans";
+pub const CONSENSUS_FINAL_NAME: &str = "rvbbit_consensus_final";
+pub const RERANK_NAME: &str = "rvbbit_rerank";
+pub const EXTRACT_MANY_NAME: &str = "rvbbit_extract_many";
+pub const SUMMARIZE_TEXT_NAME: &str = "rvbbit_summarize_text";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

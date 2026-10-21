@@ -4,9 +4,10 @@
 //! return a boolean plus the yes-probability. Fixed-label classify uses
 //! one `choice` question on that same API and returns the winning label,
 //! its probability, and the per-label map. Extract, and classify with no
-//! label set, still call an OpenAI-compatible chat endpoint. Embed and
-//! rerank are rejected per item. `TAKES` / `PICK` are not parsed in SQL;
-//! a request may still send `decision` to stack models or repeats.
+//! label set, still call an OpenAI-compatible chat endpoint. Rerank is a
+//! noul relevance score on the decision model. Embed is rejected per item.
+//! `TAKES` / `PICK` are not parsed in SQL; a request may still send
+//! `decision` to stack models or repeats.
 //!
 //! `OPENROUTER_API_KEY` is read from the environment and is never logged
 //! or copied into an error string.
@@ -552,21 +553,15 @@ fn run_item(
         AUDIT_SNIP.with(|c| *c.borrow_mut() = None);
     }
     match operation {
-        Operation::Embed | Operation::Rerank => {
-            return Err(item_err(
-                "unsupported",
-                match operation {
-                    Operation::Embed => "embed is not implemented in hutch-lite",
-                    _ => "rerank is not implemented in hutch-lite",
-                },
-            ));
+        Operation::Embed => {
+            return Err(item_err("unsupported", "embed is not implemented in hutch-lite"));
         }
-        Operation::Predict | Operation::Decide | Operation::Extract | Operation::Classify => {}
+        Operation::Predict | Operation::Decide | Operation::Extract | Operation::Classify | Operation::Rerank => {}
     }
     let labels = item.labels.clone().unwrap_or_default();
     let descriptions = item.label_descriptions.clone().unwrap_or_default();
     let fixed_classify = operation == Operation::Classify && labels.len() >= 2;
-    let plan = (matches!(operation, Operation::Predict | Operation::Decide) || fixed_classify)
+    let plan = (matches!(operation, Operation::Predict | Operation::Decide | Operation::Rerank) || fixed_classify)
         .then(|| decision_plan(&server.cfg, req));
     let storage = storage_for(&item.cache_key, tenant, plan.as_ref(), &labels, &descriptions);
     let ttl = mode.ttl.unwrap_or(server.cfg.default_ttl);
@@ -663,8 +658,11 @@ fn provider_call(
     // call the provider again. MEANS and means_score share a call when
     // both are memoize and the Decisions JSON matches.
     let memo = mode == CacheMode::ReadWrite;
-    if matches!(operation, Operation::Predict | Operation::Decide) {
+    if matches!(operation, Operation::Predict | Operation::Decide | Operation::Rerank) {
         return decision_scored(server, tenant, operation, req, item, memo);
+    }
+    if operation == Operation::Extract && plan_is_wide(req) {
+        return extract_fanout(server, tenant, operation, req, item, memo);
     }
     if operation == Operation::Classify {
         let n = item.labels.as_ref().map(|l| l.len()).unwrap_or(0);
@@ -717,13 +715,14 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| match operation {
             Operation::Predict => "Answer with only true or false.".into(),
-            Operation::Extract => {
-                if item.extract_mode.as_deref() == Some("scalar") {
+            Operation::Extract => match item.extract_mode.as_deref() {
+                Some("scalar") => {
                     "Return one short noun or literal, at most three words. No sentence, no description, no markdown, no quotes.".into()
-                } else {
-                    "Return only JSON. No markdown.".into()
                 }
-            }
+                Some("summary") => "Summarize the notes in one or two sentences. No markdown.".into(),
+                Some("many") => "Return a JSON array of short nouns. No markdown.".into(),
+                _ => "Return only JSON. No markdown.".into(),
+            },
             Operation::Classify => "Reply with only the label.".into(),
             _ => String::new(),
         });
@@ -739,7 +738,11 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
         }
         Operation::Extract => {
             let input = json_str(&item.inputs, "input").unwrap_or_else(|| item.inputs.to_string());
-            if item.extract_mode.as_deref() == Some("scalar") {
+            if item.extract_mode.as_deref() == Some("summary") {
+                input
+            } else if item.extract_mode.as_deref() == Some("many") {
+                format!("List every value in this text.\n{input}")
+            } else if item.extract_mode.as_deref() == Some("scalar") {
                 format!("Extract one short value from this text:\n{input}")
             } else {
                 format!("Extract JSON from this text:\n{input}")
@@ -869,12 +872,12 @@ fn decision_scored(
         stamp_logged_identical(server, &calls);
     }
     let (matched, mean) = combine_noul(plan.combine, plan.threshold, &scores);
-    let mut scored = Scored::from_calls(
-        serde_json::Value::Bool(matched),
-        Some(mean),
-        None,
-        calls,
-    );
+    let value = if operation == Operation::Rerank {
+        serde_json::json!(mean)
+    } else {
+        serde_json::Value::Bool(matched)
+    };
+    let mut scored = Scored::from_calls(value, Some(mean), None, calls);
     if prints.len() >= 2 {
         scored.identical_takes = Some(identical);
     }
@@ -1716,8 +1719,129 @@ fn parse_extract(text: &str, mode: Option<&str>) -> Result<serde_json::Value, St
     match mode.unwrap_or("json") {
         "json" => parse_json_value(text),
         "scalar" => parse_scalar_value(text),
-        other => Err(format!("extract mode {other} is not json or scalar")),
+        "summary" => {
+            let stripped = strip_fences(text.trim());
+            if stripped.is_empty() {
+                Err("summary was empty".into())
+            } else {
+                Ok(serde_json::Value::String(stripped.to_string()))
+            }
+        }
+        "many" => {
+            let value = parse_json_value(text)?;
+            if value.is_array() {
+                Ok(value)
+            } else {
+                Err("extract many expected a JSON array".into())
+            }
+        }
+        other => Err(format!("extract mode {other} is not json, scalar, summary, or many")),
     }
+}
+
+fn plan_is_wide(req: &BatchRequest) -> bool {
+    let Some(stack) = &req.decision else {
+        return false;
+    };
+    stack.takes.unwrap_or(1) > 1 || stack.models.len() > 1 || !stack.phrasings.is_empty()
+}
+
+/// Chat extract with TAKES, stacked models, or phrasings. The winner is
+/// the majority text. Same-model takes that disagree log `identical` false.
+fn extract_fanout(
+    server: &Server,
+    tenant: &str,
+    operation: Operation,
+    req: &BatchRequest,
+    item: &ItemRequest,
+    memo: bool,
+) -> Result<Scored, ItemError> {
+    let stack = req.decision.clone().unwrap_or(DecisionStack {
+        models: Vec::new(),
+        takes: None,
+        combine: None,
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let mut models: Vec<String> = stack
+        .models
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| choose_model(&server.cfg, &s))
+        .collect();
+    if models.is_empty() {
+        models.push(choose_model(&server.cfg, &req.model));
+    }
+    let takes = stack.takes.unwrap_or(1).clamp(1, DECISION_TAKES_CAP);
+    let phrasings = if stack.phrasings.is_empty() {
+        vec![String::new()]
+    } else {
+        stack.phrasings
+    };
+    let mut texts = Vec::new();
+    let mut calls = Vec::new();
+    let mut prints: Vec<(String, String)> = Vec::new();
+    for model in &models {
+        for phrasing in &phrasings {
+            let mut asked = item.clone();
+            if !phrasing.is_empty() {
+                asked.prompt = Some(phrasing.clone());
+            }
+            for _take in 0..takes {
+                let (system, user) = prompts(operation, &asked);
+                let max_tokens = req.max_tokens.or(Some(256));
+                let (text, meter) = chat(
+                    server,
+                    operation,
+                    tenant,
+                    model,
+                    req.temperature,
+                    max_tokens,
+                    &system,
+                    &user,
+                    item.node.clone(),
+                )
+                .map_err(|message| item_err("provider", &message))?;
+                let _ = memo;
+                prints.push((format!("{model}\n{phrasing}"), text.trim().to_string()));
+                texts.push(text);
+                calls.push(meter);
+            }
+        }
+    }
+    let identical = identical_prints(&prints);
+    if prints.len() >= 2 {
+        for call in &mut calls {
+            call.identical = Some(identical);
+        }
+        stamp_logged_identical(server, &calls);
+    }
+    let winner = majority_text(&texts);
+    let value = parse_extract(&winner, item.extract_mode.as_deref())
+        .map_err(|message| item_err("parse", &message))?;
+    let mut scored = Scored::from_calls(value, None, None, calls);
+    if prints.len() >= 2 {
+        scored.identical_takes = Some(identical);
+    }
+    Ok(scored)
+}
+
+fn majority_text(texts: &[String]) -> String {
+    if texts.is_empty() {
+        return String::new();
+    }
+    let mut best = &texts[0];
+    let mut best_n = 0usize;
+    for candidate in texts {
+        let n = texts.iter().filter(|t| *t == candidate).count();
+        if n > best_n {
+            best = candidate;
+            best_n = n;
+        }
+    }
+    best.clone()
 }
 
 /// Typed scalar extract. A JSON string, number, bool, or null is that
