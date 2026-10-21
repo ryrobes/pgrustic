@@ -6,10 +6,12 @@
 //! wait. Workers use `ureq` (no tokio). Each backend URL has its own
 //! concurrency cap, taken from the catalog row (4 for the default mock).
 //!
-//! The wire format is `rvbbit-hutch-v1` (`rvbbit_contract`). MEANS posts
-//! `/v1/predict` once per batch and does not call `/v1/cache/lookup`.
-//! The cache header mode comes from the catalog (`memoize` → `read-write`,
-//! `off` → `off`). A 10k batch stays one HTTP call per 32 rows.
+//! The wire format is `rvbbit-hutch-v1` (`rvbbit_contract`). A read-write
+//! batch looks up `/v1/cache/lookup` and the process memo first, then
+//! posts only the misses. The cache header mode comes from the catalog
+//! (`memoize` → `read-write`, `off` → `off`) unless `semantic.cache`
+//! forces `off` or `refresh`. Lookup is not an operation post, so a
+//! 10k miss run still counts one predict per 32 rows.
 //! In-flight HTTP is not aborted; the wait returns at the next 20ms poll.
 
 use std::collections::HashMap;
@@ -28,6 +30,8 @@ use rvbbit_oids::POOL_THREADS;
 use rvbbit_resolve::Endpoint;
 use types_error::{PgError, PgResult};
 
+mod memo;
+
 const WAIT_SLICE: Duration = Duration::from_millis(20);
 const RETRY_CAP: Duration = Duration::from_millis(2_000);
 
@@ -39,6 +43,7 @@ struct Job {
     limiter: Arc<Limiter>,
     body: String,
     cache_header: String,
+    audit: bool,
     reply: mpsc::Sender<Result<RawReply, String>>,
 }
 
@@ -131,8 +136,60 @@ pub fn start() {
     let _ = pool();
 }
 
+/// Register `semantic.*` and point the memo at `GetConfigOption`.
+/// Called from backend startup, not from the pool unit test.
+pub fn define_gucs() {
+    use types_guc::PGC_USERSET;
+    let _ = guc::DefineCustomStringVariable(
+        "semantic.cache",
+        Some("Semantic cache mode: on, off, or refresh."),
+        None,
+        Some("on"),
+        PGC_USERSET,
+        0,
+    );
+    let _ = guc::DefineCustomStringVariable(
+        "semantic.memo_size",
+        Some("Process semantic memo capacity, in entries."),
+        None,
+        Some("1024"),
+        PGC_USERSET,
+        0,
+    );
+    let _ = guc::DefineCustomStringVariable(
+        "semantic.memo_ttl",
+        Some("Process semantic memo lifetime, in seconds. 0 disables expiry."),
+        None,
+        Some("3600"),
+        PGC_USERSET,
+        0,
+    );
+    let _ = guc::DefineCustomStringVariable(
+        "semantic.audit_payloads",
+        Some("When on, hutch call rows include a short input snippet."),
+        None,
+        Some("off"),
+        PGC_USERSET,
+        0,
+    );
+    guc::MarkGUCPrefixReserved("semantic");
+    memo::set_guc_reader(|name| guc::GetConfigOption(name, true, false).ok().flatten());
+}
+
+/// Clear the per-query memo. Executor start calls this.
+pub fn begin_query() {
+    memo::begin_query();
+}
+
 pub struct Ticket {
     rx: Receiver<Result<RawReply, String>>,
+    /// Item keys in request order. Empty when nothing was peeled.
+    order: Vec<String>,
+    /// Cache hits that were not posted.
+    ahead: Vec<rvbbit_contract::ItemResponse>,
+    /// `(cache_key, item key)` for the items that were posted, so the
+    /// reply can fill the memo.
+    posted: Vec<(String, String)>,
 }
 
 /// One hutch round-trip's worth of answers. `http_calls` counts attempts,
@@ -152,11 +209,16 @@ pub fn submit(func_oid: u32, items: &[(String, String)]) -> PgResult<Ticket> {
             body: empty_predict(&ep),
             http_calls: 0,
         }));
-        return Ok(Ticket { rx });
+        return Ok(Ticket {
+            rx,
+            order: Vec::new(),
+            ahead: Vec::new(),
+            posted: Vec::new(),
+        });
     }
     let body = encode_predict(&ep, items).map_err(pg)?;
     let auth = bearer(&ep).map_err(pg)?;
-    enqueue(
+    send(
         format!("{}/v1/predict", ep.base_url.trim_end_matches('/')),
         auth,
         &ep,
@@ -173,7 +235,7 @@ pub fn extract_text(func_oid: u32, input: &str) -> PgResult<String> {
     let inputs = serde_json::json!({ "input": input });
     let body = encode_items(&ep, Operation::Extract, &[inputs]).map_err(pg)?;
     let auth = bearer(&ep).map_err(pg)?;
-    let ticket = enqueue(
+    let ticket = send(
         format!("{}/v1/extract", ep.base_url.trim_end_matches('/')),
         auth,
         &ep,
@@ -192,7 +254,7 @@ pub fn classify_text(func_oid: u32, input: &str) -> PgResult<String> {
     let inputs = serde_json::json!({ "input": input });
     let body = encode_items(&ep, Operation::Classify, &[inputs]).map_err(pg)?;
     let auth = bearer(&ep).map_err(pg)?;
-    let ticket = enqueue(
+    let ticket = send(
         format!("{}/v1/classify", ep.base_url.trim_end_matches('/')),
         auth,
         &ep,
@@ -210,7 +272,7 @@ pub fn means_score(func_oid: u32, input: &str, criterion: &str) -> PgResult<f64>
     let inputs = serde_json::json!({ "input": input, "criterion": criterion });
     let body = encode_items(&ep, Operation::Predict, &[inputs]).map_err(pg)?;
     let auth = bearer(&ep).map_err(pg)?;
-    let ticket = enqueue(
+    let ticket = send(
         format!("{}/v1/predict", ep.base_url.trim_end_matches('/')),
         auth,
         &ep,
@@ -222,6 +284,11 @@ pub fn means_score(func_oid: u32, input: &str, criterion: &str) -> PgResult<f64>
 }
 
 fn cache_mode_of(ep: &Endpoint) -> CacheMode {
+    match memo::cache_mode().as_str() {
+        "off" => return CacheMode::Off,
+        "refresh" => return CacheMode::Refresh,
+        _ => {}
+    }
     match ep.cache_mode.as_str() {
         "off" => CacheMode::Off,
         "refresh" => CacheMode::Refresh,
@@ -229,9 +296,8 @@ fn cache_mode_of(ep: &Endpoint) -> CacheMode {
     }
 }
 
-/// `POST /v1/cache/lookup`. Not used by MEANS. The hot path sends the
-/// catalog cache mode on the operation POST and does not add a lookup hop.
-/// Exposed so the pool speaks the contract.
+/// `POST /v1/cache/lookup`. The operation path also calls this before
+/// posting misses. Exposed so a test can speak the contract directly.
 pub fn cache_lookup(base_url: &str, keys: &[String]) -> PgResult<CacheLookupResponse> {
     let ep = rvbbit_resolve::default_endpoint();
     let body = serde_json::to_string(&CacheLookupRequest { keys: keys.to_vec() })
@@ -338,7 +404,7 @@ fn one_item(reply: ManyReply) -> PgResult<String> {
 
 fn post_op(ep: &Endpoint, op: &str, body: String) -> PgResult<RawReply> {
     let auth = bearer(ep).map_err(pg)?;
-    let ticket = enqueue(
+    let ticket = send(
         format!("{}/v1/{op}", ep.base_url.trim_end_matches('/')),
         auth,
         ep,
@@ -462,6 +528,7 @@ fn enqueue(
         retries: ep.retries.max(1),
         body,
         cache_header,
+        audit: memo::audit_payloads(),
         reply,
     };
     let tx = &pool().tx;
@@ -479,21 +546,191 @@ fn enqueue(
             }
         }
     }
-    Ok(Ticket { rx })
+    Ok(Ticket {
+        rx,
+        order: Vec::new(),
+        ahead: Vec::new(),
+        posted: Vec::new(),
+    })
+}
+
+fn send(
+    url: String,
+    auth: Option<String>,
+    ep: &Endpoint,
+    body: String,
+    cache_header: String,
+) -> PgResult<Ticket> {
+    let prepared = prepare_batch(ep, &url, &body, &cache_header)?;
+    match prepared {
+        Prepared::Local(body) => {
+            let (tx, rx) = mpsc::channel();
+            let _ = tx.send(Ok(RawReply { body, http_calls: 0 }));
+            Ok(Ticket {
+                rx,
+                order: Vec::new(),
+                ahead: Vec::new(),
+                posted: Vec::new(),
+            })
+        }
+        Prepared::Remote(PreparedRemote { body, order, ahead, posted }) => {
+            let mut ticket = enqueue(url, auth, ep, body, cache_header)?;
+            ticket.order = order;
+            ticket.ahead = ahead;
+            ticket.posted = posted;
+            Ok(ticket)
+        }
+    }
+}
+
+struct PreparedRemote {
+    body: String,
+    order: Vec<String>,
+    ahead: Vec<rvbbit_contract::ItemResponse>,
+    posted: Vec<(String, String)>,
+}
+
+enum Prepared {
+    Local(String),
+    Remote(PreparedRemote),
+}
+
+fn prepare_batch(ep: &Endpoint, url: &str, body: &str, header: &str) -> PgResult<Prepared> {
+    if url.contains("/v1/cache/") || !header.contains("mode=read-write") {
+        return Ok(remote_unchanged(body));
+    }
+    let Ok(mut req) = serde_json::from_str::<BatchRequest>(body) else {
+        return Ok(remote_unchanged(body));
+    };
+    let order: Vec<String> = req.items.iter().map(|item| item.key.clone()).collect();
+    let mut ahead = Vec::new();
+    let mut unknown = Vec::new();
+    for item in &req.items {
+        if let Some(hit) = memo::recall(&item.cache_key) {
+            let mut response = memo::hit_response(&item.key, &hit);
+            response.key = item.key.clone();
+            ahead.push(response);
+        } else {
+            unknown.push(item.cache_key.clone());
+        }
+    }
+    if !unknown.is_empty() {
+        match cache_lookup_ep(ep, &unknown) {
+            Ok(found) => {
+                let mut hit_keys = std::collections::HashSet::new();
+                for hit in found.hits {
+                    hit_keys.insert(hit.key.clone());
+                    memo::remember(&hit.key, hit.output.clone(), hit.score);
+                    if let Some(item) = req.items.iter().find(|item| item.cache_key == hit.key) {
+                        ahead.push(rvbbit_contract::ItemResponse {
+                            key: item.key.clone(),
+                            value: Some(hit.output),
+                            score: hit.score,
+                            scores: None,
+                            calls: None,
+                            error: None,
+                        });
+                    }
+                }
+                let _ = hit_keys;
+            }
+            Err(_) => {}
+        }
+    }
+    let ahead_keys: std::collections::HashSet<String> =
+        ahead.iter().map(|item| item.key.clone()).collect();
+    if ahead_keys.len() == order.len() && !order.is_empty() {
+        let outputs = order
+            .iter()
+            .filter_map(|key| ahead.iter().find(|item| &item.key == key).cloned())
+            .collect();
+        let response = BatchResponse {
+            contract: CONTRACT_VERSION.to_string(),
+            outputs,
+        };
+        let json = serde_json::to_string(&response).map_err(|e| pg(e.to_string()))?;
+        return Ok(Prepared::Local(json));
+    }
+    let posted: Vec<(String, String)> = req
+        .items
+        .iter()
+        .filter(|item| !ahead_keys.contains(&item.key))
+        .map(|item| (item.cache_key.clone(), item.key.clone()))
+        .collect();
+    req.items.retain(|item| !ahead_keys.contains(&item.key));
+    if req.items.len() == order.len() {
+        return Ok(remote_unchanged(body));
+    }
+    let body = serde_json::to_string(&req).map_err(|e| pg(e.to_string()))?;
+    Ok(Prepared::Remote(PreparedRemote {
+        body,
+        order,
+        ahead,
+        posted,
+    }))
+}
+
+fn remote_unchanged(body: &str) -> Prepared {
+    Prepared::Remote(PreparedRemote {
+        body: body.to_string(),
+        order: Vec::new(),
+        ahead: Vec::new(),
+        posted: Vec::new(),
+    })
+}
+
+fn cache_lookup_ep(ep: &Endpoint, keys: &[String]) -> PgResult<CacheLookupResponse> {
+    let body = serde_json::to_string(&CacheLookupRequest { keys: keys.to_vec() })
+        .map_err(|e| pg(format!("cache lookup encode: {e}")))?;
+    let ticket = enqueue(
+        format!("{}/v1/cache/lookup", ep.base_url.trim_end_matches('/')),
+        bearer(ep).map_err(pg)?,
+        ep,
+        body,
+        cache_header(CacheMode::Off, None, None),
+    )?;
+    let raw = wait_raw(ticket)?;
+    serde_json::from_str(&raw.body).map_err(|e| pg(format!("cache lookup decode: {e}")))
 }
 
 fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
-    loop {
+    let Ticket { rx, order, ahead, posted } = ticket;
+    let raw = loop {
         check_cancel()?;
-        match ticket.rx.recv_timeout(WAIT_SLICE) {
-            Ok(Ok(v)) => return Ok(v),
+        match rx.recv_timeout(WAIT_SLICE) {
+            Ok(Ok(v)) => break v,
             Ok(Err(e)) => return Err(pg(e)),
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(pg("rvbbit dispatch worker dropped the reply"));
             }
         }
+    };
+    if order.is_empty() {
+        return Ok(raw);
     }
+    let mut parsed: BatchResponse = serde_json::from_str(&raw.body).map_err(|e| pg(e.to_string()))?;
+    for (cache_key, item_key) in &posted {
+        if let Some(item) = parsed.outputs.iter().find(|item| &item.key == item_key) {
+            if let Some(value) = &item.value {
+                memo::remember(cache_key, value.clone(), item.score);
+            }
+        }
+    }
+    let mut merged = Vec::with_capacity(order.len());
+    for key in &order {
+        if let Some(hit) = ahead.iter().find(|item| &item.key == key) {
+            merged.push(hit.clone());
+        } else if let Some(hit) = parsed.outputs.iter().find(|item| &item.key == key) {
+            merged.push(hit.clone());
+        }
+    }
+    parsed.outputs = merged;
+    let body = serde_json::to_string(&parsed).map_err(|e| pg(e.to_string()))?;
+    Ok(RawReply {
+        body,
+        http_calls: raw.http_calls,
+    })
 }
 
 fn encode_predict(ep: &Endpoint, items: &[(String, String)]) -> Result<String, String> {
@@ -507,6 +744,7 @@ fn encode_predict(ep: &Endpoint, items: &[(String, String)]) -> Result<String, S
 fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value]) -> Result<String, String> {
     let system = if ep.system_prompt.is_empty() { None } else { Some(ep.system_prompt.clone()) };
     let prompt = if ep.user_prompt.is_empty() { None } else { Some(ep.user_prompt.clone()) };
+    let opts = cache_opts(ep);
     let mut req_items = Vec::with_capacity(inputs.len());
     for (i, inputs) in inputs.iter().enumerate() {
         let schema = return_schema(ep);
@@ -521,6 +759,9 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
             max_tokens: ep.max_tokens,
             take_index: 0,
             seed: "",
+            opts: &opts,
+            threshold: ep.threshold,
+            extract_mode: ep.extract_mode.as_deref().unwrap_or(""),
             inputs,
         });
         let criterion = inputs.get("criterion").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -559,6 +800,20 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
 /// already hashes. Empty labels leave the schema unchanged.
 /// A function or operator `THRESHOLD` becomes the noul cutoff. Absent
 /// keeps the hutch server default. Classify and extract ignore it.
+fn cache_opts(ep: &Endpoint) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if !ep.labels.is_empty() {
+        map.insert("labels".into(), serde_json::json!(ep.labels));
+    }
+    if ep.label_descriptions.iter().any(|d| !d.is_empty()) {
+        map.insert(
+            "label_descriptions".into(),
+            serde_json::json!(ep.label_descriptions),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
 fn noul_stack(ep: &Endpoint, operation: Operation) -> Option<DecisionStack> {
     if !matches!(operation, Operation::Predict | Operation::Decide) {
         return None;
@@ -758,6 +1013,9 @@ fn post_once(agent: &ureq::Agent, job: &Job) -> Result<String, PostErr> {
         .set("Content-Type", "application/json")
         .set(HEADER_CONTRACT, CONTRACT_VERSION)
         .set(HEADER_CACHE, &job.cache_header);
+    if job.audit {
+        req = req.set("X-Rvbbit-Audit", "payloads");
+    }
     if let Some(token) = &job.auth {
         req = req.set(HEADER_AUTHORIZATION, &format!("Bearer {token}"));
     }
@@ -852,7 +1110,7 @@ impl Decisions for HutchTree<'_> {
 
 fn post_tree(ep: &Endpoint, op: &str, body: String) -> Result<RawReply, String> {
     let auth = bearer(ep)?;
-    let ticket = enqueue(
+    let ticket = send(
         format!("{}/v1/{op}", ep.base_url.trim_end_matches('/')),
         auth,
         ep,
@@ -887,6 +1145,13 @@ fn encode_tree_items(
         schema_ep.labels = labels.to_vec();
         schema_ep.label_descriptions = meanings.to_vec();
         let schema = return_schema(&schema_ep);
+        let mut opts = cache_opts(&schema_ep);
+        if !models.is_empty() {
+            opts["models"] = serde_json::json!(models);
+        }
+        if !combine.is_empty() {
+            opts["combine"] = serde_json::json!(combine);
+        }
         let cache_key = client_cache_key_hex(&CacheKeyParts {
             fn_name: &ep.fn_name,
             fn_version: ep.fn_version,
@@ -898,6 +1163,9 @@ fn encode_tree_items(
             max_tokens: None,
             take_index: 0,
             seed: node,
+            opts: &opts,
+            threshold,
+            extract_mode: "",
             inputs: &inputs,
         });
         req_items.push(ItemRequest {

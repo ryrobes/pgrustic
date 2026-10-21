@@ -271,6 +271,22 @@ Catalog `EXTRACT` still requires JSON. `extract_mode = scalar` on an
 item accepts a JSON scalar or plain text and caches that string. A JSON
 object stays an error in scalar mode.
 
+## Cache
+
+`semantic.cache` is `on` (honor the catalog mode), `off`, or `refresh`.
+`semantic.memo_size` (default `1024`) and `semantic.memo_ttl` (default
+`3600` seconds, `0` disables expiry) bound the process LRU. A per-query
+map in front of that LRU is cleared at executor start and is not a
+Postgres write, so a read-only transaction and a hot standby can run
+these calls. Receipts stay on the hutch call log (`rvbbit.calls` reads
+it). There is no audit table. `semantic.audit_payloads` `on` adds a
+short input snippet to that log.
+
+Hutch `HUTCH_CACHE` is `memory` (default), `off`, or `persistent`.
+Persistent entries are files in `HUTCH_CACHE_DIR` (default `hutch-cache`),
+keyed by the tenant-mixed storage key. A restarted hutch serves them
+with no provider call. `POST /reset` deletes those files.
+
 `rvbbit.calls` reads each distinct hutch URL once. Two backends that
 share a URL do not duplicate the log. The live demo and the tree demo
 export `RVBBIT_HUTCH_URL` so that read is the demo hutch, not port 8099.

@@ -8,7 +8,9 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+guc = { path = "../../backend/utils/misc/guc" }
 init_small = { path = "../../backend/utils/init/init_small" }
+types_guc = { path = "../../_support/types/types_guc" }
 postgres_seams = { path = "../../backend/tcop/postgres_seams" }
 rvbbit_contract = { path = "../rvbbit_contract" }
 rvbbit_oids = { path = "../rvbbit_oids" }

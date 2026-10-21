@@ -17158,6 +17158,7 @@ dependencies = [
 name = "rvbbit_dispatch"
 version = "0.0.0"
 dependencies = [
+ "guc",
  "hutch_mock",
  "init_small",
  "postgres_seams",
@@ -17167,6 +17168,7 @@ dependencies = [
  "rvbbit_tree",
  "serde_json",
  "types_error",
+ "types_guc",
  "ureq",
 ]
 

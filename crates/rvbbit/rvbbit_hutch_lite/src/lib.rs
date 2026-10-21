@@ -16,6 +16,7 @@
 //! `output_tokens`. A missing cost falls back to `GET {base}/generation`.
 
 mod cost;
+mod persist;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -37,6 +38,14 @@ use cost::{
 };
 
 const CALL_LOG_CAP: usize = 1024;
+
+thread_local! {
+    static AUDIT_SNIP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn audit_payload() -> Option<String> {
+    AUDIT_SNIP.with(|c| c.borrow().clone())
+}
 
 const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
 const DEFAULT_DECISION_MODEL: &str = "typesafe/jev-1.14";
@@ -65,6 +74,13 @@ pub struct Config {
     pub default_ttl: Duration,
     /// When set, require `Authorization: Bearer <value>`.
     pub expect_auth: Option<String>,
+    /// `off`, `memory`, or `persistent`. `off` skips the contract cache.
+    /// `persistent` writes the same entries under [`Self::cache_dir`] so a
+    /// restart still serves them.
+    pub cache_store: String,
+    pub cache_dir: String,
+    /// Record a short input snippet on each call meter.
+    pub audit_payloads: bool,
 }
 
 /// `https://openrouter.ai/api/v1` -> `https://openrouter.ai/api/alpha/decisions`.
@@ -126,7 +142,20 @@ impl Config {
             tenant: std::env::var("HUTCH_TENANT").unwrap_or_else(|_| "local".into()),
             default_ttl: Duration::from_secs(ttl_secs),
             expect_auth: std::env::var("HUTCH_EXPECT_AUTH").ok().filter(|s| !s.is_empty()),
+            cache_store: cache_store_from_env(),
+            cache_dir: std::env::var("HUTCH_CACHE_DIR").unwrap_or_else(|_| "hutch-cache".into()),
+            audit_payloads: std::env::var("HUTCH_AUDIT_PAYLOADS")
+                .map(|s| s == "on" || s == "1" || s == "true")
+                .unwrap_or(false),
         }
+    }
+}
+
+fn cache_store_from_env() -> String {
+    match std::env::var("HUTCH_CACHE").unwrap_or_else(|_| "memory".into()).as_str() {
+        "off" => "off".into(),
+        "persistent" => "persistent".into(),
+        _ => "memory".into(),
     }
 }
 
@@ -289,6 +318,7 @@ fn handle(mut stream: TcpStream, server: &Server) {
     let mut path = String::new();
     let mut auth = String::new();
     let mut cache_header = String::new();
+    let mut audit_header = String::new();
     for (i, line) in header.lines().enumerate() {
         if i == 0 {
             let mut parts = line.split_whitespace();
@@ -301,6 +331,8 @@ fn handle(mut stream: TcpStream, server: &Server) {
                 auth = value.trim().to_string();
             } else if name.eq_ignore_ascii_case("x-rvbbit-cache") {
                 cache_header = value.trim().to_string();
+            } else if name.eq_ignore_ascii_case("x-rvbbit-audit") {
+                audit_header = value.trim().to_string();
             }
         }
     }
@@ -313,7 +345,17 @@ fn handle(mut stream: TcpStream, server: &Server) {
     }
     body.truncate(content_length);
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-    let (status, payload) = route(server, &method, path_only(&path), query, &auth, &cache_header, &body);
+    let audit = server.cfg.audit_payloads || audit_header.split(',').any(|p| p.trim() == "payloads");
+    let (status, payload) = route(
+        server,
+        &method,
+        path_only(&path),
+        query,
+        &auth,
+        &cache_header,
+        audit,
+        &body,
+    );
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
@@ -329,6 +371,7 @@ fn route(
     query: &str,
     auth: &str,
     cache_header: &str,
+    audit: bool,
     body: &[u8],
 ) -> (u16, String) {
     if method.eq_ignore_ascii_case("GET") && (path == "/stats" || path == PATH_CACHE_STATS) {
@@ -340,6 +383,9 @@ fn route(
     if method.eq_ignore_ascii_case("POST") && path == "/reset" {
         let mut cache = lock(&server.cache);
         *cache = Cache::new();
+        if server.cfg.cache_store == "persistent" {
+            persist::clear_dir(std::path::Path::new(&server.cfg.cache_dir));
+        }
         return (200, "{\"ok\":true}".into());
     }
     if let Some(expect) = &server.cfg.expect_auth {
@@ -382,12 +428,15 @@ fn route(
             Err(e) => return (400, format!("{{\"error\":\"{e}\"}}")),
         };
         let op = operation.unwrap_or(req.operation);
-        let mode = parse_cache_header(cache_header);
+        let mut mode = parse_cache_header(cache_header);
+        if server.cfg.cache_store == "off" {
+            mode.mode = CacheMode::Off;
+        }
         {
             let mut cache = lock(&server.cache);
             cache.requests += 1;
         }
-        let resp = run_batch(server, &tenant, op, mode, &req);
+        let resp = run_batch(server, &tenant, op, mode, &req, audit);
         return (200, serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()));
     }
     (404, "{\"error\":\"not found\"}".into())
@@ -399,6 +448,7 @@ fn run_batch(
     operation: Operation,
     mode: ParsedCache,
     req: &BatchRequest,
+    audit: bool,
 ) -> BatchResponse {
     let outputs = Arc::new(Mutex::new(vec![
         ItemResponse {
@@ -419,7 +469,7 @@ fn run_batch(
             let outputs = Arc::clone(&outputs);
             scope.spawn(move || {
                 acquire(&gate);
-                let result = run_item(server, tenant, operation, mode, req, item);
+                let result = run_item(server, tenant, operation, mode, req, item, audit);
                 release(&gate);
                 let mut slot = outputs.lock().unwrap_or_else(|e| e.into_inner());
                 slot[i] = match result {
@@ -460,7 +510,19 @@ fn run_item(
     mode: ParsedCache,
     req: &BatchRequest,
     item: &rvbbit_contract::ItemRequest,
+    audit: bool,
 ) -> Result<Scored, ItemError> {
+    if audit {
+        let text = item.inputs.to_string();
+        let snip = if text.chars().count() > 180 {
+            text.chars().take(180).collect()
+        } else {
+            text
+        };
+        AUDIT_SNIP.with(|c| *c.borrow_mut() = Some(snip));
+    } else {
+        AUDIT_SNIP.with(|c| *c.borrow_mut() = None);
+    }
     match operation {
         Operation::Embed | Operation::Rerank => {
             return Err(item_err(
@@ -507,7 +569,7 @@ fn get_or_compute(
 ) -> Result<Scored, ItemError> {
     {
         let mut cache = lock(&server.cache);
-        if let Some(hit) = fresh(&cache, storage) {
+        if let Some(hit) = fresh(server, &mut cache, storage) {
             cache.hits += 1;
             drop(cache);
             return Ok(meter_cached(server, operation, tenant, &hit, "hit", started, node.clone()));
@@ -1312,6 +1374,7 @@ fn miss_meter(
         generation_id: usage.generation_id.clone(),
         node,
         score,
+        payload: audit_payload(),
     }
 }
 
@@ -1348,6 +1411,7 @@ fn saved_meter(
         generation_id: usage.generation_id.clone(),
         node,
         score,
+        payload: audit_payload(),
     }
 }
 
@@ -1380,6 +1444,7 @@ fn meter_cached(
         generation_id: stored.generation_id.clone(),
         node,
         score: stored.score,
+        payload: audit_payload(),
     };
     record_call(server, &meter);
     let mut scored = stored.clone();
@@ -1656,9 +1721,13 @@ fn lookup(server: &Server, tenant: &str, req: &CacheLookupRequest) -> String {
     let mut cache = lock(&server.cache);
     for key in &req.keys {
         let storage = storage_of(key, tenant);
-        if let Some(hit) = fresh(&cache, &storage) {
+        if let Some(hit) = fresh(server, &mut cache, &storage) {
             cache.hits += 1;
-            hits.push(CacheHit { key: key.clone(), output: hit.value });
+            hits.push(CacheHit {
+                key: key.clone(),
+                output: hit.value,
+                score: hit.score,
+            });
         } else {
             cache.misses += 1;
             misses.push(key.clone());
@@ -1706,21 +1775,53 @@ fn purge(server: &Server, tenant: &str, req: &CachePurgeRequest) -> String {
 }
 
 fn store(server: &Server, storage: &str, scored: &Scored, ttl: Duration) {
+    if server.cfg.cache_store == "off" {
+        return;
+    }
     let expires = if ttl.is_zero() { None } else { Some(Instant::now() + ttl) };
     let mut kept = scored.clone();
     kept.calls.clear();
+    if server.cfg.cache_store == "persistent" {
+        let ttl_ms = if ttl.is_zero() { None } else { Some(ttl.as_millis()) };
+        persist::save(
+            std::path::Path::new(&server.cfg.cache_dir),
+            storage,
+            &kept.value,
+            kept.score,
+            ttl_ms,
+        );
+    }
     let mut cache = lock(&server.cache);
     cache.entries.insert(storage.to_string(), CacheEntry { scored: kept, expires });
 }
 
-fn fresh(cache: &Cache, storage: &str) -> Option<Scored> {
-    let entry = cache.entries.get(storage)?;
-    if let Some(exp) = entry.expires {
-        if Instant::now() >= exp {
-            return None;
-        }
+fn fresh(server: &Server, cache: &mut Cache, storage: &str) -> Option<Scored> {
+    if server.cfg.cache_store == "off" {
+        return None;
     }
-    Some(entry.scored.clone())
+    let memory = cache.entries.get(storage).map(|entry| {
+        let expired = entry.expires.is_some_and(|exp| Instant::now() >= exp);
+        (expired, entry.scored.clone())
+    });
+    if let Some((expired, scored)) = memory {
+        if !expired {
+            return Some(scored);
+        }
+        cache.entries.remove(storage);
+    }
+    if server.cfg.cache_store != "persistent" {
+        return None;
+    }
+    let (value, score) = persist::load(std::path::Path::new(&server.cfg.cache_dir), storage)?;
+    let scored = Scored::bare(value, score, None);
+    cache.entries.insert(
+        storage.to_string(),
+        CacheEntry {
+            scored: scored.clone(),
+            expires: Some(Instant::now() + server.cfg.default_ttl),
+        },
+    );
+    Some(scored)
 }
 
 fn storage_for(
@@ -1730,32 +1831,12 @@ fn storage_for(
     labels: &[String],
     descriptions: &[String],
 ) -> String {
-    let base = storage_of(client_hex, tenant);
-    if plan.is_none() && labels.is_empty() {
-        return base;
-    }
-    let mut tag = if let Some(plan) = plan {
-        let threshold = serde_json::Number::from_f64(plan.threshold)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "null".into());
-        format!(
-            "{base}\n{}\n{}\n{}\n{threshold}",
-            plan.models.join("\n"),
-            plan.takes,
-            plan.combine.as_str(),
-        )
-    } else {
-        base
-    };
-    if !labels.is_empty() {
-        tag.push('\n');
-        tag.push_str(&labels.join("\n"));
-    }
-    if descriptions.iter().any(|d| !d.is_empty()) {
-        tag.push('\n');
-        tag.push_str(&descriptions.join("\n"));
-    }
-    hex32(&blake3::hash(tag.as_bytes()).into())
+    // Cache key v2 already carries threshold, extract mode, labels, and
+    // descriptions. Lookup addresses that client key. A change to the
+    // server-side default `HUTCH_DECISION_THRESHOLD` needs `POST /reset`
+    // (or `HUTCH_CACHE=off`) before it applies to stored booleans.
+    let _ = (plan, labels, descriptions);
+    storage_of(client_hex, tenant)
 }
 
 fn stats_json(server: &Server, lite: bool) -> String {

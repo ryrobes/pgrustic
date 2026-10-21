@@ -483,6 +483,7 @@ pub fn init_all_with_transport(transport: Transport) {
     rvbbit_resolve::set_ensure(rvbbit_catalog::ensure_and_load);
     rvbbit_resolve::set_execute(rvbbit_catalog::execute);
     rvbbit_resolve::set_enum_labels(rvbbit_catalog::enum_labels);
+    rvbbit_dispatch::define_gucs();
     rvbbit_dispatch::start();
 }
 

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const CONTRACT_VERSION: &str = "rvbbit-hutch-v1";
-pub const CACHE_KEY_VERSION: &str = "rvbbit-cache-v1";
+pub const CACHE_KEY_VERSION: &str = "rvbbit-cache-v2";
 
 pub const HEADER_CONTRACT: &str = "X-Rvbbit-Contract";
 pub const HEADER_CACHE: &str = "X-Rvbbit-Cache";
@@ -244,6 +244,11 @@ pub struct CallMeter {
     /// probability for a choice call. Absent on chat and on errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// Request snippet when `semantic.audit_payloads` is on. Absent
+    /// otherwise. The hutch call log is the receipt; this is not a
+    /// Postgres table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -261,6 +266,10 @@ pub struct CacheLookupRequest {
 pub struct CacheHit {
     pub key: String,
     pub output: serde_json::Value,
+    /// Yes-probability or winning-label probability, when the stored
+    /// value had one. Older servers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -325,6 +334,14 @@ pub struct CacheKeyParts<'a> {
     pub max_tokens: Option<u32>,
     pub take_index: u32,
     pub seed: &'a str,
+    /// Sorted option object. Labels and label descriptions live here so
+    /// a description change misses even when the return schema forgot
+    /// them. Empty object when the call has no options.
+    pub opts: &'a serde_json::Value,
+    /// Noul cutoff. `None` is an empty field, distinct from `0`.
+    pub threshold: Option<f64>,
+    /// `scalar`, `json`, or empty when the call is not an extract.
+    pub extract_mode: &'a str,
     pub inputs: &'a serde_json::Value,
 }
 
@@ -350,8 +367,18 @@ pub fn client_cache_key(parts: &CacheKeyParts<'_>) -> [u8; 32] {
         &mut buf,
         parts.max_tokens.map(|n| n.to_string()).unwrap_or_default().as_bytes(),
     );
+    push_lp(&mut buf, canonical_json(parts.opts).as_bytes());
     push_lp(&mut buf, parts.take_index.to_string().as_bytes());
     push_lp(&mut buf, parts.seed.as_bytes());
+    push_lp(
+        &mut buf,
+        parts
+            .threshold
+            .map(canonical_number)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    push_lp(&mut buf, parts.extract_mode.as_bytes());
     push_lp(&mut buf, inputs.as_bytes());
     blake3::hash(&buf).into()
 }
@@ -441,6 +468,7 @@ mod tests {
         let a = serde_json::json!({"b": 1, "a": "é"});
         let composed = "e\u{0301}";
         let b = serde_json::json!({"a": composed, "b": 1});
+        let opts = serde_json::json!({});
         let pa = CacheKeyParts {
             fn_name: "rvbbit.means",
             fn_version: 1,
@@ -452,6 +480,9 @@ mod tests {
             max_tokens: Some(16),
             take_index: 0,
             seed: "",
+            opts: &opts,
+            threshold: None,
+            extract_mode: "",
             inputs: &a,
         };
         let mut pb = pa.clone();
@@ -464,6 +495,7 @@ mod tests {
     #[test]
     fn version_and_tenant_change_the_key() {
         let inputs = serde_json::json!({"input": "x"});
+        let opts = serde_json::json!({});
         let p = CacheKeyParts {
             fn_name: "rvbbit.means",
             fn_version: 1,
@@ -475,6 +507,9 @@ mod tests {
             max_tokens: None,
             take_index: 0,
             seed: "",
+            opts: &opts,
+            threshold: None,
+            extract_mode: "",
             inputs: &inputs,
         };
         let mut q = p.clone();
@@ -492,5 +527,48 @@ mod tests {
             cache_header(CacheMode::ReadWrite, Some("ab"), Some(30)),
             "key=ab; ttl=30; mode=read-write"
         );
+    }
+
+    #[test]
+    fn threshold_extract_mode_and_opts_change_the_key() {
+        let inputs = serde_json::json!({"input": "x"});
+        let opts = serde_json::json!({"label_descriptions": ["tracks", "saw it"]});
+        let swapped = serde_json::json!({"label_descriptions": ["tracks", "saw it"]});
+        let base = CacheKeyParts {
+            fn_name: "classify",
+            fn_version: 1,
+            system_prompt: "",
+            user_prompt: "q",
+            return_schema: "text",
+            model: "typesafe/jev-1.14",
+            temperature: 0.0,
+            max_tokens: None,
+            take_index: 0,
+            seed: "",
+            opts: &opts,
+            threshold: Some(0.5),
+            extract_mode: "",
+            inputs: &inputs,
+        };
+        let mut other = base.clone();
+        other.opts = &swapped;
+        assert_eq!(client_cache_key(&base), client_cache_key(&other));
+        other.threshold = Some(0.9);
+        assert_ne!(client_cache_key(&base), client_cache_key(&other));
+        other.threshold = Some(0.5);
+        other.extract_mode = "scalar";
+        assert_ne!(client_cache_key(&base), client_cache_key(&other));
+        other.extract_mode = "";
+        other.model = "other";
+        assert_ne!(client_cache_key(&base), client_cache_key(&other));
+        other.model = "typesafe/jev-1.14";
+        other.temperature = 0.4;
+        assert_ne!(client_cache_key(&base), client_cache_key(&other));
+        other.temperature = 0.0;
+        other.user_prompt = "other prompt";
+        assert_ne!(client_cache_key(&base), client_cache_key(&other));
+        other.user_prompt = "q";
+        other.take_index = 2;
+        assert_ne!(client_cache_key(&base), client_cache_key(&other));
     }
 }

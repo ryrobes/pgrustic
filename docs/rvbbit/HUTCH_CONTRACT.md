@@ -29,10 +29,11 @@ catalog `cache_mode` on that same operation POST and does not set `key`
 or `ttl`. `memoize` (the column default) is `mode=read-write`, `refresh`
 is `mode=refresh`, and `off` is `mode=off`. The pre-catalog fallback
 endpoint, used before any backend row exists, still sends `mode=off`.
-There is no pre-flight `POST /v1/cache/lookup`: that hop would change the
-10k-row benchmark. The mock ignores the header and counts every POST, so
-that benchmark's call count is unchanged. Hutch-lite honors the header
-inside the POST and does not call the provider again on a hit.
+A read-write batch also sends one `POST /v1/cache/lookup` for the keys
+the process memo does not already hold, and posts only the misses. The
+mock does not count that lookup in `GET /stats`, so a first-run miss
+benchmark stays one operation POST per batch. Hutch-lite honors the
+header inside the POST and does not call the provider again on a hit.
 
 A backend whose `auth_env` is set, and whose environment does not contain
 that variable (or contains an empty value), fails the statement before any
@@ -101,23 +102,27 @@ Mock values, deterministic, no network:
 
 An empty criterion does not match.
 
-## Cache key v1
+## Cache key v2
 
 The client key does **not** include the tenant. Hutch mixes the tenant in
 when it stores or looks up. A client-supplied tenant is not trusted.
 
-`client_cache_key` is blake3 over length-prefixed fields, in order:
+`client_cache_key` is blake3 over length-prefixed fields, in order.
+`rvbbit-cache-v1` keys miss.
 
-1. magic `rvbbit-cache-v1`
+1. magic `rvbbit-cache-v2`
 2. function name
 3. function version (decimal)
 4. template hash
 5. model
 6. canonical temperature (JSON number; non-finite becomes `null`)
 7. `max_tokens` decimal, or empty
-8. take index (decimal, MEANS sends `0`)
-9. seed (MEANS sends empty)
-10. canonical JSON of `inputs`
+8. canonical JSON of sorted opts (labels and label descriptions; `{}` when empty)
+9. take index (decimal, MEANS sends `0`)
+10. seed (MEANS sends empty)
+11. threshold as a canonical JSON number, or empty when the function sets none
+12. extract mode (`scalar`, `json`, or empty)
+13. canonical JSON of `inputs`
 
 Each field is `u32` big-endian length plus that many bytes. The hex form
 is 64 lowercase hex characters (`client_cache_key_hex`).
@@ -247,7 +252,7 @@ Resolution is operator → semantic function → model → backend.
 - one item per distinct `(input, criterion)` pair in the batch
 - `inputs` object keys `input` and `criterion`
 - take index 0, empty seed
-- no call to `/v1/cache/lookup`
+- one `POST /v1/cache/lookup` for keys missing from the process memo, then one predict POST of the misses. A batch that is entirely known is not posted
 
 A text semantic function posts the same header to `{backend.url}/v1/extract`,
 one HTTP call per row, with `inputs.input` set to the concatenated text

@@ -42,6 +42,9 @@ fn harness(api_key: Option<&str>) -> Harness {
         tenant: "local".into(),
         default_ttl: Duration::from_secs(60),
         expect_auth: None,
+        cache_store: "memory".into(),
+        cache_dir: "hutch-cache".into(),
+        audit_payloads: false,
     };
     thread::spawn(move || {
         let _ = rvbbit_hutch_lite::serve_listener(hutch_listener, cfg);
@@ -142,6 +145,9 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
         max_tokens: Some(32),
         take_index: 0,
         seed: "",
+        opts: &serde_json::json!({}),
+        threshold: None,
+        extract_mode: "",
         inputs: &inputs,
     });
     ItemRequest {
@@ -483,6 +489,95 @@ fn single_flight_shares_one_provider_call() {
     assert_eq!(h.provider_hits.load(Ordering::SeqCst), 1);
     let stats = ureq::get(&format!("{}/stats", h.hutch)).call().unwrap().into_string().unwrap();
     assert!(stats.contains("\"single_flight_waits\":1") || stats.contains("\"provider_calls\":1"), "{stats}");
+}
+
+#[test]
+fn eight_sessions_share_one_upstream_call() {
+    let h = harness(Some("test-key"));
+    let req = predict("SLOW", "biped");
+    let url = format!("{}/v1/predict", h.hutch);
+    let mut joins = Vec::new();
+    for _ in 0..8 {
+        let url = url.clone();
+        let req = req.clone();
+        joins.push(thread::spawn(move || post(&url, "read-write", &req)));
+    }
+    for join in joins {
+        let got = join.join().unwrap();
+        assert_eq!(got.outputs[0].value, Some(serde_json::json!(true)));
+    }
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn persistent_cache_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("hutch-persist-{}-{}", std::process::id(), line!()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let first = spawn_hutch("persistent", &dir);
+    let req = predict("TRUE_CASE", "biped");
+    let got = post(&format!("{}/v1/predict", first.url), "read-write", &req);
+    assert_eq!(got.outputs[0].value, Some(serde_json::json!(true)));
+    assert_eq!(first.provider_hits.load(Ordering::SeqCst), 1);
+    let key = req.items[0].cache_key.clone();
+    // A new listener is a new process memory. The directory is the cache.
+    let second = spawn_hutch("persistent", &dir);
+    let lookup = serde_json::json!({"keys": [key]});
+    let looked = ureq::post(&format!("{}/v1/cache/lookup", second.url))
+        .set("Content-Type", "application/json")
+        .send_string(&lookup.to_string())
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(looked.contains("\"hits\""), "{looked}");
+    assert!(!looked.contains("\"misses\":[\""), "{looked}");
+    let again = post(&format!("{}/v1/predict", second.url), "read-write", &req);
+    assert_eq!(again.outputs[0].value, Some(serde_json::json!(true)));
+    assert_eq!(second.provider_hits.load(Ordering::SeqCst), 0, "restarted hutch served the file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+struct Spawned {
+    url: String,
+    provider_hits: Arc<AtomicU64>,
+}
+
+fn spawn_hutch(store: &str, dir: &std::path::Path) -> Spawned {
+    let fake = TcpListener::bind("127.0.0.1:0").unwrap();
+    let fake_port = fake.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicU64::new(0));
+    let hits2 = Arc::clone(&hits);
+    thread::spawn(move || serve_fake(fake, hits2));
+    let hutch_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let hutch_port = hutch_listener.local_addr().unwrap().port();
+    let openai_base = format!("http://127.0.0.1:{fake_port}/v1");
+    let dir = dir.to_path_buf();
+    let store = store.to_string();
+    let cfg = Config {
+        decisions_url: rvbbit_hutch_lite::decisions_url_from_base(&openai_base),
+        openai_base,
+        api_key: Some("test-key".into()),
+        default_model: "openai/gpt-4o-mini".into(),
+        decision_model: "typesafe/jev-1.14".into(),
+        decision_takes: 1,
+        decision_combine: "mean".into(),
+        decision_threshold: 0.5,
+        timeout: Duration::from_secs(5),
+        concurrency: 8,
+        tenant: "local".into(),
+        default_ttl: Duration::from_secs(60),
+        expect_auth: None,
+        cache_store: store,
+        cache_dir: dir.display().to_string(),
+        audit_payloads: false,
+    };
+    thread::spawn(move || {
+        let _ = rvbbit_hutch_lite::serve_listener(hutch_listener, cfg);
+    });
+    thread::sleep(Duration::from_millis(30));
+    Spawned {
+        url: format!("http://127.0.0.1:{hutch_port}"),
+        provider_hits: hits,
+    }
 }
 
 #[test]
