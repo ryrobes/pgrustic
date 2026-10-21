@@ -25,6 +25,8 @@ pub const MEANS_SCORE_OID: u32 = 9025;
 /// `rvbbit_classify(text) -> text`. Fixed-label classify. The SQL result
 /// is JSON text `{label, score, scores}`.
 pub const CLASSIFY_OID: u32 = 9026;
+/// `rvbbit_call_log() -> text`. JSON array behind the `rvbbit.calls` view.
+pub const CALL_LOG_OID: u32 = 9027;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -32,6 +34,7 @@ pub const GETDEF_NAME: &str = "rvbbit_get_semfn_def";
 pub const EXTRACT_NAME: &str = "rvbbit_extract";
 pub const MEANS_SCORE_NAME: &str = "rvbbit_means_score";
 pub const CLASSIFY_NAME: &str = "rvbbit_classify";
+pub const CALL_LOG_NAME: &str = "rvbbit_call_log";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

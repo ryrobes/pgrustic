@@ -220,6 +220,14 @@ ORDER BY id;
 SELECT id, rvbbit.creature(notes) AS extracted
 FROM sightings
 ORDER BY id;
+SELECT op, model,
+       count(*) AS calls,
+       sum(cost) AS cost,
+       sum(cost_saved) AS cost_saved,
+       avg(latency_ms) AS latency_ms
+FROM rvbbit.calls
+GROUP BY op, model
+ORDER BY op, model;
 SQL
 
 run_sql "catalog and sightings (no model calls)" "$RUNDIR/setup.sql"
@@ -248,6 +256,12 @@ print(
     f"hits {a['hits']} -> {b['hits']}; "
     f"requests {a['requests']} -> {b['requests']}"
 )
+print(
+    f"total_cost_usd {a.get('total_cost_usd')} -> {b.get('total_cost_usd')}; "
+    f"cost_saved_usd {a.get('cost_saved_usd')} -> {b.get('cost_saved_usd')}"
+)
+print("pass 1 latency_by_op_model", json.dumps(a.get("latency_by_op_model"), sort_keys=True))
+print("pass 2 latency_by_op_model", json.dumps(b.get("latency_by_op_model"), sort_keys=True))
 if a["provider_calls"] > 40:
     sys.exit(f"pass 1 used {a['provider_calls']} provider calls; cap is 40")
 if b["provider_calls"] != a["provider_calls"]:
@@ -256,6 +270,12 @@ if b["hits"] <= a["hits"]:
     sys.exit("cache hits did not increase on the rerun")
 if b["requests"] <= a["requests"]:
     sys.exit("expected the rerun to reach hutch again")
+if not a.get("total_cost_usd"):
+    sys.exit("pass 1 recorded no provider cost")
+if abs(b["total_cost_usd"] - a["total_cost_usd"]) > 1e-9:
+    sys.exit("total_cost_usd changed on the rerun")
+if b.get("cost_saved_usd", 0) <= a.get("cost_saved_usd", 0):
+    sys.exit("cost_saved_usd did not increase on the rerun")
 PY
 
 if grep -q -F -- "$OPENROUTER_API_KEY" "$HUTCH_LOG"; then

@@ -908,6 +908,27 @@ fn ensure_schema() -> PgResult<()> {
     if have_labels.is_none() {
         exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS labels text")?;
     }
+    // rvbbit.calls is a view over the live hutch log. Clusters created
+    // before it already have dump_sql, so this is not part of FUNCTION_DDL.
+    if scalar(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = 'call_log'",
+    )?
+    .is_none()
+    {
+        exec(
+            "CREATE OR REPLACE FUNCTION rvbbit.call_log() RETURNS text \
+             LANGUAGE internal VOLATILE PARALLEL UNSAFE AS 'rvbbit_call_log'",
+        )?;
+    }
+    if scalar(
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'rvbbit' AND c.relname = 'calls' AND c.relkind = 'v'",
+    )?
+    .is_none()
+    {
+        exec(CALLS_VIEW)?;
+    }
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'dump_sql'",
@@ -1023,6 +1044,16 @@ const SCHEMA_DDL: &[&str] = &[
         SELECT oid, name, version, args, returns, comment
         FROM rvbbit.workflow",
 ];
+
+const CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.calls AS \
+    SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
+           latency_ms, provider_latency_ms, cache, items, tenant, \
+           generation_id, ts::timestamptz AS ts \
+    FROM json_to_recordset(rvbbit.call_log()::json) AS r( \
+        op text, model text, tokens_in bigint, tokens_out bigint, \
+        cost float8, cost_saved float8, latency_ms float8, \
+        provider_latency_ms float8, cache text, items int, \
+        tenant text, generation_id text, ts text)";
 
 const FUNCTION_DDL: &[&str] = &[
     "CREATE OR REPLACE FUNCTION rvbbit.dump_sql() RETURNS text
@@ -1499,6 +1530,18 @@ fn dollar(s: &str) -> String {
         tag.push('x');
     }
     format!("${tag}${s}${tag}$")
+}
+
+/// Hutch backend URLs, in name order. Empty when the catalog has no
+/// `TYPE hutch` backend. `rvbbit.call_log` GETs `{url}/v1/calls`.
+pub fn hutch_urls() -> PgResult<Vec<String>> {
+    ensure_schema()?;
+    let rows = query("SELECT url FROM rvbbit.backend WHERE kind = 'hutch' ORDER BY name")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|mut row| row.pop())
+        .flatten()
+        .collect())
 }
 
 fn pg(message: impl Into<String>) -> Box<PgError> {

@@ -280,9 +280,9 @@ hashing: `{return_type} labels=` plus the labels joined by U+001F.
 `crates/rvbbit/rvbbit_hutch_lite` is an in-tree server that speaks this
 contract over plain HTTP. It is not the private hutch. These JSON fields
 were added and are optional: `BatchRequest.decision`, `ItemRequest.labels`,
-`ItemResponse.score`, `ItemResponse.scores`. Older clients omit them.
-Lookup and put still store the value only; they do not store `score` or
-`scores`.
+`ItemResponse.score`, `ItemResponse.scores`, `ItemResponse.calls`.
+Older clients omit them. Lookup and put still store the value only;
+they do not store `score`, `scores`, or `calls`.
 
 Predict, decide, and fixed-label classify call OpenRouter's Decisions API
 (Jev by default). Extract, and classify with no label set, call an
@@ -296,7 +296,9 @@ What it implements:
 - a separate memo of Decisions HTTP bodies, keyed by tenant, take index, and the request JSON. It is used only for `mode=read-write`, so MEANS and `means_score` share one provider call when both are memoize and the prompt and inputs match. `off` and `refresh` call the provider again
 - single-flight for concurrent misses of the same storage key and of the same decision body
 - `POST /v1/cache/lookup`, `/put`, `/purge`, `/stats` in memory. Put is inline, not a background writer queue
-- `GET /stats` is lite instrumentation. It adds `provider_calls` and `requests` on top of the cache counters. `GET` or `POST /v1/cache/stats` stays the contract shape and does not include those two fields
+- `GET /stats` is lite instrumentation. It adds `provider_calls`, `requests`, `total_cost_usd`, `cost_saved_usd`, and `latency_by_op_model` on top of the cache counters. `GET` or `POST /v1/cache/stats` stays the contract shape and does not include those fields
+- `GET /v1/calls?limit=N` returns the recent call log (`limit` default 50, max 1024), oldest of that window first. `POST /reset` clears it. The log keeps the last 1024 calls
+- Each item may include `calls`, one object per provider call or cache hit that produced it. SQL does not insert those rows. `rvbbit.calls` is a view: `rvbbit.call_log()` GETs `{backend}/v1/calls?limit=1024` from every `TYPE hutch` backend and `json_to_recordset` expands it. The view is not part of `rvbbit.dump_sql`
 
 Decision calls:
 
@@ -308,6 +310,91 @@ Decision calls:
 - Vote: more yes-votes than no-votes, where a vote is `noul >= threshold`. A tie uses the mean. The reported score is still the mean
 - Cost, classify: one Decisions request per item per take per stacked model. Jev charges input tokens only (about $0.042 per million); output tokens are free. N labels do not multiply the request count, because `choice` returns every label's probability in that one call. A binary-only model would need N `noul` calls (one per label, one-vs-rest) and then argmax. That fallback is not implemented. Jev's `choice` question is multi-class
 - Cost, MEANS: the same shape, one `noul` request per item per take per stacked model, not one request per row of a SQL batch on the wire from pgrustic. Hutch-lite fans the batch out
+
+Cost fields, read from the provider response. Inline cost is preferred.
+A missing `usage.cost` with a `gen-...` id falls back to
+`GET {OPENROUTER_BASE_URL}/generation?id=`. That GET is not a
+`provider_calls` increment. Its time is included in `latency_ms` and
+not in `provider_latency_ms`.
+
+Chat completions (always present; `usage.include` is deprecated):
+
+- `id` — generation id
+- `usage.cost` — amount charged to the account
+- `usage.prompt_tokens` — `tokens_in`
+- `usage.completion_tokens` — `tokens_out`
+
+Decisions:
+
+- `id` — generation id (`gen-dec-...` in the published examples)
+- `model` — dated snapshot that served the request, stored when present
+- `usage.cost` — USD
+- `usage.input_tokens` — `tokens_in`
+- `usage.output_tokens` — `tokens_out`
+
+Generation fallback (`data` object):
+
+- `total_cost`, or numeric `usage` when `total_cost` is absent
+- `tokens_prompt` / `tokens_completion`
+- `id`, `model` only when the inference body omitted them
+
+`CallMeter` and `GET /v1/calls` use the names in the left column. The
+`rvbbit.calls` view renames `cost_usd` to `cost`, `cost_saved_usd` to
+`cost_saved`, and `timestamp` to `ts`:
+
+| field | meaning |
+| --- | --- |
+| `op` | `predict`, `decide`, `classify`, or `extract` |
+| `model` | response `model` when sent, otherwise the slug we sent |
+| `tokens_in`, `tokens_out` | billed tokens on a miss; 0 on a hit |
+| `cost_usd` (SQL column `cost`) | USD charged; 0 on a hit; null when the provider omitted it |
+| `cost_saved_usd` (SQL column `cost_saved`) | USD avoided; 0 on a miss; null when the original charge is unknown |
+| `provider_latency_ms` | inference POST only; 0 on a hit |
+| `latency_ms` | hutch time for this call, including a generation GET |
+| `cache` | `hit`, `miss`, or `single-flight` |
+| `items` | 1. Hutch-lite fans a batch out to one provider call per item |
+| `tenant` | blake3 hex of the bearer, or `HUTCH_TENANT` |
+| `timestamp` (SQL column `ts`) | UTC RFC3339 |
+| `generation_id` | provider `id`, including on a hit so the avoided call can be found |
+
+A contract-cache hit is one row: `cost_usd` 0, `cost_saved_usd` equal to
+the USD the misses charged while producing the stored value. A decision-memo
+hit (MEANS and `means_score` sharing a body) is its own row with the same
+shape. A value that was produced entirely from the memo has no produced
+cost, so a later contract-cache hit of that value does not count the
+savings a second time. Single-flight waiters record `cache=single-flight`,
+cost 0, and the leader's produced cost as saved. Failed provider calls are
+in the hutch log and `/stats`. They are not copied onto an item error.
+`POST /reset` clears the in-memory log, which is what the view reads.
+The executor does not insert into a table: that would cycle through SPI.
+The view reads hutch, so a batched MEANS and a per-row function show up
+the same way.
+
+```sql
+SELECT op, model, sum(cost), avg(latency_ms)
+FROM rvbbit.calls
+GROUP BY 1, 2;
+```
+
+One stderr line per call, `hutch_call` plus the fields above. The API key
+is redacted if it appears. The line does not include the request body.
+
+Sources:
+
+- <https://openrouter.ai/docs/cookbook/administration/usage-accounting>
+- <https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion> (`usage.cost` example `0.0012`)
+- <https://openrouter.ai/docs/api/api-reference/generations/get-request-&-usage-metadata-for-a-generation> (`data.total_cost`, `data.tokens_prompt`, `data.tokens_completion`; `data.usage` is a number in that example)
+- <https://openrouter.ai/docs/guides/community/jev-tutorial> (Decisions `usage.cost` in USD)
+- <https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request>
+- <https://github.com/OpenRouterTeam/skills/blob/main/skills/openrouter-decisions/references/decisions-api.md>
+
+Uncertain:
+
+- The usage-accounting cookbook says cost is in credits and shows `0.95` for a short completion. The chat API reference and the generation example use fractional amounts (`0.0012`, `0.0015`), and the Decisions docs say `usage.cost` is USD. This server stores the number as USD and does not rescale.
+- On the generation endpoint, `usage` is a number equal to `total_cost` in the published example, not the chat `usage` object. Numeric `usage` is read only when `total_cost` is absent.
+- `cost_details.upstream_inference_cost` is the provider's charge to OpenRouter (and is 0 or null for non-BYOK on the generation endpoint). The account charge is `usage.cost` / `total_cost`.
+- Published Decisions responses always include `usage`. The generation GET is only for a body that omits `usage.cost`. The docs do not say `GET /generation` accepts a `gen-dec-...` id, though the id matches `^gen-[0-9A-Za-z-]+$`.
+- OpenRouter's own `latency` field is not copied. `provider_latency_ms` is the wall clock of the inference POST.
 
 What it stubs:
 
@@ -358,6 +445,6 @@ items marked mock.
 11. 429 responses should include `Retry-After` as an integer number of seconds. pgrustic waits that long (capped at 2s) and retries within the backend attempt budget.
 12. Keep accepting the previous predict body until callers have moved, or gate it on the contract header. pgrustic no longer sends the spike's JSON array.
 
-The list above is otherwise unchanged. `score`, `scores`, `labels`, and `decision` are additive optional fields. A server that ignores them still answers MEANS with a boolean `value`.
+The list above is otherwise unchanged. `score`, `scores`, `labels`, `label_descriptions`, `decision`, and `calls` are additive optional fields. A server that ignores them still answers MEANS with a boolean `value`. Item 9's cache meter is the `calls` array: a hit has cost 0 and `cache` `hit`.
 
 Dependency: add `rvbbit_contract` (this repo's `crates/rvbbit/rvbbit_contract`) as a path or git dependency. The crate's public types are the ones named above, plus `DecisionStack`: `BatchRequest`, `ItemRequest`, `BatchResponse`, `ItemResponse`, `ItemError`, `CacheLookupRequest`, `CacheLookupResponse`, `CacheHit`, `CachePutRequest`, `CachePutEntry`, `CachePutResponse`, `CachePurgeRequest`, `CachePurgeResponse`, `CacheStatsResponse`, `CacheKeyParts`, `client_cache_key`, `client_cache_key_hex`, `storage_key`, `canonical_json`, `cache_header`.

@@ -173,8 +173,54 @@ pub struct ItemResponse {
     /// and errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scores: Option<serde_json::Value>,
+    /// Provider calls and cache hits that produced this item, in order.
+    /// A hit has `cost_usd` 0 and `cost_saved_usd` set to the provider
+    /// USD that was avoided. Absent when the server did not meter the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<Vec<CallMeter>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ItemError>,
+}
+
+/// One provider call, or a cache hit that avoided one.
+///
+/// `cost_usd` and `cost_saved_usd` are US dollars as reported by the
+/// provider (`usage.cost` or the generation endpoint's `total_cost`).
+/// A cache hit stores `cost_usd = 0` and the avoided charge in
+/// `cost_saved_usd`. Tokens on a hit are 0: the original miss already
+/// recorded the billed tokens.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallMeter {
+    /// `predict`, `classify`, `extract`, or `decide`.
+    pub op: String,
+    /// Response model when the provider sent one, otherwise the slug we sent.
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// USD charged for this call. 0 on a cache hit. Absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// USD avoided. 0 on a miss. Absent when the original charge is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_saved_usd: Option<f64>,
+    /// Milliseconds spent in the inference HTTP call. 0 on a cache hit.
+    /// A generation-metadata GET is not included.
+    pub provider_latency_ms: u64,
+    /// Milliseconds spent in hutch for this call, including a generation
+    /// lookup when one was required.
+    pub latency_ms: u64,
+    /// `hit`, `miss`, or `single-flight`.
+    pub cache: String,
+    /// Items covered by this provider call. Hutch-lite fans a batch out,
+    /// so this is 1.
+    pub items: u32,
+    pub tenant: String,
+    /// UTC RFC3339 with milliseconds.
+    pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

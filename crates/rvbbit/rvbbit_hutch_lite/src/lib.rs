@@ -10,8 +10,14 @@
 //!
 //! `OPENROUTER_API_KEY` is read from the environment and is never logged
 //! or copied into an error string.
+//!
+//! Each provider call records tokens, USD cost, and latency. Chat cost is
+//! `usage.cost`. Decisions cost is `usage.cost` with `input_tokens` and
+//! `output_tokens`. A missing cost falls back to `GET {base}/generation`.
 
-use std::collections::HashMap;
+mod cost;
+
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
@@ -21,9 +27,16 @@ use std::time::{Duration, Instant};
 use rvbbit_contract::{
     BatchRequest, BatchResponse, CacheHit, CacheLookupRequest, CacheLookupResponse, CacheMode,
     CachePurgeRequest, CachePurgeResponse, CachePutRequest, CachePutResponse, CacheStatsResponse,
-    DecisionStack, ItemError, ItemRequest, ItemResponse, Operation, CONTRACT_VERSION,
+    CallMeter, DecisionStack, ItemError, ItemRequest, ItemResponse, Operation, CONTRACT_VERSION,
     PATH_CACHE_LOOKUP, PATH_CACHE_PURGE, PATH_CACHE_PUT, PATH_CACHE_STATS,
 };
+
+use cost::{
+    generation_id_ok, merge_generation, meter_log_line, op_name, percentile, rfc3339_now,
+    summarize_produced, usage_from_body, ProviderUsage,
+};
+
+const CALL_LOG_CAP: usize = 1024;
 
 const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
 const DEFAULT_DECISION_MODEL: &str = "typesafe/jev-1.14";
@@ -122,6 +135,45 @@ struct Scored {
     value: serde_json::Value,
     score: Option<f64>,
     scores: Option<serde_json::Value>,
+    /// USD charged by misses while producing this value. None when there
+    /// was no miss, or when a miss omitted cost. Memo hits do not add.
+    produced_cost_usd: Option<f64>,
+    model: String,
+    generation_id: Option<String>,
+    /// Meters for this invocation. Cleared before the value is stored.
+    calls: Vec<CallMeter>,
+}
+
+impl Scored {
+    fn bare(value: serde_json::Value, score: Option<f64>, scores: Option<serde_json::Value>) -> Self {
+        Self {
+            value,
+            score,
+            scores,
+            produced_cost_usd: None,
+            model: String::new(),
+            generation_id: None,
+            calls: Vec::new(),
+        }
+    }
+
+    fn from_calls(
+        value: serde_json::Value,
+        score: Option<f64>,
+        scores: Option<serde_json::Value>,
+        calls: Vec<CallMeter>,
+    ) -> Self {
+        let (produced_cost_usd, model, generation_id) = summarize_produced(&calls);
+        Self {
+            value,
+            score,
+            scores,
+            produced_cost_usd,
+            model,
+            generation_id,
+            calls,
+        }
+    }
 }
 
 struct CacheEntry {
@@ -151,6 +203,12 @@ struct Cache {
     provider_calls: u64,
     /// Operation POSTs, including ones served entirely from cache.
     requests: u64,
+    /// Recent provider calls and cache hits. `/reset` clears this.
+    calls: VecDeque<CallMeter>,
+    total_cost_usd: f64,
+    cost_saved_usd: f64,
+    /// Provider latency of misses, last [`CALL_LOG_CAP`] per op+model.
+    latency_samples: HashMap<(String, String), VecDeque<u64>>,
 }
 
 impl Cache {
@@ -165,6 +223,10 @@ impl Cache {
             single_flight_waits: 0,
             provider_calls: 0,
             requests: 0,
+            calls: VecDeque::new(),
+            total_cost_usd: 0.0,
+            cost_saved_usd: 0.0,
+            latency_samples: HashMap::new(),
         }
     }
 }
@@ -246,7 +308,8 @@ fn handle(mut stream: TcpStream, server: &Server) {
         }
     }
     body.truncate(content_length);
-    let (status, payload) = route(server, &method, path_only(&path), &auth, &cache_header, &body);
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let (status, payload) = route(server, &method, path_only(&path), query, &auth, &cache_header, &body);
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
@@ -259,12 +322,16 @@ fn route(
     server: &Server,
     method: &str,
     path: &str,
+    query: &str,
     auth: &str,
     cache_header: &str,
     body: &[u8],
 ) -> (u16, String) {
     if method.eq_ignore_ascii_case("GET") && (path == "/stats" || path == PATH_CACHE_STATS) {
         return (200, stats_json(server, path == "/stats"));
+    }
+    if method.eq_ignore_ascii_case("GET") && path == "/v1/calls" {
+        return (200, calls_json(server, calls_limit(query)));
     }
     if method.eq_ignore_ascii_case("POST") && path == "/reset" {
         let mut cache = lock(&server.cache);
@@ -335,6 +402,7 @@ fn run_batch(
             value: None,
             score: None,
             scores: None,
+            calls: None,
             error: None,
         };
         req.items.len()
@@ -356,6 +424,7 @@ fn run_batch(
                         value: Some(scored.value),
                         score: scored.score,
                         scores: scored.scores,
+                        calls: if scored.calls.is_empty() { None } else { Some(scored.calls) },
                         error: None,
                     },
                     Err(err) => ItemResponse {
@@ -363,6 +432,7 @@ fn run_batch(
                         value: None,
                         score: None,
                         scores: None,
+                        calls: None,
                         error: Some(err),
                     },
                 };
@@ -406,6 +476,7 @@ fn run_item(
         .then(|| decision_plan(&server.cfg, req));
     let storage = storage_for(&item.cache_key, tenant, plan.as_ref(), &labels, &descriptions);
     let ttl = mode.ttl.unwrap_or(server.cfg.default_ttl);
+    let started = Instant::now();
     let compute = || provider_call(server, tenant, operation, req, item, mode.mode);
     match mode.mode {
         CacheMode::Off => compute(),
@@ -414,7 +485,7 @@ fn run_item(
             store(server, &storage, &value, ttl);
             Ok(value)
         }
-        CacheMode::ReadWrite => get_or_compute(server, &storage, ttl, compute),
+        CacheMode::ReadWrite => get_or_compute(server, &storage, ttl, operation, tenant, started, compute),
     }
 }
 
@@ -422,18 +493,23 @@ fn get_or_compute(
     server: &Server,
     storage: &str,
     ttl: Duration,
+    operation: Operation,
+    tenant: &str,
+    started: Instant,
     compute: impl FnOnce() -> Result<Scored, ItemError>,
 ) -> Result<Scored, ItemError> {
     {
         let mut cache = lock(&server.cache);
         if let Some(hit) = fresh(&cache, storage) {
             cache.hits += 1;
-            return Ok(hit);
+            drop(cache);
+            return Ok(meter_cached(server, operation, tenant, &hit, "hit", started));
         }
         if let Some(flight) = cache.inflight.get(storage).cloned() {
             cache.single_flight_waits += 1;
             drop(cache);
-            return wait_flight(&flight);
+            let shared = wait_flight(&flight)?;
+            return Ok(meter_cached(server, operation, tenant, &shared, "single-flight", started));
         }
         let flight = Arc::new(Flight {
             lock: Mutex::new(None),
@@ -483,7 +559,7 @@ fn provider_call(
     // both are memoize and the Decisions JSON matches.
     let memo = mode == CacheMode::ReadWrite;
     if matches!(operation, Operation::Predict | Operation::Decide) {
-        return decision_scored(server, tenant, req, item, memo);
+        return decision_scored(server, tenant, operation, req, item, memo);
     }
     if operation == Operation::Classify {
         let n = item.labels.as_ref().map(|l| l.len()).unwrap_or(0);
@@ -494,12 +570,8 @@ fn provider_call(
             ));
         }
         if n >= 2 {
-            return choice_scored(server, tenant, req, item, memo);
+            return choice_scored(server, tenant, operation, req, item, memo);
         }
-    }
-    {
-        let mut cache = lock(&server.cache);
-        cache.provider_calls += 1;
     }
     let model = choose_model(&server.cfg, &req.model);
     let (system, user) = prompts(operation, item);
@@ -507,22 +579,14 @@ fn provider_call(
         Operation::Extract => Some(256),
         _ => Some(32),
     });
-    let text = chat(
-        &server.cfg,
-        &server.agent,
-        &model,
-        req.temperature,
-        max_tokens,
-        &system,
-        &user,
-    )
-    .map_err(|message| item_err("provider", &message))?;
+    let (text, meter) = chat(server, operation, tenant, &model, req.temperature, max_tokens, &system, &user)
+        .map_err(|message| item_err("provider", &message))?;
     let value = match operation {
         Operation::Extract => parse_json_value(&text).map_err(|message| item_err("parse", &message))?,
         Operation::Classify => serde_json::Value::String(text.trim().to_string()),
         _ => return Err(item_err("unsupported", "operation is not implemented in hutch-lite")),
     };
-    Ok(Scored { value, score: None, scores: None })
+    Ok(Scored::from_calls(value, None, None, vec![meter]))
 }
 
 fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String, String) {
@@ -628,24 +692,37 @@ fn choose_decision_model(cfg: &Config, requested: &str) -> String {
 fn decision_scored(
     server: &Server,
     tenant: &str,
+    operation: Operation,
     req: &BatchRequest,
     item: &ItemRequest,
     memo: bool,
 ) -> Result<Scored, ItemError> {
     let plan = decision_plan(&server.cfg, req);
     let mut scores = Vec::with_capacity(plan.models.len() * plan.takes as usize);
+    let mut calls = Vec::new();
     for model in &plan.models {
         for take in 0..plan.takes {
-            let text = decision_http(server, tenant, DecisionKind::Noul, model, take, item, memo)?;
+            let (text, meter) = decision_http(
+                server,
+                tenant,
+                operation,
+                DecisionKind::Noul,
+                model,
+                take,
+                item,
+                memo,
+            )?;
+            calls.push(meter);
             scores.push(parse_noul(&text).map_err(map_decision_err)?);
         }
     }
     let (matched, mean) = combine_noul(plan.combine, plan.threshold, &scores);
-    Ok(Scored {
-        value: serde_json::Value::Bool(matched),
-        score: Some(mean),
-        scores: None,
-    })
+    Ok(Scored::from_calls(
+        serde_json::Value::Bool(matched),
+        Some(mean),
+        None,
+        calls,
+    ))
 }
 
 /// One `choice` question per call. Stacked calls average `probabilities`
@@ -659,6 +736,7 @@ fn decision_scored(
 fn choice_scored(
     server: &Server,
     tenant: &str,
+    operation: Operation,
     req: &BatchRequest,
     item: &ItemRequest,
     memo: bool,
@@ -673,9 +751,20 @@ fn choice_scored(
     let plan = decision_plan(&server.cfg, req);
     let mut sums: HashMap<String, f64> = HashMap::new();
     let mut calls = 0f64;
+    let mut meters = Vec::new();
     for model in &plan.models {
         for take in 0..plan.takes {
-            let text = decision_http(server, tenant, DecisionKind::Choice, model, take, item, memo)?;
+            let (text, meter) = decision_http(
+                server,
+                tenant,
+                operation,
+                DecisionKind::Choice,
+                model,
+                take,
+                item,
+                memo,
+            )?;
+            meters.push(meter);
             let hit = parse_choice(&text).map_err(map_decision_err)?;
             for label in &labels {
                 let p = hit.probabilities.get(label).copied().unwrap_or(0.0);
@@ -695,11 +784,12 @@ fn choice_scored(
             best_label = label.clone();
         }
     }
-    Ok(Scored {
-        value: serde_json::Value::String(best_label),
-        score: Some(best),
-        scores: Some(serde_json::Value::Object(scores)),
-    })
+    Ok(Scored::from_calls(
+        serde_json::Value::String(best_label),
+        Some(best),
+        Some(serde_json::Value::Object(scores)),
+        meters,
+    ))
 }
 
 fn combine_noul(combine: Combine, threshold: f64, scores: &[f64]) -> (bool, f64) {
@@ -730,33 +820,43 @@ enum DecisionKind {
 fn decision_http(
     server: &Server,
     tenant: &str,
+    operation: Operation,
     kind: DecisionKind,
     model: &str,
     take: u32,
     item: &ItemRequest,
     memo: bool,
-) -> Result<String, ItemError> {
+) -> Result<(String, CallMeter), ItemError> {
     let body = match kind {
         DecisionKind::Noul => noul_body(model, item)?,
         DecisionKind::Choice => choice_body(model, item)?,
     };
     if !memo {
-        return fetch_decision(server, kind, &body);
+        return fetch_decision(server, operation, tenant, model, kind, &body);
     }
     // Take index is part of the memo key so stacked repeats each call the
     // provider. It is not sent: the Decisions API has no take field, and
     // Jev is not documented as sampling. Temperature and max_tokens are
     // also not sent and are not part of this key.
     let key = format!("{tenant}\n{take}\n{body}");
+    let started = Instant::now();
     let flight = {
         let mut cache = lock(&server.cache);
         if let Some(text) = cache.decision_memo.get(&key).cloned() {
-            return Ok(text);
+            drop(cache);
+            let usage = usage_from_body(&text);
+            let meter = saved_meter(operation, tenant, model, &usage, "hit", started);
+            record_call(server, &meter);
+            return Ok((text, meter));
         }
         if let Some(existing) = cache.decision_inflight.get(&key).cloned() {
             cache.single_flight_waits += 1;
             drop(cache);
-            return wait_decision(&existing);
+            let text = wait_decision(&existing)?;
+            let usage = usage_from_body(&text);
+            let meter = saved_meter(operation, tenant, model, &usage, "single-flight", started);
+            record_call(server, &meter);
+            return Ok((text, meter));
         }
         let flight = Arc::new(DecisionFlight {
             lock: Mutex::new(None),
@@ -765,10 +865,10 @@ fn decision_http(
         cache.decision_inflight.insert(key.clone(), Arc::clone(&flight));
         flight
     };
-    let result = fetch_decision(server, kind, &body).map(|text| {
+    let result = fetch_decision(server, operation, tenant, model, kind, &body).map(|(text, meter)| {
         let mut cache = lock(&server.cache);
         cache.decision_memo.insert(key.clone(), text.clone());
-        text
+        (text, meter)
     });
     {
         let mut cache = lock(&server.cache);
@@ -777,7 +877,7 @@ fn decision_http(
     {
         let mut slot = flight.lock.lock().unwrap_or_else(|e| e.into_inner());
         *slot = Some(match &result {
-            Ok(text) => Ok(text.clone()),
+            Ok((text, _)) => Ok(text.clone()),
             Err(e) => Err(e.clone()),
         });
         flight.cv.notify_all();
@@ -785,19 +885,45 @@ fn decision_http(
     result
 }
 
-fn fetch_decision(server: &Server, kind: DecisionKind, body: &str) -> Result<String, ItemError> {
+fn fetch_decision(
+    server: &Server,
+    operation: Operation,
+    tenant: &str,
+    model: &str,
+    kind: DecisionKind,
+    body: &str,
+) -> Result<(String, CallMeter), ItemError> {
     {
         let mut cache = lock(&server.cache);
         cache.provider_calls += 1;
     }
-    let text = post_json(&server.cfg, &server.agent, &server.cfg.decisions_url, body)
-        .map_err(|message| item_err("provider", &message))?;
+    let started = Instant::now();
+    let text = match post_json(&server.cfg, &server.agent, &server.cfg.decisions_url, body) {
+        Ok(text) => text,
+        Err(message) => {
+            let ms = elapsed_ms(started);
+            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms);
+            record_call(server, &meter);
+            return Err(item_err("provider", &message));
+        }
+    };
+    let provider_ms = elapsed_ms(started);
+    let mut usage = usage_from_body(&text);
+    if usage.model.is_none() {
+        usage.model = Some(model.to_string());
+    }
+    if usage.cost_usd.is_none() {
+        fill_generation(server, &mut usage);
+    }
+    let latency_ms = elapsed_ms(started);
+    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms);
+    record_call(server, &meter);
     let parsed = match kind {
         DecisionKind::Noul => parse_noul(&text).map(|_| ()),
         DecisionKind::Choice => parse_choice(&text).map(|_| ()),
     };
     parsed.map_err(map_decision_err)?;
-    Ok(text)
+    Ok((text, meter))
 }
 
 fn wait_decision(flight: &DecisionFlight) -> Result<String, ItemError> {
@@ -999,14 +1125,16 @@ pub struct ChoiceAnswer {
 }
 
 fn chat(
-    cfg: &Config,
-    agent: &ureq::Agent,
+    server: &Server,
+    operation: Operation,
+    tenant: &str,
     model: &str,
     temperature: f64,
     max_tokens: Option<u32>,
     system: &str,
     user: &str,
-) -> Result<String, String> {
+) -> Result<(String, CallMeter), String> {
+    let cfg = &server.cfg;
     let key = cfg.api_key.as_deref().unwrap_or("");
     let url = format!(
         "{}/chat/completions",
@@ -1027,8 +1155,173 @@ fn chat(
         Ok(s) => s,
         Err(e) => return Err(redact(&e.to_string(), key)),
     };
-    let text = post_json(cfg, agent, &url, &payload)?;
-    completion_text(&text).map_err(|e| redact(&e, key))
+    {
+        let mut cache = lock(&server.cache);
+        cache.provider_calls += 1;
+    }
+    let started = Instant::now();
+    let text = match post_json(cfg, &server.agent, &url, &payload) {
+        Ok(text) => text,
+        Err(message) => {
+            let ms = elapsed_ms(started);
+            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms);
+            record_call(server, &meter);
+            return Err(message);
+        }
+    };
+    let provider_ms = elapsed_ms(started);
+    let mut usage = usage_from_body(&text);
+    if usage.model.is_none() {
+        usage.model = Some(model.to_string());
+    }
+    if usage.cost_usd.is_none() {
+        fill_generation(server, &mut usage);
+    }
+    let latency_ms = elapsed_ms(started);
+    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms);
+    record_call(server, &meter);
+    let content = completion_text(&text).map_err(|e| redact(&e, key))?;
+    Ok((content, meter))
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn miss_meter(
+    operation: Operation,
+    tenant: &str,
+    requested_model: &str,
+    usage: &ProviderUsage,
+    provider_ms: u64,
+    latency_ms: u64,
+) -> CallMeter {
+    CallMeter {
+        op: op_name(operation).into(),
+        model: usage
+            .model
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| requested_model.to_string()),
+        tokens_in: usage.tokens_in,
+        tokens_out: usage.tokens_out,
+        cost_usd: usage.cost_usd,
+        cost_saved_usd: Some(0.0),
+        provider_latency_ms: provider_ms,
+        latency_ms,
+        cache: "miss".into(),
+        items: 1,
+        tenant: tenant.to_string(),
+        timestamp: rfc3339_now(),
+        generation_id: usage.generation_id.clone(),
+    }
+}
+
+/// A decision-memo hit or single-flight waiter. Cost is 0. The saved
+/// amount is the original `usage.cost`. Tokens are 0 because the miss
+/// already recorded the billed tokens.
+fn saved_meter(
+    operation: Operation,
+    tenant: &str,
+    requested_model: &str,
+    usage: &ProviderUsage,
+    cache: &str,
+    started: Instant,
+) -> CallMeter {
+    CallMeter {
+        op: op_name(operation).into(),
+        model: usage
+            .model
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| requested_model.to_string()),
+        tokens_in: Some(0),
+        tokens_out: Some(0),
+        cost_usd: Some(0.0),
+        cost_saved_usd: usage.cost_usd,
+        provider_latency_ms: 0,
+        latency_ms: elapsed_ms(started),
+        cache: cache.into(),
+        items: 1,
+        tenant: tenant.to_string(),
+        timestamp: rfc3339_now(),
+        generation_id: usage.generation_id.clone(),
+    }
+}
+
+/// Contract-cache hit or single-flight. `cost_saved_usd` is the USD the
+/// misses charged while producing the stored value. A value that was
+/// itself served from the decision memo has no produced cost, so the
+/// savings stay on the memo hit and are not counted again.
+fn meter_cached(
+    server: &Server,
+    operation: Operation,
+    tenant: &str,
+    stored: &Scored,
+    cache: &str,
+    started: Instant,
+) -> Scored {
+    let meter = CallMeter {
+        op: op_name(operation).into(),
+        model: stored.model.clone(),
+        tokens_in: Some(0),
+        tokens_out: Some(0),
+        cost_usd: Some(0.0),
+        cost_saved_usd: stored.produced_cost_usd,
+        provider_latency_ms: 0,
+        latency_ms: elapsed_ms(started),
+        cache: cache.into(),
+        items: 1,
+        tenant: tenant.to_string(),
+        timestamp: rfc3339_now(),
+        generation_id: stored.generation_id.clone(),
+    };
+    record_call(server, &meter);
+    let mut scored = stored.clone();
+    scored.calls = vec![meter];
+    scored
+}
+
+fn record_call(server: &Server, meter: &CallMeter) {
+    let key = server.cfg.api_key.as_deref().unwrap_or("");
+    eprintln!("{}", meter_log_line(meter, key));
+    let mut cache = lock(&server.cache);
+    if let Some(cost) = meter.cost_usd.filter(|n| n.is_finite()) {
+        cache.total_cost_usd += cost;
+    }
+    if let Some(saved) = meter.cost_saved_usd.filter(|n| n.is_finite()) {
+        cache.cost_saved_usd += saved;
+    }
+    if meter.cache == "miss" {
+        let samples = cache
+            .latency_samples
+            .entry((meter.op.clone(), meter.model.clone()))
+            .or_default();
+        if samples.len() == CALL_LOG_CAP {
+            samples.pop_front();
+        }
+        samples.push_back(meter.provider_latency_ms);
+    }
+    if cache.calls.len() == CALL_LOG_CAP {
+        cache.calls.pop_front();
+    }
+    cache.calls.push_back(meter.clone());
+}
+
+fn fill_generation(server: &Server, usage: &mut ProviderUsage) {
+    let Some(id) = usage.generation_id.clone() else {
+        return;
+    };
+    if !generation_id_ok(&id) {
+        return;
+    }
+    let url = format!(
+        "{}/generation?id={id}",
+        server.cfg.openai_base.trim_end_matches('/')
+    );
+    if let Ok(body) = get_json(&server.cfg, &server.agent, &url) {
+        merge_generation(usage, &body);
+    }
 }
 
 fn post_json(cfg: &Config, agent: &ureq::Agent, url: &str, payload: &str) -> Result<String, String> {
@@ -1039,6 +1332,23 @@ fn post_json(cfg: &Config, agent: &ureq::Agent, url: &str, payload: &str) -> Res
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {key}"))
         .send_string(payload);
+    match send {
+        Ok(resp) => resp.into_string().map_err(|e| redact(&e.to_string(), key)),
+        Err(ureq::Error::Status(code, resp)) => {
+            let detail = resp.into_string().unwrap_or_default();
+            Err(redact(&format!("upstream HTTP {code}: {detail}"), key))
+        }
+        Err(e) => Err(redact(&format!("upstream transport: {e}"), key)),
+    }
+}
+
+fn get_json(cfg: &Config, agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    let key = cfg.api_key.as_deref().unwrap_or("");
+    let send = agent
+        .get(url)
+        .timeout(cfg.timeout)
+        .set("Authorization", &format!("Bearer {key}"))
+        .call();
     match send {
         Ok(resp) => resp.into_string().map_err(|e| redact(&e.to_string(), key)),
         Err(ureq::Error::Status(code, resp)) => {
@@ -1201,11 +1511,7 @@ fn put(server: &Server, tenant: &str, req: &CachePutRequest) -> String {
         store(
             server,
             &storage,
-            &Scored {
-                value: entry.output.clone(),
-                score: None,
-                scores: None,
-            },
+            &Scored::bare(entry.output.clone(), None, None),
             ttl,
         );
         stored += 1;
@@ -1234,11 +1540,10 @@ fn purge(server: &Server, tenant: &str, req: &CachePurgeRequest) -> String {
 
 fn store(server: &Server, storage: &str, scored: &Scored, ttl: Duration) {
     let expires = if ttl.is_zero() { None } else { Some(Instant::now() + ttl) };
+    let mut kept = scored.clone();
+    kept.calls.clear();
     let mut cache = lock(&server.cache);
-    cache.entries.insert(
-        storage.to_string(),
-        CacheEntry { scored: scored.clone(), expires },
-    );
+    cache.entries.insert(storage.to_string(), CacheEntry { scored: kept, expires });
 }
 
 fn fresh(cache: &Cache, storage: &str) -> Option<Scored> {
@@ -1295,6 +1600,20 @@ fn stats_json(server: &Server, lite: bool) -> String {
         .filter(|e| e.expires.map(|t| now < t).unwrap_or(true))
         .count() as u64;
     if lite {
+        let mut latency = Vec::new();
+        for ((op, model), samples) in &cache.latency_samples {
+            let values: Vec<u64> = samples.iter().copied().collect();
+            latency.push(serde_json::json!({
+                "op": op,
+                "model": model,
+                "p50_ms": percentile(&values, 0.50),
+                "p95_ms": percentile(&values, 0.95),
+                "calls": values.len(),
+            }));
+        }
+        latency.sort_by(|a, b| {
+            (a["op"].as_str(), a["model"].as_str()).cmp(&(b["op"].as_str(), b["model"].as_str()))
+        });
         return serde_json::json!({
             "entries": entries,
             "hits": cache.hits,
@@ -1302,6 +1621,9 @@ fn stats_json(server: &Server, lite: bool) -> String {
             "single_flight_waits": cache.single_flight_waits,
             "provider_calls": cache.provider_calls,
             "requests": cache.requests,
+            "total_cost_usd": cache.total_cost_usd,
+            "cost_saved_usd": cache.cost_saved_usd,
+            "latency_by_op_model": latency,
         })
         .to_string();
     }
@@ -1312,6 +1634,26 @@ fn stats_json(server: &Server, lite: bool) -> String {
         single_flight_waits: cache.single_flight_waits,
     })
     .unwrap_or_else(|_| "{}".into())
+}
+
+fn calls_limit(query: &str) -> usize {
+    let mut limit = 50usize;
+    for part in query.split('&') {
+        let Some(value) = part.strip_prefix("limit=") else {
+            continue;
+        };
+        if let Ok(n) = value.parse::<usize>() {
+            limit = n.clamp(1, CALL_LOG_CAP);
+        }
+    }
+    limit
+}
+
+fn calls_json(server: &Server, limit: usize) -> String {
+    let cache = lock(&server.cache);
+    let start = cache.calls.len().saturating_sub(limit);
+    let calls: Vec<&CallMeter> = cache.calls.iter().skip(start).collect();
+    serde_json::json!({ "calls": calls }).to_string()
 }
 
 fn tenant_of(cfg: &Config, auth: &str) -> String {

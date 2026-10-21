@@ -17125,6 +17125,7 @@ dependencies = [
  "rvbbit_dispatch",
  "rvbbit_oids",
  "rvbbit_resolve",
+ "serde_json",
  "types_error",
  "types_fmgr",
  "varlena",

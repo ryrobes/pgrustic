@@ -270,6 +270,7 @@ fn route(
                     value: Some(value),
                     score: None,
                     scores: None,
+                    calls: None,
                     error: None,
                 }
             })
@@ -329,6 +330,7 @@ pub fn item_error(key: &str, message: &str) -> ItemResponse {
         value: None,
         score: None,
         scores: None,
+        calls: None,
         error: Some(ItemError {
             code: "mock".into(),
             message: message.into(),

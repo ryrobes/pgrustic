@@ -92,7 +92,24 @@ fn serve_fake(listener: TcpListener, hits: Arc<AtomicU64>) {
                 body.extend_from_slice(&tmp[..n]);
             }
             body.truncate(len);
+            let request_line = header.lines().next().unwrap_or("").to_string();
+            // A generation lookup is accounting, not an inference call.
+            // Still counted here so a test can see that the fallback fired.
             hits.fetch_add(1, Ordering::SeqCst);
+            if request_line.starts_with("GET ") && request_line.contains("/generation") {
+                let payload = if request_line.contains("id=gen-nocost-1") {
+                    r#"{"data":{"id":"gen-nocost-1","model":"openai/gpt-4o-mini","total_cost":0.000009,"tokens_prompt":50,"tokens_completion":10,"usage":0.000009}}"#
+                } else {
+                    r#"{"error":{"message":"generation not found"}}"#
+                };
+                let status = if request_line.contains("id=gen-nocost-1") { 200 } else { 404 };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                return;
+            }
             let text = String::from_utf8_lossy(&body);
             if text.contains("SLOW") {
                 thread::sleep(Duration::from_millis(250));
@@ -171,7 +188,7 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
                 noul_for(text)
             )
         };
-        return (200, payload);
+        return (200, decorate_decision(&payload, text));
     }
     let content = if text.contains("BAD_JSON") {
         "not json at all".to_string()
@@ -186,13 +203,60 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
     } else {
         "false".into()
     };
-    (
-        200,
-        format!(
-            "{{\"choices\":[{{\"message\":{{\"content\":{}}}}}]}}",
-            serde_json::to_string(&content).unwrap()
-        ),
-    )
+    (200, chat_body(&content, text))
+}
+
+fn requested_model(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "openai/gpt-4o-mini".into())
+}
+
+/// Decisions `usage.cost` is USD. 80 input tokens at $0.042 / 1M.
+fn decorate_decision(body: &str, request: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    let model = requested_model(request);
+    if request.contains("NOCOST") {
+        value["id"] = serde_json::json!("gen-nocost-1");
+        value["model"] = serde_json::json!(model);
+    } else {
+        value["id"] = serde_json::json!("gen-dec-1");
+        value["model"] = serde_json::json!(model);
+        value["usage"] = serde_json::json!({
+            "input_tokens": 80,
+            "output_tokens": 4,
+            "cost": 0.00000336
+        });
+    }
+    value.to_string()
+}
+
+/// Chat `usage.cost` is the account charge. 100 prompt tokens at $0.15 / 1M
+/// plus 20 completion tokens at $0.60 / 1M.
+fn chat_body(content: &str, request: &str) -> String {
+    let model = requested_model(request);
+    let mut value = serde_json::json!({
+        "id": if request.contains("NOCOST") { "gen-nocost-1" } else { "gen-chat-1" },
+        "model": model,
+        "choices": [{"message": {"content": content}}],
+    });
+    if !request.contains("NOCOST") {
+        value["usage"] = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "cost": 0.000027
+        });
+    }
+    value.to_string()
+}
+
+fn near(got: Option<f64>, expect: f64) -> bool {
+    got.is_some_and(|n| (n - expect).abs() < 1e-12)
 }
 
 fn noul_for(text: &str) -> &'static str {
@@ -278,6 +342,16 @@ fn predict_extract_cache_and_errors() {
     assert_eq!(yes.outputs[0].value, Some(serde_json::json!(true)));
     assert_eq!(yes.outputs[0].score, Some(0.75));
     assert!(yes.outputs[0].scores.is_none());
+    let call = &yes.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(call.op, "predict");
+    assert_eq!(call.cache, "miss");
+    assert_eq!(call.items, 1);
+    assert_eq!(call.tokens_in, Some(80));
+    assert_eq!(call.tokens_out, Some(4));
+    assert!(near(call.cost_usd, 0.00000336), "{:?}", call.cost_usd);
+    assert!(near(call.cost_saved_usd, 0.0));
+    assert_eq!(call.generation_id.as_deref(), Some("gen-dec-1"));
+    assert_eq!(call.tenant, "local");
     let no = post(&format!("{}/v1/predict", h.hutch), "read-write", &predict("FALSE_CASE", "biped"));
     assert_eq!(no.outputs[0].value, Some(serde_json::json!(false)));
     assert_eq!(no.outputs[0].score, Some(0.25));
@@ -286,6 +360,27 @@ fn predict_extract_cache_and_errors() {
     let again = post(&format!("{}/v1/predict", h.hutch), "read-write", &predict("TRUE_CASE", "biped"));
     assert_eq!(again.outputs[0].value, Some(serde_json::json!(true)));
     assert_eq!(h.provider_hits.load(Ordering::SeqCst), 2, "second predict is a cache hit");
+    let hit = &again.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(hit.cache, "hit");
+    assert!(near(hit.cost_usd, 0.0));
+    assert!(near(hit.cost_saved_usd, 0.00000336), "{:?}", hit.cost_saved_usd);
+    assert_eq!(hit.provider_latency_ms, 0);
+    assert_eq!(hit.tokens_in, Some(0));
+    let stats = ureq::get(&format!("{}/stats", h.hutch)).call().unwrap().into_string().unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+    assert!(near(stats["total_cost_usd"].as_f64(), 0.00000336 * 2.0), "{stats}");
+    assert!(near(stats["cost_saved_usd"].as_f64(), 0.00000336), "{stats}");
+    assert!(stats["latency_by_op_model"].as_array().unwrap().iter().any(|row| {
+        row["op"] == "predict" && row["calls"].as_u64() == Some(2)
+    }));
+    let recent = ureq::get(&format!("{}/v1/calls?limit=1", h.hutch))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    let recent: serde_json::Value = serde_json::from_str(&recent).unwrap();
+    assert_eq!(recent["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(recent["calls"][0]["cache"], "hit");
 
     let mut extract = predict("JSON_CASE", "ignored");
     extract.operation = Operation::Extract;
@@ -403,13 +498,18 @@ fn decision_stack_alias_and_classify() {
     other.items[0].cache_key = "b".repeat(8);
     other.items[0].key = "1".into();
     let hits = h.provider_hits.load(Ordering::SeqCst);
-    let _ = post(&format!("{}/v1/predict", h.hutch), "read-write", &shared);
-    let _ = post(&format!("{}/v1/predict", h.hutch), "read-write", &other);
+    let first = post(&format!("{}/v1/predict", h.hutch), "read-write", &shared);
+    let second = post(&format!("{}/v1/predict", h.hutch), "read-write", &other);
     assert_eq!(
         h.provider_hits.load(Ordering::SeqCst),
         hits + 1,
         "identical decision bodies share one provider call"
     );
+    assert_eq!(first.outputs[0].calls.as_ref().unwrap()[0].cache, "miss");
+    let memo_hit = &second.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(memo_hit.cache, "hit");
+    assert!(near(memo_hit.cost_usd, 0.0));
+    assert!(near(memo_hit.cost_saved_usd, 0.00000336), "{:?}", memo_hit.cost_saved_usd);
 
     let mut kind = predict("BIGFOOT tracks", "ignored");
     kind.operation = Operation::Classify;
@@ -482,6 +582,44 @@ fn decision_stack_alias_and_classify() {
     assert_eq!(open.outputs[0].value, Some(serde_json::json!("forest")));
     assert!(open.outputs[0].score.is_none());
     assert!(open.outputs[0].scores.is_none());
+    let chat = &open.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(chat.op, "classify");
+    assert_eq!(chat.cache, "miss");
+    assert_eq!(chat.tokens_in, Some(100));
+    assert_eq!(chat.tokens_out, Some(20));
+    assert!(near(chat.cost_usd, 0.000027), "{:?}", chat.cost_usd);
+    assert_eq!(chat.generation_id.as_deref(), Some("gen-chat-1"));
+}
+
+#[test]
+fn missing_inline_cost_uses_the_generation_endpoint() {
+    let h = harness(Some("test-key"));
+    let mut req = predict("NOCOST", "ignored");
+    req.operation = Operation::Extract;
+    req.items[0] = item("NOCOST creature", None);
+    req.items[0].key = "n".into();
+    let got = post(&format!("{}/v1/extract", h.hutch), "off", &req);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    let call = &got.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(call.cache, "miss");
+    assert_eq!(call.op, "extract");
+    assert!(near(call.cost_usd, 0.000009), "{:?}", call.cost_usd);
+    assert_eq!(call.tokens_in, Some(50));
+    assert_eq!(call.tokens_out, Some(10));
+    assert_eq!(call.generation_id.as_deref(), Some("gen-nocost-1"));
+    assert!(call.latency_ms >= call.provider_latency_ms);
+    let stats = ureq::get(&format!("{}/stats", h.hutch)).call().unwrap().into_string().unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["provider_calls"], 1, "generation lookup is not a provider call");
+    assert!(near(stats["total_cost_usd"].as_f64(), 0.000009), "{stats}");
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), 2, "inference plus generation GET");
+    let contract = ureq::get(&format!("{}/v1/cache/stats", h.hutch))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(!contract.contains("total_cost_usd"), "{contract}");
+    assert!(!contract.contains("provider_calls"), "{contract}");
 }
 
 #[test]

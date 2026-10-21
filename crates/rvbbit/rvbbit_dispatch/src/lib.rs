@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use rvbbit_contract::{
     cache_header, client_cache_key_hex, BatchRequest, BatchResponse, CacheKeyParts,
-    CacheLookupRequest, CacheLookupResponse, CacheMode, ItemRequest, Operation,
+    CacheLookupRequest, CacheLookupResponse, CacheMode, CallMeter, ItemRequest, Operation,
     CONTRACT_VERSION, HEADER_AUTHORIZATION, HEADER_CACHE, HEADER_CONTRACT,
 };
 use rvbbit_oids::POOL_THREADS;
@@ -392,8 +392,52 @@ fn return_schema(ep: &Endpoint) -> String {
     format!("{} labels={}", ep.return_type, parts)
 }
 
+fn parsed_batch(text: &str) -> Result<BatchResponse, String> {
+    serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))
+}
+
+/// `GET {base}/v1/calls?limit=1024`. The `rvbbit.calls` view reads this.
+/// It does not use the dispatch pool, so a stats read cannot wait behind
+/// a predict batch.
+pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
+    let url = format!(
+        "{}/v1/calls?limit=1024",
+        base_url.trim_end_matches('/')
+    );
+    let resp = ureq::get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map_err(|e| format!("hutch calls: {e}"))?;
+    let text = resp.into_string().map_err(|e| format!("hutch calls body: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("hutch calls json: {e}"))?;
+    let calls = parsed
+        .get("calls")
+        .and_then(|v| v.as_array())
+        .ok_or("hutch calls response has no calls array")?;
+    let mut rows = Vec::with_capacity(calls.len());
+    for call in calls {
+        let meter: CallMeter = serde_json::from_value(call.clone()).map_err(|e| format!("hutch calls row: {e}"))?;
+        rows.push(serde_json::json!({
+            "op": meter.op,
+            "model": meter.model,
+            "tokens_in": meter.tokens_in,
+            "tokens_out": meter.tokens_out,
+            "cost": meter.cost_usd,
+            "cost_saved": meter.cost_saved_usd,
+            "latency_ms": meter.latency_ms,
+            "provider_latency_ms": meter.provider_latency_ms,
+            "cache": meter.cache,
+            "items": meter.items,
+            "tenant": meter.tenant,
+            "generation_id": meter.generation_id,
+            "ts": meter.timestamp,
+        }));
+    }
+    serde_json::to_string(&rows).map_err(|e| format!("hutch calls encode: {e}"))
+}
+
 fn decode_classify(text: &str) -> Result<String, String> {
-    let parsed: BatchResponse = serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let parsed = parsed_batch(text)?;
     let item = parsed.outputs.first().ok_or_else(|| "hutch classify returned no items".to_string())?;
     if let Some(err) = &item.error {
         return Err(format!("hutch item 0: {} {}", err.code, err.message));
@@ -412,7 +456,7 @@ fn decode_classify(text: &str) -> Result<String, String> {
 }
 
 fn decode_score(text: &str) -> Result<f64, String> {
-    let parsed: BatchResponse = serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let parsed = parsed_batch(text)?;
     let item = parsed.outputs.first().ok_or_else(|| "hutch predict returned no items".to_string())?;
     if let Some(err) = &item.error {
         return Err(format!("hutch item 0: {} {}", err.code, err.message));
@@ -421,7 +465,7 @@ fn decode_score(text: &str) -> Result<f64, String> {
 }
 
 fn decode_json_text(text: &str) -> Result<String, String> {
-    let parsed: BatchResponse = serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let parsed = parsed_batch(text)?;
     let item = parsed.outputs.first().ok_or_else(|| "hutch extract returned no items".to_string())?;
     if let Some(err) = &item.error {
         return Err(format!("hutch item 0: {} {}", err.code, err.message));
@@ -442,8 +486,7 @@ fn empty_predict(ep: &Endpoint) -> String {
 }
 
 fn decode_predict(text: &str, http_calls: u32) -> Result<BatchReply, String> {
-    let parsed: BatchResponse = serde_json::from_str(text)
-        .map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let parsed = parsed_batch(text)?;
     let mut matched = Vec::with_capacity(parsed.outputs.len());
     for (i, item) in parsed.outputs.iter().enumerate() {
         if let Some(err) = &item.error {

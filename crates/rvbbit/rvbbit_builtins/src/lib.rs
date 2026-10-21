@@ -6,8 +6,9 @@
 
 use datum::Datum;
 use rvbbit_oids::{
-    CLASSIFY_NAME, CLASSIFY_OID, DUMP_NAME, DUMP_OID, EXTRACT_NAME, EXTRACT_OID, GETDEF_NAME,
-    GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RESTORE_NAME, RESTORE_OID,
+    CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_NAME, CLASSIFY_OID, DUMP_NAME, DUMP_OID, EXTRACT_NAME,
+    EXTRACT_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID,
+    RESTORE_NAME, RESTORE_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -93,6 +94,27 @@ pub fn rvbbit_classify(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> Pg
     Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), text.as_bytes())?))
 }
 
+/// JSON array of recent hutch calls, one object per provider call or
+/// cache hit. `rvbbit.calls` is a view over `json_to_recordset` of this
+/// text. Column `cost` is USD. A hit has cost 0 and `cost_saved` set.
+pub fn rvbbit_call_log(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let urls = rvbbit_catalog::hutch_urls()?;
+    let mut rows = Vec::new();
+    for url in urls {
+        let text = rvbbit_dispatch::recent_calls_json(&url).map_err(|message| {
+            Box::new(types_error::PgError::error(message)) as Box<types_error::PgError>
+        })?;
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| {
+            Box::new(types_error::PgError::error(format!("rvbbit.call_log: {e}")))
+                as Box<types_error::PgError>
+        })?;
+        rows.extend(parsed);
+    }
+    let body = serde_json::Value::Array(rows).to_string();
+    Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), body.as_bytes())?))
+}
+
 pub fn rvbbit_dump_sql(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     let sql = rvbbit_catalog::dump_sql()?;
     Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), sql.as_bytes())?))
@@ -175,5 +197,13 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: true,
         retset: false,
         func: rvbbit_classify as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CALL_LOG_OID,
+        name: CALL_LOG_NAME,
+        nargs: 0,
+        strict: false,
+        retset: false,
+        func: rvbbit_call_log as PGFunction,
     },
 ];

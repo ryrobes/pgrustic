@@ -22,10 +22,22 @@ It then runs, in order:
 - `rvbbit.kind(notes)` with `LABELS ('bigfoot' AS '...', 'known animal' AS '...', 'unclear' AS '...')` (one Decisions `choice` call per row; the column is JSON `{"label","score","scores"}`)
 - `rvbbit.creature(notes)` on the chat model (one `/v1/extract` per row)
 
-and runs them again. The second pass must not increase `provider_calls`.
-`hits` must rise. Eighteen provider calls is the expected first pass
-(six `noul`, six `choice`, six chat). The score rows are memo hits.
-The script aborts above forty.
+and runs them again. The second pass must not increase `provider_calls`
+or `total_cost_usd`. `hits` and `cost_saved_usd` must rise. Eighteen
+provider calls is the expected first pass (six `noul`, six `choice`,
+six chat). The score rows are memo hits: cost 0, and `cost_saved` equal
+to the original `noul` charge. The script prints `GET /stats` (including
+`latency_by_op_model`) and:
+
+```sql
+SELECT op, model, sum(cost), avg(latency_ms) FROM rvbbit.calls GROUP BY 1, 2;
+```
+
+`rvbbit.calls` is a view. `rvbbit.call_log()` reads `GET /v1/calls` from
+each hutch backend. It is the last 1024 calls in that process, not a
+stored table, and `POST /reset` clears it.
+
+It aborts above forty provider calls, or when pass 1 recorded no USD cost.
 
 Fixed-label classify is one Decisions request per row, not one per label.
 Jev's `choice` question returns every label's probability. Output tokens

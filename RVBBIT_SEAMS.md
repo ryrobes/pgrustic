@@ -27,7 +27,7 @@ for the catalog). Plus dependency lines in the manifests below and
 | `crates/backend/executor/execmain/src/semantic.rs` | **New file in an upstream crate.** The batch loop has to call `exec_proc_node`, projection, and slots. Putting it in `execmain` avoids an `execmain` ↔ `rvbbit_exec` cycle. |
 | `crates/backend/commands/explain/src/node.rs` | A MEANS Result prints as `Semantic Filter`. Batch size and concurrency come from the catalog endpoint (32 and 4 after bootstrap). ANALYZE counters are unchanged. |
 | `crates/backend/utils/adt/ruleutils/src/lib.rs` | Deparse of oid 9020 still prints `rvbbit_means(...)` without a `pg_proc` lookup. A catalog oid deparses through the normal `pg_proc` path as `rvbbit.means(...)`. |
-| `crates/_support/seams_init/src/lib.rs` | Registers builtins 9020–9026, installs the catalog ensure/execute hooks, and starts the dispatch pool at server boot. |
+| `crates/_support/seams_init/src/lib.rs` | Registers builtins 9020–9027, installs the catalog ensure/execute hooks, and starts the dispatch pool at server boot. |
 | `crates/_support/types/nodes/src/parsenodes.rs` | `ObjectType::OBJECT_RVBBIT` is appended after `OBJECT_VIEW`. Existing discriminants, including `OBJECT_VIEW`, stay put. It is not a C object type (`objtype_from_i32` still stops at `OBJECT_VIEW`, and the nodes `check_enum` list is unchanged). |
 | `crates/backend/commands/seclabel/src/lib.rs` | Exhaustive `ObjectType` match: `OBJECT_RVBBIT` does not support security labels. |
 | `crates/backend/parser/parser_driver/src/lib.rs` | If a script contains rvbbit DDL, those statements become `DefineStmt` `OBJECT_RVBBIT`. Scripts with no rvbbit DDL are handed to gram.y unchanged. |
@@ -52,10 +52,10 @@ Manifests (dependency lines only):
 
 | Crate | Role |
 | --- | --- |
-| `crates/rvbbit/rvbbit_oids` | Builtin oids 9020–9026, default batch size 32, concurrency 4, pool size 8. |
+| `crates/rvbbit/rvbbit_oids` | Builtin oids 9020–9027, default batch size 32, concurrency 4, pool size 8. |
 | `crates/rvbbit/rvbbit_plan` | Walks the plan and lifts MEANS quals off base scans onto a Result. Cheap quals stay on the scan. |
 | `crates/rvbbit/rvbbit_dispatch` | Fixed OS thread pool, `ureq` (no tokio), bounded queue, cancel-aware wait. Each job carries the catalog backend URL, auth, timeout, and concurrency. |
-| `crates/rvbbit/rvbbit_builtins` | `rvbbit_means`, `rvbbit_means_score`, `rvbbit_extract`, `rvbbit_classify`, `rvbbit_dump_sql`, `rvbbit_restore_sql`, `rvbbit_get_semfn_def`. |
+| `crates/rvbbit/rvbbit_builtins` | `rvbbit_means`, `rvbbit_means_score`, `rvbbit_extract`, `rvbbit_classify`, `rvbbit_call_log`, `rvbbit_dump_sql`, `rvbbit_restore_sql`, `rvbbit_get_semfn_def`. |
 | `crates/rvbbit/rvbbit_contract` | `rvbbit-hutch-v1` request and response types and cache key v1. No engine dependencies. |
 | `crates/rvbbit/rvbbit_parse` | Recursive descent for rvbbit DDL. Keywords exist only here. |
 | `crates/rvbbit/rvbbit_resolve` | Process-local catalog cache and the function pointers `seams_init` installs. Breaks the parser → SPI cycle. |
