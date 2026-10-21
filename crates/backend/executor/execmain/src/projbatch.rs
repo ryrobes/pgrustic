@@ -10,7 +10,8 @@
 //!
 //! A MEANS qual or a top-level `rvbbit.decide` keeps its own batcher. The
 //! project calls in that query stay on the builtin. A call nested under
-//! another expression stays on the builtin too.
+//! `round` or a cast is still batched: the Result remembers the score,
+//! then the outer function reads it back.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -66,45 +67,45 @@ pub fn project_shape<'mcx>(mcx: Mcx<'mcx>, tlist: &NodeList<'mcx>) -> PgResult<P
         let Some(entry) = item.as_target_entry() else {
             continue;
         };
-        walk(mcx, entry.expr, true, &mut shape)?;
+        walk(mcx, entry.expr, &mut shape)?;
     }
     Ok(shape)
 }
 
-fn walk<'mcx>(mcx: Mcx<'mcx>, node: Node<'mcx>, top: bool, shape: &mut ProjectShape) -> PgResult<()> {
+fn walk<'mcx>(mcx: Mcx<'mcx>, node: Node<'mcx>, shape: &mut ProjectShape) -> PgResult<()> {
     match node.node_tag() {
         NodeTag::T_RelabelType => {
             let arg = node.as_relabel_type().expect("Relabel").arg;
-            walk(mcx, arg, top, shape)?;
+            walk(mcx, arg, shape)?;
         }
         NodeTag::T_CoerceViaIO => {
             let arg = node.as_coerce_via_io().expect("CoerceViaIO").arg;
-            walk(mcx, arg, top, shape)?;
+            walk(mcx, arg, shape)?;
         }
         NodeTag::T_FuncExpr => {
             let func = node.as_func_expr().expect("FuncExpr");
             if let Some(kind) = project_kind(mcx, func.funcid)? {
                 if accepts_project(kind, func.args.len()) {
+                    // Nested calls (`round(rerank(...))`, casts) batch too.
+                    // The outer function runs after the memo is filled.
                     shape.present = true;
-                    if top {
-                        shape.batched = true;
-                    }
+                    shape.batched = true;
                 }
             }
             for arg in func.args.iter() {
-                walk(mcx, arg, false, shape)?;
+                walk(mcx, arg, shape)?;
             }
         }
         NodeTag::T_OpExpr => {
             let op = node.as_op_expr().expect("OpExpr");
             for arg in op.args.iter() {
-                walk(mcx, arg, false, shape)?;
+                walk(mcx, arg, shape)?;
             }
         }
         NodeTag::T_BoolExpr => {
             let b = node.as_bool_expr().expect("BoolExpr");
             for arg in b.args.iter() {
-                walk(mcx, arg, false, shape)?;
+                walk(mcx, arg, shape)?;
             }
         }
         _ => {}
@@ -186,6 +187,10 @@ pub struct ProjectState<'mcx> {
     emit: VecDeque<SavedTuple>,
     held: Option<SavedTuple>,
     child_done: bool,
+    /// Parent LIMIT count plus offset. A Sort under this Result is bounded
+    /// to the same number and errors if read once more, so pulls stop here.
+    tuple_bound: Option<u64>,
+    child_pulled: u64,
     batches: u64,
     http_calls: u64,
     memo_hits: u64,
@@ -227,9 +232,7 @@ pub fn compile<'mcx>(
         let Some(entry) = item.as_target_entry() else {
             continue;
         };
-        if let Some(func) = top_project(mcx, entry.expr)? {
-            funcs.push(func);
-        }
+        collect_projects(mcx, entry.expr, &mut funcs)?;
     }
     if funcs.is_empty() {
         return Ok(None);
@@ -258,6 +261,8 @@ pub fn compile<'mcx>(
         emit: VecDeque::new(),
         held: None,
         child_done: false,
+        tuple_bound: None,
+        child_pulled: 0,
         batches: 0,
         http_calls: 0,
         memo_hits: 0,
@@ -266,19 +271,57 @@ pub fn compile<'mcx>(
     })))
 }
 
-fn top_project<'mcx>(mcx: Mcx<'mcx>, node: Node<'mcx>) -> PgResult<Option<Node<'mcx>>> {
+/// A parent `LIMIT` counted these tuples (count + offset). Negative means
+/// the sort underneath is not bounded. The pull stops at this count so it
+/// never reads the extra tuple a bounded sort rejects.
+pub fn note_tuple_bound(state: &mut ProjectState<'_>, tuples_needed: i64) {
+    state.tuple_bound = if tuples_needed < 0 {
+        None
+    } else {
+        Some(tuples_needed as u64)
+    };
+    state.child_pulled = 0;
+}
+
+/// Every native project call in the target, including one nested under
+/// `round`, a cast, or another function. The outer expression still runs
+/// in the projection; it reads the memo this batch fills.
+fn collect_projects<'mcx>(
+    mcx: Mcx<'mcx>,
+    node: Node<'mcx>,
+    out: &mut Vec<Node<'mcx>>,
+) -> PgResult<()> {
     match node.node_tag() {
-        NodeTag::T_RelabelType => top_project(mcx, node.as_relabel_type().expect("Relabel").arg),
-        NodeTag::T_CoerceViaIO => top_project(mcx, node.as_coerce_via_io().expect("CoerceViaIO").arg),
+        NodeTag::T_RelabelType => {
+            collect_projects(mcx, node.as_relabel_type().expect("Relabel").arg, out)
+        }
+        NodeTag::T_CoerceViaIO => {
+            collect_projects(mcx, node.as_coerce_via_io().expect("CoerceViaIO").arg, out)
+        }
         NodeTag::T_FuncExpr => {
             let func = node.as_func_expr().expect("FuncExpr");
-            if project_kind(mcx, func.funcid)?.is_some_and(|kind| accepts_project(kind, func.args.len())) {
-                Ok(Some(node))
-            } else {
-                Ok(None)
+            if project_kind(mcx, func.funcid)?.is_some_and(|kind| accepts_project(kind, func.args.len()))
+            {
+                out.push(node);
             }
+            for arg in func.args.iter() {
+                collect_projects(mcx, arg, out)?;
+            }
+            Ok(())
         }
-        _ => Ok(None),
+        NodeTag::T_OpExpr => {
+            for arg in node.as_op_expr().expect("OpExpr").args.iter() {
+                collect_projects(mcx, arg, out)?;
+            }
+            Ok(())
+        }
+        NodeTag::T_BoolExpr => {
+            for arg in node.as_bool_expr().expect("BoolExpr").args.iter() {
+                collect_projects(mcx, arg, out)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -340,6 +383,7 @@ impl<'mcx> ProjectState<'mcx> {
         self.emit.clear();
         self.held = None;
         self.child_done = false;
+        self.child_pulled = 0;
         Ok(())
     }
 
@@ -381,16 +425,27 @@ impl<'mcx> ProjectState<'mcx> {
         }
         let mut rows = Vec::with_capacity(self.batch_rows);
         let ecxt = node.ps.ps_ExprContext.expect("Result ExprContext");
-        while rows.len() < self.batch_rows {
+        // Stop on the first NULL. An exhausted seq scan returns a row
+        // again if it is pulled after that NULL, and a bounded sort then
+        // either spins or errors with "retrieved too many tuples".
+        // Also stop once a parent LIMIT bound is met: the Sort under this
+        // Result keeps that many tuples and errors on the next read.
+        while rows.len() < self.batch_rows && !self.child_done {
+            if self.tuple_bound.is_some_and(|bound| self.child_pulled >= bound) {
+                self.child_done = true;
+                break;
+            }
             crate::cfi()?;
             estate.reset_expr_context(ecxt);
             let outer = node.outer.as_deref_mut().expect("semantic project Result has a child");
             let Some(outer_slot) = exec_proc_node(outer, estate)? else {
+                self.child_done = true;
                 break;
             };
             estate.ecxt_mut(ecxt).ecxt_outertuple = Some(outer_slot);
             let calls = self.eval_sites(estate, ecxt)?;
             let saved = semantic::snapshot_slot(estate, outer_slot)?;
+            self.child_pulled += 1;
             self.rows_in += 1;
             rows.push(Pending {
                 outer: Some(saved),

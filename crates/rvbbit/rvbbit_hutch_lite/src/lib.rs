@@ -962,9 +962,9 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                 }
                 Some("summary") => "Summarize the notes in one or two sentences. No markdown.".into(),
                 Some("many") => {
-                    "Return only a JSON array of strings of the requested kind. \
-                     Include no other nouns, places, people, objects, or adjectives. \
-                     If there are none, return []. No markdown."
+                    "Return a JSON array of strings. Include the nouns and short descriptions \
+                     that refer to the requested kind, even when the text does not use that word. \
+                     Do not include unrelated nouns. If there are none, return []. No markdown."
                         .into()
                 }
                 _ => "Return only JSON. No markdown.".into(),
@@ -987,7 +987,10 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
             if item.extract_mode.as_deref() == Some("summary") {
                 input
             } else if item.extract_mode.as_deref() == Some("many") {
-                format!("List only values of the requested kind. Return [] when there are none.\n{input}")
+                format!(
+                    "List the nouns and descriptions that refer to the requested kind. \
+                     Leave out unrelated nouns. Return [] when there are none.\n{input}"
+                )
             } else if item.extract_mode.as_deref() == Some("scalar") {
                 format!("Extract one short value from this text:\n{input}")
             } else {

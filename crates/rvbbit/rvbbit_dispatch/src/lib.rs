@@ -187,7 +187,7 @@ pub fn define_gucs() {
         ("semantic.threshold", "Default noul cutoff."),
         (
             "semantic.rerank_model",
-            "Default RERANK model. Empty keeps jev noul. A slug such as voyageai/rerank-3 calls OpenRouter /rerank.",
+            "Default RERANK model. Empty keeps jev noul. voyageai/rerank-3 is the recommended slug for pure ranking and calls OpenRouter /rerank.",
         ),
     ] {
         let _ = guc::DefineCustomStringVariable(name, Some(desc), None, Some(""), PGC_USERSET, 0);
@@ -552,18 +552,21 @@ fn many_endpoint(kind: &str) -> Endpoint {
     ep.label_descriptions.clear();
     ep.fn_name = "extract_many".into();
     let schema = format!(
-        "{{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"description\":\"one {kind}\"}}}}"
+        "{{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"description\":\"a noun or short description of one {kind}\"}}}}"
     );
     ep.return_type = schema.clone();
     ep.extract_mode = Some("many".into());
     ep.system_prompt = format!(
-        "Return only values that are a {kind}. Each array item is one {kind} and nothing else. \
-         Do not include other nouns, places, people, objects, or adjectives. \
+        "Return the nouns and the short descriptions that refer to a {kind}. \
+         Each array item is one {kind}: the noun for it, or a short description of it, and nothing else. \
+         Include those references even when the text does not use the word \"{kind}\". \
+         Do not include unrelated nouns, places, people, objects, or adjectives. \
          If the text names no {kind}, return []. \
          Reply with a JSON array of strings and no markdown. Schema: {schema}"
     );
     ep.user_prompt = format!(
-        "List only the {kind} values in this text. Return [] if there are none.\n{{{{input}}}}"
+        "List the nouns and descriptions that refer to a {kind}. \
+         Leave out unrelated nouns. Return [] if there are none.\n{{{{input}}}}"
     );
     ep.max_tokens = Some(128);
     ep
@@ -1881,11 +1884,13 @@ mod tests {
     fn extract_many_asks_only_for_the_requested_kind() {
         let ep = super::many_endpoint("creature");
         assert_eq!(ep.extract_mode.as_deref(), Some("many"));
-        assert!(ep.system_prompt.contains("one creature"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("nouns and the short descriptions that refer to a creature"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("nothing else"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("does not use the word \"creature\""), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("return []"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("\"type\":\"array\""), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("Do not include other nouns"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("Do not include unrelated nouns"), "{}", ep.system_prompt);
+        assert!(ep.user_prompt.contains("nouns and descriptions that refer to a creature"));
         assert!(ep.user_prompt.contains("Return [] if there are none"));
         assert!(ep.return_type.contains("one creature"));
         let body = encode_items(
@@ -1901,7 +1906,8 @@ mod tests {
         assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
         assert_eq!(parsed["items"][0]["extract_mode"], "many");
         let system = parsed["items"][0]["system"].as_str().unwrap();
-        assert!(system.contains("one creature"));
+        assert!(system.contains("refer to a creature"));
+        assert!(system.contains("unrelated nouns"));
         assert!(system.contains("return []"));
         assert_ne!(
             super::scalar_key_extract("creature"),

@@ -4062,6 +4062,9 @@ pub fn exec_set_tuple_bound<'mcx>(tuples_needed: i64, node: &mut PlanStateNode<'
             ::nodeincrementalsort::incremental_sort_set_tuple_bound(&mut s.state, tuples_needed)
         }
         PlanStateNode::Result(rs) => {
+            if let Some(proj) = rs.proj.as_deref_mut() {
+                crate::projbatch::note_tuple_bound(proj, tuples_needed);
+            }
             if let Some(outer) = rs.outer.as_deref_mut() {
                 exec_set_tuple_bound(tuples_needed, outer);
             }

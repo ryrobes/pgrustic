@@ -344,13 +344,13 @@ fn rewrite_pipe(sql: &str, pipe: usize, out: &mut String) -> Option<usize> {
     let verb = sql[verb_at..verb_end].to_ascii_lowercase();
     if !matches!(
         verb.as_str(),
-        "means" | "extract" | "classify" | "rerank" | "summarize" | "consensus"
+        "means" | "means_score" | "extract" | "classify" | "rerank" | "summarize" | "consensus"
     ) {
         return None;
     }
     let left = pop_simple_expr(out)?;
     let rewritten = match verb.as_str() {
-        "means" | "consensus" => pipe_means(sql, verb_end, &left, &verb),
+        "means" | "means_score" | "consensus" => pipe_means(sql, verb_end, &left, &verb),
         "rerank" => pipe_binary(sql, verb_end, &left, "rerank"),
         "summarize" => pipe_summarize(sql, verb_end, &left),
         "extract" => pipe_extract(sql, verb_end, &left),
@@ -374,6 +374,9 @@ fn pipe_means(sql: &str, at: usize, left: &str, op: &str) -> Option<(usize, Stri
     if let Some((end, clauses)) = tail {
         let call = typed_clause(op, &format!("({left})"), &format!("({right})"), &clauses);
         return Some((end, alias_op(sql, end, &call, op)));
+    }
+    if op == "means_score" {
+        return Some((arg_end, format!("rvbbit.means_score(({left}), ({right}))")));
     }
     // A bare `|> CONSENSUS` is still a yes/no MEANS. Consensus-the-aggregate
     // needs the group, which a pipe does not have.
@@ -632,7 +635,7 @@ fn typed_clause(op: &str, input_sql: &str, extra_sql: &str, tail: &str) -> Strin
         "apply_clauses"
     } else {
         match op {
-            "rerank" => "clause_score",
+            "rerank" | "means_score" => "clause_score",
             "means" | "consensus" => "clause_bool",
             _ => "clause_text",
         }
@@ -914,17 +917,14 @@ fn rewrite_select_lateral(sql: &str, region: &SelectRegion) -> String {
         }
     }
     let has_from = word_at(sql, skip_ws(sql.as_bytes(), region.list_end), "from");
-    let mut inner_items = Vec::new();
-    if !extracts.is_empty() && others.is_empty() && has_from {
-        inner_items.push("*".to_string());
-    } else {
-        inner_items.extend(others);
-    }
     let mut value_cols = Vec::new();
+    let mut list_cols = Vec::new();
     let mut joins = String::new();
     for (i, ex) in extracts.iter().enumerate() {
         let list_name = format!("e{i}_list");
-        inner_items.push(format!("{} AS {list_name}", ex.call));
+        // The list column stays inside the subquery. The outer select
+        // projects source columns and the exploded value, not eN_list.
+        list_cols.push(format!("{} AS {list_name}", ex.call));
         let value_name = ex.alias.clone().unwrap_or_else(|| sql_ident(&ex.kind));
         value_cols.push(format!("e{i}.value AS {value_name}"));
         joins.push_str(&format!(
@@ -933,14 +933,32 @@ fn rewrite_select_lateral(sql: &str, region: &SelectRegion) -> String {
     }
     let quant = if distinct { "DISTINCT " } else { "" };
     let rest = sql[region.list_end..region.stmt_end].trim();
-    let inner = if rest.is_empty() {
+    let star = has_from && (others.is_empty() || others.iter().any(|item| is_star_item(item)));
+    let mut inner_items = Vec::new();
+    let mut outer_items = Vec::new();
+    if star {
+        // `s` is the source row. `(q.src).*` expands those columns and
+        // leaves the helper list column behind.
+        inner_items.push("s AS src".to_string());
+        outer_items.push("(q.src).*".to_string());
+    }
+    for (i, item) in others.iter().filter(|item| !is_star_item(item)).enumerate() {
+        let (sql_item, name) = named_projection(item, i);
+        inner_items.push(sql_item);
+        outer_items.push(format!("q.{name}"));
+    }
+    inner_items.extend(list_cols);
+    outer_items.extend(value_cols);
+    let inner = if star {
+        format!("SELECT {} FROM (SELECT * {rest}) s", inner_items.join(", "))
+    } else if rest.is_empty() {
         format!("SELECT {}", inner_items.join(", "))
     } else {
-        format!("SELECT {} {}", inner_items.join(", "), rest)
+        format!("SELECT {} {rest}", inner_items.join(", "))
     };
     let rewritten = format!(
-        "SELECT {quant}q.*, {} FROM ({inner}) q{joins}",
-        value_cols.join(", ")
+        "SELECT {quant}{} FROM ({inner}) q{joins}",
+        outer_items.join(", ")
     );
     let mut out = String::with_capacity(sql.len() + rewritten.len());
     out.push_str(&sql[..region.kw_start]);
@@ -1054,6 +1072,38 @@ fn split_trailing_alias(item: &str) -> (String, Option<String>) {
     } else {
         (item.trim().to_string(), None)
     }
+}
+
+fn is_star_item(item: &str) -> bool {
+    let item = item.trim();
+    if item == "*" {
+        return true;
+    }
+    let Some(prefix) = item.strip_suffix(".*") else {
+        return false;
+    };
+    !prefix.is_empty() && prefix.bytes().all(|c| is_ident_cont(c) || c == b'.')
+}
+
+/// `(sql, output name)` so the outer select can name the column and skip
+/// the extract-many helper.
+fn named_projection(item: &str, index: usize) -> (String, String) {
+    let (expr, alias) = split_trailing_alias(item);
+    if let Some(alias) = alias {
+        let name = alias.trim().trim_matches('"').to_string();
+        return (format!("{} AS {alias}", expr.trim()), name);
+    }
+    let expr = expr.trim();
+    if is_plain_ident(expr) {
+        return (expr.to_string(), expr.to_string());
+    }
+    let name = format!("c{index}");
+    (format!("{expr} AS {name}"), name)
+}
+
+fn is_plain_ident(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && is_ident_start(b[0]) && b.iter().copied().all(is_ident_cont)
 }
 
 fn sql_ident(name: &str) -> String {
@@ -1520,7 +1570,10 @@ mod tests {
             "{many}"
         );
         assert!(many.contains("e0.value AS creature"), "{many}");
-        assert!(many.contains("SELECT *, rvbbit.extract_many('creature', (notes), '') AS e0_list FROM t"), "{many}");
+        assert!(many.contains("(q.src).*"), "{many}");
+        assert!(!many.contains("q.*"), "{many}");
+        let many_head = many.split(" FROM (").next().unwrap_or("");
+        assert!(!many_head.contains("e0_list"), "{many}");
         let mixed = rewrite_native_semantic(
             "SELECT kind, EXTRACT MANY color FROM body FROM notes",
         )
@@ -1529,7 +1582,9 @@ mod tests {
             mixed.contains("SELECT kind, rvbbit.extract_many('color', (body), '') AS e0_list FROM notes"),
             "{mixed}"
         );
+        assert!(mixed.contains("q.kind"), "{mixed}");
         assert!(mixed.contains("e0.value AS color"), "{mixed}");
+        assert!(!mixed.split(" FROM (").next().unwrap_or("").contains("e0_list"), "{mixed}");
         let aliased = rewrite_native_semantic(
             "SELECT EXTRACT MANY creature FROM notes AS r FROM t",
         )
@@ -1568,6 +1623,22 @@ mod tests {
             nemotron.contains("rvbbit.rerank_for((notes), ('logging road'), 'nvidia/nemotron-3.5-rerank-8b:free')"),
             "{nemotron}"
         );
+    }
+
+    #[test]
+    fn pipe_means_score_takes_a_clause_tail() {
+        let sql = "SELECT body |> MEANS_SCORE 'a large biped was seen' WITH TAKES 3 FROM t";
+        let out = rewrite_native_semantic(sql).unwrap();
+        assert!(
+            out.contains(
+                "rvbbit.clause_score('means_score', (body), ('a large biped was seen'), 'WITH TAKES 3') AS means_score"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("FROM t"), "{out}");
+        assert!(!out.contains("|>"), "{out}");
+        let bare = rewrite_native_semantic("SELECT body |> MEANS_SCORE 'a large biped' FROM t").unwrap();
+        assert_eq!(bare, "SELECT rvbbit.means_score((body), ('a large biped')) FROM t");
     }
 
     #[test]

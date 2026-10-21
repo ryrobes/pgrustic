@@ -374,11 +374,29 @@ fn func_is_native_project(func: &FuncExpr<'_>) -> bool {
     ns.name_str() == b"rvbbit"
 }
 
-fn expr_is_top_project(node: Node<'_>) -> bool {
+/// True when the expression is a native project call or contains one.
+/// `round(rvbbit.rerank(...))` and a cast of that call are included, so
+/// the scan target moves onto the Result and the batcher sees the call.
+fn expr_contains_project(node: Node<'_>) -> bool {
     match node.node_tag() {
-        NodeTag::T_RelabelType => expr_is_top_project(node.as_relabel_type().expect("Relabel").arg),
-        NodeTag::T_CoerceViaIO => expr_is_top_project(node.as_coerce_via_io().expect("CoerceViaIO").arg),
-        NodeTag::T_FuncExpr => func_is_native_project(node.as_func_expr().expect("FuncExpr")),
+        NodeTag::T_RelabelType => expr_contains_project(node.as_relabel_type().expect("Relabel").arg),
+        NodeTag::T_CoerceViaIO => expr_contains_project(node.as_coerce_via_io().expect("CoerceViaIO").arg),
+        NodeTag::T_FuncExpr => {
+            let func = node.as_func_expr().expect("FuncExpr");
+            func_is_native_project(func) || func.args.iter().any(expr_contains_project)
+        }
+        NodeTag::T_OpExpr => node
+            .as_op_expr()
+            .expect("OpExpr")
+            .args
+            .iter()
+            .any(expr_contains_project),
+        NodeTag::T_BoolExpr => node
+            .as_bool_expr()
+            .expect("BoolExpr")
+            .args
+            .iter()
+            .any(expr_contains_project),
         _ => false,
     }
 }
@@ -386,7 +404,7 @@ fn expr_is_top_project(node: Node<'_>) -> bool {
 fn tlist_contains_project(tlist: &NodeList<'_>) -> bool {
     tlist.iter().any(|tle| {
         tle.as_target_entry()
-            .is_some_and(|te| expr_is_top_project(te.expr))
+            .is_some_and(|te| expr_contains_project(te.expr))
     })
 }
 
@@ -399,7 +417,7 @@ fn tlist_without_project<'mcx>(
     let mut project_exprs = NodeList::nil();
     for tle_node in cloned.iter() {
         let tle = tle_node.as_target_entry().expect("TargetEntry");
-        if expr_is_top_project(tle.expr) {
+        if expr_contains_project(tle.expr) {
             project_exprs.lappend(mcx, tle.expr)?;
         } else {
             kept.lappend(mcx, tle_node)?;

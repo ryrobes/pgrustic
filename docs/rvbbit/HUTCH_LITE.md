@@ -84,24 +84,29 @@ aborts the session when
 `SUMMARIZE(expr)` and `CONSENSUS(expr, criterion)` are aggregates. The
 transition concatenates the group; the final calls hutch once.
 `SUMMARIZE` is a chat summary. `CONSENSUS` is one Jev yes/no over the
-joined text. `EXTRACT MANY kind FROM expr` asks for a JSON array of
-that kind only (`[]` when the text has none). The array is one batched
-extract, the same Semantic Project shape as `CLASSIFY` and typed
-`EXTRACT`, then a `LEFT JOIN LATERAL` explodes each value onto its
-source row. An empty array keeps the row with a NULL value.
+joined text. `EXTRACT MANY kind FROM expr` asks for the nouns and short
+descriptions that refer to that kind (`[]` when the text has none) and
+leaves out unrelated nouns. The array is one batched extract, the same Semantic
+Project shape as `CLASSIFY` and typed `EXTRACT`, then a `LEFT JOIN
+LATERAL` explodes each value onto its source row. The helper list
+column stays inside that subquery. An empty array keeps the row with a
+NULL value.
 `RERANK(document, query)` is a Jev noul relevance score (`float8`)
 unless `USING MODEL`, the `semantic.rerank_model` GUC, or
-`HUTCH_RERANK_MODEL` names a dedicated slug
-(`nvidia/nemotron-3.5-rerank-8b:free`, `voyageai/rerank-3`). That path
-is one OpenRouter `POST /rerank` for every document that shares a query.
-The default stays jev. An explicit `jev` still uses noul. Cost and
-timing land in `rvbbit.calls`.
+`HUTCH_RERANK_MODEL` names a dedicated slug. That path is one OpenRouter
+`POST /rerank` for every document that shares a query, including when
+the call sits under `round` or a cast. The default stays jev. An
+explicit `jev` still uses noul. For pure ranking, `voyageai/rerank-3`
+is the recommended `USING MODEL`. `nvidia/nemotron-3.5-rerank-8b:free`
+is limited to 20 requests per minute and returns compressed scores.
+Cost and timing land in `rvbbit.calls`.
 `expr |> OP` is the same call with `expr` as the input: `|> MEANS`,
-`|> EXTRACT`, `|> EXTRACT MANY`, `|> CLASSIFY`, `|> RERANK`,
-`|> SUMMARIZE`, `|> CONSENSUS`. A clause tail returns the op's natural
-type (`clause_bool`, `clause_score`, or `clause_text`) and names the
-column after the op, unless the query already wrote `AS`. `REPORT`, or
-an explicit `rvbbit.apply_clauses`, still returns the JSON report.
+`|> MEANS_SCORE`, `|> EXTRACT`, `|> EXTRACT MANY`, `|> CLASSIFY`,
+`|> RERANK`, `|> SUMMARIZE`, `|> CONSENSUS`. A clause tail returns the
+op's natural type (`clause_bool`, `clause_score`, or `clause_text`) and
+names the column after the op, unless the query already wrote `AS`.
+`REPORT`, or an explicit `rvbbit.apply_clauses`, still returns the JSON
+report.
 `rvbbit.calls` keeps score, identical, and cost. `|>>` stays geometric.
 
 ## Fresh Ubuntu

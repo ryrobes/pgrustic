@@ -26,7 +26,8 @@ cargo test -p rvbbit_parse -p rvbbit_dispatch -p rvbbit_hutch_lite --profile fas
   clause_tail_stops_at_as_and_other_terminators \
   openrouter_rerank_batches_one_query \
   rerank_env_model_is_one_openrouter_call \
-  explicit_jev_rerank_stays_on_noul
+  explicit_jev_rerank_stays_on_noul \
+  pipe_means_score_takes_a_clause_tail
 echo "m6 demo: rewrite, aggregate state, rerank, summary, and extract-many passed"
 
 if [[ "${RVBBIT_M6_LIVE:-}" != "1" ]]; then

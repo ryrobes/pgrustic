@@ -264,11 +264,11 @@ fn route(
             .items
             .iter()
             .map(|item| {
-                let value = mock_value(op, item);
+                let (value, score) = mock_scored(op, item);
                 ItemResponse {
                     key: item.key.clone(),
                     value: Some(value),
-                    score: None,
+                    score,
                     scores: None,
                     calls: None,
                     error: None,
@@ -301,7 +301,7 @@ fn operation_of(path: &str) -> Option<Operation> {
     })
 }
 
-fn mock_value(op: Operation, item: &rvbbit_contract::ItemRequest) -> serde_json::Value {
+fn mock_scored(op: Operation, item: &rvbbit_contract::ItemRequest) -> (serde_json::Value, Option<f64>) {
     let input = item
         .inputs
         .get("input")
@@ -313,13 +313,31 @@ fn mock_value(op: Operation, item: &rvbbit_contract::ItemRequest) -> serde_json:
         .clone()
         .or_else(|| item.inputs.get("criterion").and_then(|v| v.as_str()).map(|s| s.to_string()))
         .unwrap_or_default();
+    let folded = input.to_ascii_lowercase();
     match op {
-        Operation::Predict => serde_json::Value::Bool(matches(&input, &criterion)),
-        Operation::Classify => serde_json::Value::String(criterion),
-        Operation::Extract => serde_json::json!({}),
-        Operation::Embed => serde_json::json!([0.0]),
-        Operation::Rerank => serde_json::json!(0.0),
-        Operation::Decide => serde_json::json!({"label": "yes", "status": "ok"}),
+        Operation::Predict => {
+            let yes = matches(&input, &criterion);
+            (serde_json::Value::Bool(yes), Some(if yes { 0.82 } else { 0.15 }))
+        }
+        Operation::Classify => (serde_json::Value::String(criterion), Some(0.75)),
+        Operation::Extract => {
+            if item.extract_mode.as_deref() == Some("many") {
+                let listed = if folded.contains("biped") || folded.contains("hairy") {
+                    "[\"biped\"]"
+                } else {
+                    "[]"
+                };
+                (serde_json::Value::String(listed.into()), None)
+            } else {
+                (serde_json::json!({}), None)
+            }
+        }
+        Operation::Embed => (serde_json::json!([0.0]), None),
+        Operation::Rerank => {
+            let score = if folded.contains("logging") { 0.91 } else { 0.12 };
+            (serde_json::json!(score), Some(score))
+        }
+        Operation::Decide => (serde_json::json!({"label": "yes", "status": "ok"}), Some(0.75)),
     }
 }
 

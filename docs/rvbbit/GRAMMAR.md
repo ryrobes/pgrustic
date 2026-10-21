@@ -93,7 +93,7 @@ order, and fall back to the builtin.
 | Variant | What is lifted | Group key | HTTP |
 | --- | --- | --- | --- |
 | Filter | `WHERE ... MEANS` / `ABOUT` on a base scan. Cheap quals stay on the scan. | `(input, criterion)` | one POST per 32 rows, up to 4 in flight |
-| Project | top-level `rvbbit.classify`, `rvbbit.classify_enum`, `rvbbit.extract_typed`, or `rvbbit.extract_many` (3 args, empty clause tail), or `rvbbit.rerank` / `rvbbit.rerank_for` (2 or 3 args) | means backend URL, model, and the label set, extract kind, or rerank query | one POST per group per window of 32 rows. A dedicated rerank model collapses one query's documents into one OpenRouter `/rerank` |
+| Project | `rvbbit.classify`, `rvbbit.classify_enum`, `rvbbit.extract_typed`, or `rvbbit.extract_many` (3 args, empty clause tail), or `rvbbit.rerank` / `rvbbit.rerank_for` (2 or 3 args), including a call nested under `round` or a cast | means backend URL, model, and the label set, extract kind, or rerank query | one POST per group per window of 32 rows. A dedicated rerank model collapses one query's documents into one OpenRouter `/rerank` |
 
 `EXPLAIN` names the filter `Semantic Filter` and the project
 `Semantic Project`, and prints `Batch Size`. Under `ANALYZE` it prints
@@ -101,9 +101,8 @@ batches, HTTP calls, memo hits, and rows in/out.
 
 The row-at-a-time builtin runs when:
 
-- the call is nested under another expression
-- a MEANS qual or a top-level `rvbbit.decide` already owns the Result
-  (`Project = per-row` in `EXPLAIN`)
+- a MEANS qual or a top-level `rvbbit.decide` already owns the Result, so a
+  project call on that node stays per-row (`Project = per-row` in `EXPLAIN`)
 - the planner's syscache seams are not installed (unit tests), so the
   scan is not wrapped
 - the project memo has no entry for that input (a bad enum, or a null
