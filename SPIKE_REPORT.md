@@ -2,6 +2,8 @@
 
 **Recommendation: go.** A scan-level `expr MEANS 'text'` filter can live in this engine. The batch path, cancel, and the upstream regression gate all behaved the way the spike asked. The seams are few enough to rebase. Wider syntax (joins, `HAVING`, target lists, a real catalog row) is follow-on work, and the lexer special case will get awkward if many new words are added the same way.
 
+M1 and M2 continued on `cursor/rvbbit-m1-m2-4990` (PR #2, stacked on this branch). The catalog row, dump round trip, and hutch contract are in `M1_M2_REPORT.md`. The 313-call, cancel, and 217/231 numbers below are the spike baseline; M1/M2 re-measured them and they held. `EXPLAIN` now prints `rvbbit.means(...)` once the catalog row exists.
+
 Branch `cursor/rvbbit-semantic-spike-4990`. Measurements below are from this VM on 2026-10-21, against `target/fast-profile/postgres` and `hutch_mock` on `127.0.0.1:8099`.
 
 ## Criteria

@@ -701,9 +701,11 @@ fn drop_function(name: &str, args: &[Arg], if_exists: bool, cascade: bool) -> Pg
     } else {
         args.iter().map(|a| a.typ.clone()).collect()
     };
-    exec(&format!("DROP FUNCTION IF EXISTS rvbbit.{}({})", qident(name), types.join(", ")))?;
+    // Drop our pg_depend row before DROP FUNCTION. The row names this
+    // table as classid, which performDeletion does not know.
     clear_deps("semfn", &oid)?;
     clear_comment("semfn", &oid)?;
+    exec(&format!("DROP FUNCTION IF EXISTS rvbbit.{}({})", qident(name), types.join(", ")))?;
     exec(&format!("DELETE FROM rvbbit.semfn WHERE oid = {oid}"))
 }
 

@@ -1,3 +1,4 @@
+DROP ROLE IF EXISTS rvbbit_reader;
 CREATE ROLE rvbbit_reader;
 CREATE BACKEND grant_b TYPE hutch URL 'http://127.0.0.1:9';
 CREATE MODEL grant_m ON BACKEND grant_b NAME 'remote';

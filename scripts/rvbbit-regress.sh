@@ -18,6 +18,10 @@ export PATH="$PG_BIN:$PATH"
 
 if [[ "${RVBBIT_REGRESS_KEEP:-0}" != 1 ]]; then
   dropdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" --if-exists "$PGDATABASE"
+  # Roles are cluster-wide. Drop them after the database so leftover
+  # grants from a failed run are already gone.
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -v ON_ERROR_STOP=1 -q -c \
+    "DROP ROLE IF EXISTS rvbbit_reader; DROP ROLE IF EXISTS rvbbit_dump_role;"
   createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE"
 fi
 mkdir -p "$OUT"

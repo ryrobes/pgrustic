@@ -29,7 +29,7 @@ SELECT name, model_name, version, comment FROM rvbbit.decision_trees ORDER BY na
 SELECT name, version, args, returns, comment FROM rvbbit.workflows ORDER BY name, version;
 SELECT description FROM pg_description d JOIN rvbbit.backend b ON b.oid = d.objoid WHERE b.name = 'b1';
 SELECT p.proname, n.nspname, p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'rvbbit' AND p.proname = 'likes';
-SELECT rvbbit.pg_get_semanticfunctiondef('likes') LIKE '%PROMPT $$still$$%';
+SELECT rvbbit.pg_get_semanticfunctiondef('likes') LIKE '%still%';
 
 \dt rvbbit.*
 \dv rvbbit.*

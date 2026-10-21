@@ -1,5 +1,6 @@
 -- Stock pg_dump does not know these objects. The round trip is
 -- rvbbit.dump_sql() / rvbbit.restore_sql(text).
+DROP ROLE IF EXISTS rvbbit_dump_role;
 CREATE ROLE rvbbit_dump_role;
 CREATE BACKEND dump_b TYPE hutch URL 'http://127.0.0.1:9' AUTH SECRET 'DUMP_TOKEN' WITH (batch_size = 16, max_concurrent = 2, timeout = '2s', retries = 4) VERSION 3;
 CREATE MODEL dump_m ON BACKEND dump_b NAME 'remote' VERSION 2;
