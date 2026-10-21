@@ -152,6 +152,12 @@ pub struct ItemRequest {
     /// can group cost by node. Not part of the cache key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Extract decode. Absent or `json` requires a JSON value (catalog
+    /// EXTRACT). `scalar` accepts a JSON scalar or plain text and stores
+    /// the text as a string. Not part of the client cache key: callers
+    /// that change the mode also change the prompt, which is hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -234,6 +240,10 @@ pub struct CallMeter {
     /// classify, and extract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Yes-probability for a noul call, or the winning label's
+    /// probability for a choice call. Absent on chat and on errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

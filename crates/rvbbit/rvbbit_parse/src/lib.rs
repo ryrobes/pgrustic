@@ -232,6 +232,8 @@ pub struct FnClauses {
     pub labels: Vec<String>,
     /// Parallel to [`Self::labels`]. `None` means the default description.
     pub label_descriptions: Vec<Option<String>>,
+    /// Noul cutoff in `[0, 1]`. Absent means the server default (0.5).
+    pub threshold: Option<f64>,
 }
 
 impl Default for FnClauses {
@@ -247,6 +249,7 @@ impl Default for FnClauses {
             version: None,
             labels: Vec::new(),
             label_descriptions: Vec::new(),
+            threshold: None,
         }
     }
 }
@@ -291,6 +294,8 @@ pub enum Command {
         symbol: Option<String>,
         negator: Option<String>,
         version: Option<i64>,
+        /// Operator cutoff. Absent means the function's `THRESHOLD`.
+        threshold: Option<f64>,
     },
     CreateTree {
         or_replace: bool,
@@ -499,6 +504,7 @@ impl<'a> Parser<'a> {
                 let mut function = None;
                 let mut symbol = None;
                 let mut negator = None;
+                let mut threshold = None;
                 while !self.at_sym(')') && !self.at_end() {
                     if self.eat_kw(Kw::Leftarg) {
                         self.expect_sym('=')?;
@@ -515,6 +521,9 @@ impl<'a> Parser<'a> {
                     } else if self.eat_kw(Kw::Negator) {
                         self.expect_sym('=')?;
                         negator = Some(self.negator_name()?);
+                    } else if self.eat_kw(Kw::Threshold) {
+                        self.expect_sym('=')?;
+                        threshold = Some(self.unit_threshold()?);
                     } else {
                         return Err(format!("bad operator item near {}", self.near()));
                     }
@@ -531,6 +540,7 @@ impl<'a> Parser<'a> {
                     symbol,
                     negator,
                     version,
+                    threshold,
                 });
             }
             return Err(format!("expected FUNCTION or OPERATOR near {}", self.near()));
@@ -812,6 +822,8 @@ impl<'a> Parser<'a> {
                 c.max_tokens = Some(self.int()?);
             } else if self.eat_kw(Kw::Temperature) {
                 c.temperature = Some(self.number()?);
+            } else if self.eat_kw(Kw::Threshold) {
+                c.threshold = Some(self.unit_threshold()?);
             } else if self.eat_kw(Kw::Cache) {
                 c.cache = Some(self.name()?);
             } else if self.eat_kw(Kw::Test) {
@@ -1285,6 +1297,14 @@ impl<'a> Parser<'a> {
             }
             _ => Err(format!("expected a number near {}", self.near())),
         }
+    }
+
+    fn unit_threshold(&mut self) -> Result<f64, String> {
+        let n = self.number()?;
+        if !(0.0..=1.0).contains(&n) {
+            return Err(format!("THRESHOLD {n} is outside [0, 1]"));
+        }
+        Ok(n)
     }
 
     fn expect_kw(&mut self, kw: Kw, label: &str) -> Result<(), String> {

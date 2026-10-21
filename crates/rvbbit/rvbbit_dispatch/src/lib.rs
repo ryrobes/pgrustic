@@ -23,7 +23,7 @@ use rvbbit_contract::{
     CacheLookupRequest, CacheLookupResponse, CacheMode, CallMeter, DecisionStack, ItemRequest,
     Operation, CONTRACT_VERSION, HEADER_AUTHORIZATION, HEADER_CACHE, HEADER_CONTRACT,
 };
-use rvbbit_tree::{AskAns, AskReq, ChoiceReq, Decisions};
+use rvbbit_tree::{AskAns, AskReq, ChoiceAns, ChoiceReq, Decisions};
 use rvbbit_oids::POOL_THREADS;
 use rvbbit_resolve::Endpoint;
 use types_error::{PgError, PgResult};
@@ -305,17 +305,7 @@ pub fn extract_many(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
     if inputs.is_empty() {
         return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
     }
-    let mut ep = decision_endpoint();
-    ep.model = "mock".into();
-    ep.labels.clear();
-    ep.label_descriptions.clear();
-    ep.fn_name = "extract_typed".into();
-    ep.return_type = "text".into();
-    ep.system_prompt = format!(
-        "Return only one {kind} value as plain text. No markdown, no quotes."
-    );
-    ep.user_prompt = format!("Extract the {kind} from: {{{{input}}}}");
-    ep.max_tokens = Some(64);
+    let ep = typed_extract_endpoint(kind);
     let payload: Vec<serde_json::Value> = inputs
         .iter()
         .map(|input| serde_json::json!({ "input": input }))
@@ -400,6 +390,25 @@ pub fn scalar_key_classify(labels: &[String]) -> String {
 pub fn scalar_key_extract(kind: &str) -> String {
     let ep = decision_endpoint();
     format!("e\u{1e}{}\u{1e}mock\u{1e}{kind}", ep.base_url)
+}
+
+fn typed_extract_endpoint(kind: &str) -> Endpoint {
+    let mut ep = decision_endpoint();
+    ep.model = "mock".into();
+    ep.labels.clear();
+    ep.label_descriptions.clear();
+    ep.fn_name = "extract_typed".into();
+    ep.return_type = "text".into();
+    // Scalar mode caches a bare noun. JSON mode rejected every plain-text
+    // answer and the row fell through ON ERROR.
+    ep.extract_mode = Some("scalar".into());
+    ep.system_prompt = format!(
+        "Name the {kind} in at most three words. A short noun or literal only. \
+         No sentence, no description, no markdown, no quotes."
+    );
+    ep.user_prompt = format!("What {kind} does this text name?\n{{{{input}}}}");
+    ep.max_tokens = Some(16);
+    ep
 }
 
 fn decision_endpoint() -> Endpoint {
@@ -531,6 +540,7 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
                     Some(ep.label_descriptions.clone())
                 }
             },
+            extract_mode: ep.extract_mode.clone(),
         });
     }
     let req = BatchRequest {
@@ -540,13 +550,28 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
         temperature: ep.temperature,
         max_tokens: ep.max_tokens,
         items: req_items,
-        decision: None,
+        decision: noul_stack(ep, operation),
     };
     serde_json::to_string(&req).map_err(|e| format!("hutch encode: {e}"))
 }
 
 /// Fold a non-empty label set into the schema string that the cache key
 /// already hashes. Empty labels leave the schema unchanged.
+/// A function or operator `THRESHOLD` becomes the noul cutoff. Absent
+/// keeps the hutch server default. Classify and extract ignore it.
+fn noul_stack(ep: &Endpoint, operation: Operation) -> Option<DecisionStack> {
+    if !matches!(operation, Operation::Predict | Operation::Decide) {
+        return None;
+    }
+    let threshold = ep.threshold?;
+    Some(DecisionStack {
+        models: Vec::new(),
+        takes: None,
+        combine: None,
+        threshold: Some(threshold),
+    })
+}
+
 fn return_schema(ep: &Endpoint) -> String {
     if ep.labels.is_empty() {
         return ep.return_type.clone();
@@ -610,6 +635,7 @@ pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
             "tenant": meter.tenant,
             "generation_id": meter.generation_id,
             "node": meter.node,
+            "score": meter.score,
             "ts": meter.timestamp,
         }));
     }
@@ -762,6 +788,8 @@ pub struct DecideReply {
     pub http_calls: u32,
     pub node_calls: u32,
     pub memo_hits: u32,
+    /// Per row, `(node id, score)` in visit order.
+    pub scores: Vec<Vec<(String, f64)>>,
 }
 
 /// Walk `nodes` for every input. One HTTP batch per node per level.
@@ -775,6 +803,7 @@ pub fn decide_texts(ep: &Endpoint, nodes: &str, inputs: &[String]) -> PgResult<D
         http_calls: backend.http_calls,
         node_calls: report.node_calls,
         memo_hits: report.memo_hits,
+        scores: report.scores,
     })
 }
 
@@ -802,7 +831,7 @@ impl Decisions for HutchTree<'_> {
         decode_ask(&raw.body)
     }
 
-    fn choose(&mut self, req: &ChoiceReq) -> Result<Vec<String>, String> {
+    fn choose(&mut self, req: &ChoiceReq) -> Result<Vec<ChoiceAns>, String> {
         let body = encode_tree_items(
             self.ep,
             Operation::Classify,
@@ -817,7 +846,7 @@ impl Decisions for HutchTree<'_> {
         )?;
         let raw = post_tree(self.ep, "classify", body)?;
         self.http_calls = self.http_calls.saturating_add(raw.http_calls);
-        decode_labels(&raw.body)
+        decode_choices(&raw.body)
     }
 }
 
@@ -885,6 +914,7 @@ fn encode_tree_items(
                 Some(meanings.to_vec())
             },
             node: Some(node_meter(node, question)),
+            extract_mode: None,
         });
     }
     let stacked = !models.is_empty() || combine == "vote" || threshold.is_some_and(|t| (t - 0.5).abs() > 1e-9);
@@ -931,7 +961,7 @@ fn decode_ask(text: &str) -> Result<Vec<AskAns>, String> {
     Ok(out)
 }
 
-fn decode_labels(text: &str) -> Result<Vec<String>, String> {
+fn decode_choices(text: &str) -> Result<Vec<ChoiceAns>, String> {
     let parsed = parsed_batch(text)?;
     let mut out = Vec::with_capacity(parsed.outputs.len());
     for (i, item) in parsed.outputs.iter().enumerate() {
@@ -943,7 +973,11 @@ fn decode_labels(text: &str) -> Result<Vec<String>, String> {
             .as_ref()
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("hutch item {i} has no label"))?;
-        out.push(label.to_string());
+        let score = item.score.unwrap_or(0.0);
+        out.push(ChoiceAns {
+            label: label.to_string(),
+            score,
+        });
     }
     Ok(out)
 }
@@ -1010,7 +1044,8 @@ pub fn forget_scalar(keys: &[(String, String)]) {
 
 #[cfg(test)]
 mod tests {
-    use super::coerce_extracted;
+    use super::{coerce_extracted, encode_items, typed_extract_endpoint};
+    use rvbbit_contract::Operation;
 
     #[test]
     fn coerce_extract_kinds() {
@@ -1019,6 +1054,23 @@ mod tests {
         assert_eq!(coerce_extracted("bool", "YES").unwrap(), "true");
         assert_eq!(coerce_extracted("creature", "  sasquatch ").unwrap(), "sasquatch");
         assert!(coerce_extracted("float", "inf").is_err());
+    }
+
+    #[test]
+    fn typed_extract_asks_for_a_short_noun() {
+        let ep = typed_extract_endpoint("creature");
+        assert_eq!(ep.extract_mode.as_deref(), Some("scalar"));
+        assert!(ep.system_prompt.contains("at most three words"));
+        assert!(ep.system_prompt.contains("No sentence"));
+        let body = encode_items(
+            &ep,
+            Operation::Extract,
+            &[serde_json::json!({ "input": "a tall hairy figure" })],
+        )
+        .unwrap();
+        assert!(body.contains("\"extract_mode\":\"scalar\""));
+        assert!(body.contains("What creature does this text name?"));
+        assert!(!body.contains("large, black-brown"));
     }
 }
 

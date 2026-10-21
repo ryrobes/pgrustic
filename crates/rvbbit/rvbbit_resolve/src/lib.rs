@@ -33,6 +33,11 @@ pub struct Endpoint {
     pub labels: Vec<String>,
     /// Parallel to [`Self::labels`]. Empty string means the default sentence.
     pub label_descriptions: Vec<String>,
+    /// Noul cutoff for this function or operator. `None` means the hutch
+    /// server default (`HUTCH_DECISION_THRESHOLD`, 0.5).
+    pub threshold: Option<f64>,
+    /// Extract decode. `Some("scalar")` accepts plain text. `None` is JSON.
+    pub extract_mode: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,5 +227,7 @@ pub fn default_endpoint() -> Endpoint {
         cache_mode: "off".into(),
         labels: Vec::new(),
         label_descriptions: Vec::new(),
+        threshold: None,
+        extract_mode: None,
     }
 }

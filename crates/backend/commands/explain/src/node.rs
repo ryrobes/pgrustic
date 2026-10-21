@@ -1380,6 +1380,9 @@ pub fn ExplainNode<'mcx>(
                         ExplainPropertyInteger("Memo Hits", None, st.memo_hits as i64, es);
                         ExplainPropertyInteger("Tree Rows In", None, st.rows_in as i64, es);
                         ExplainPropertyInteger("Tree Rows Out", None, st.rows_out as i64, es);
+                        if !st.scores.is_empty() {
+                            ExplainPropertyText("Node Scores", &st.scores, es);
+                        }
                     }
                 }
                 if project.present {
