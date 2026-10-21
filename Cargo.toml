@@ -891,6 +891,11 @@ members = [
     "crates/backend/utils/adt/pseudorandomfuncs",
     "crates/backend/utils/adt/pg_upgrade_support",
     "crates/bin/fuzzgen",
+    "crates/rvbbit/rvbbit_oids",
+    "crates/rvbbit/rvbbit_plan",
+    "crates/rvbbit/rvbbit_dispatch",
+    "crates/rvbbit/rvbbit_builtins",
+    "crates/rvbbit/hutch_mock",
 ]
 
 [workspace.package]

@@ -31,6 +31,8 @@ pub struct ResultState<'mcx> {
     /// C outerPlan->chgParam: a pending child rescan, applied at the first
     /// pull after the one-time filter passes.
     pub outer_chg: ::types_nodes::bitmapset::Bitmapset<'mcx>,
+    /// Batch executor for a MEANS qual. None for an ordinary Result.
+    pub rvbbit: Option<Box<crate::semantic::SemanticState<'mcx>>>,
 }
 
 /// `ExecInitResult` (nodeResult.c).
@@ -84,6 +86,7 @@ pub fn exec_init_result<'mcx>(
         None => None,
     };
     let rs_checkqual = resconstantqual.is_some();
+    let rvbbit = crate::semantic::compile(estate, node)?;
     Ok(ResultState {
         ps: PlanStateBase {
             plan: &node.plan,
@@ -98,6 +101,7 @@ pub fn exec_init_result<'mcx>(
         rs_done: false,
         rs_checkqual,
         outer_chg: ::types_nodes::bitmapset::Bitmapset::empty(),
+        rvbbit,
     })
 }
 
@@ -106,6 +110,9 @@ pub fn exec_result<'mcx>(
     node: &mut ResultState<'mcx>,
     estate: &mut EStateData<'mcx>,
 ) -> PgResult<Option<ExecSlotId>> {
+    if node.rvbbit.is_some() {
+        return crate::semantic::exec(node, estate);
+    }
     crate::cfi()?;
     let ecxt = node
         .ps
@@ -263,6 +270,9 @@ pub fn exec_end_result<'mcx>(
     node: &mut ResultState<'mcx>,
     estate: &mut EStateData<'mcx>,
 ) -> PgResult<()> {
+    // Drop the batch state before the node is forgotten. release_owned
+    // runs after this and clears the field if end was skipped.
+    node.rvbbit.take();
     match node.outer.as_deref_mut() {
         Some(outer) => exec_end_node(outer, estate),
         None => Ok(()),
@@ -270,6 +280,8 @@ pub fn exec_end_result<'mcx>(
 }
 
 // resconstantqual exempt: an ExprState (fn_extra memos); release_owned takes it.
+// rvbbit exempt: the batch state owns heap (memo, saved tuples); exec_end_result
+// and release_owned take() it before the node is forgotten.
 ::mcx::forget_safe_struct!(
-    ResultState<'_> { ps, outer, rs_done, rs_checkqual, outer_chg; resconstantqual },
+    ResultState<'_> { ps, outer, rs_done, rs_checkqual, outer_chg; resconstantqual, rvbbit },
 );

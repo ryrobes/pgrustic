@@ -1,0 +1,15 @@
+[package]
+name = "rvbbit_builtins"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+datum = { path = "../../_support/types/datum" }
+rvbbit_dispatch = { path = "../rvbbit_dispatch" }
+rvbbit_oids = { path = "../rvbbit_oids" }
+types_error = { path = "../../_support/types/types_error" }
+types_fmgr = { path = "../../_support/types/fmgr" }

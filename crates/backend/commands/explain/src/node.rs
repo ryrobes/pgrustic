@@ -667,7 +667,13 @@ pub fn ExplainNode<'mcx>(
     let mut partialmode: Option<&str> = None;
     let mut operation: Option<&str> = None;
     let (pname, sname): (&str, &str) = match node.node_tag() {
-        NodeTag::T_Result => ("Result", "Result"),
+        NodeTag::T_Result => {
+            if rvbbit_plan::qual_contains_means(&plan.qual) {
+                ("Semantic Filter", "Semantic Filter")
+            } else {
+                ("Result", "Result")
+            }
+        }
         NodeTag::T_ProjectSet => ("ProjectSet", "ProjectSet"),
         NodeTag::T_Append => ("Append", "Append"),
         NodeTag::T_MergeAppend => ("Merge Append", "Merge Append"),
@@ -1304,6 +1310,40 @@ pub fn ExplainNode<'mcx>(
             show_scan_qual(&plan.qual, "Filter", node, ancestors, es)?;
             if !plan.qual.is_nil() {
                 show_instrumentation_count("Rows Removed by Filter", 1, &instrument, es);
+            }
+            if rvbbit_plan::qual_contains_means(&plan.qual) {
+                ExplainPropertyText("Semantic", "means", es);
+                ExplainPropertyInteger(
+                    "Batch Size",
+                    None,
+                    rvbbit_oids::BATCH_ROWS as i64,
+                    es,
+                );
+                ExplainPropertyInteger(
+                    "Concurrency",
+                    None,
+                    rvbbit_oids::CONCURRENCY as i64,
+                    es,
+                );
+                if es.analyze {
+                    if let Some(st) = execmain::semantic_stats(plan.plan_node_id) {
+                        ExplainPropertyInteger("Batches", None, st.batches as i64, es);
+                        ExplainPropertyInteger("HTTP Calls", None, st.http_calls as i64, es);
+                        ExplainPropertyInteger("Memo Hits", None, st.memo_hits as i64, es);
+                        ExplainPropertyInteger(
+                            "Semantic Rows In",
+                            None,
+                            st.rows_in as i64,
+                            es,
+                        );
+                        ExplainPropertyInteger(
+                            "Semantic Rows Out",
+                            None,
+                            st.rows_out as i64,
+                            es,
+                        );
+                    }
+                }
             }
         }
         NodeTag::T_Sort => {

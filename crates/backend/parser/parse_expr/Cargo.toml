@@ -35,6 +35,7 @@ parse_relation = { path = "../parse_relation" }
 parse_utilcmd = { path = "../parse_utilcmd" }
 parser_small1 = { path = "../parser_small1" }
 stack_depth = { path = "../../utils/misc/stack_depth" }
+rvbbit_oids = { path = "../../../rvbbit/rvbbit_oids" }
 types_core = { path = "../../../_support/types/types_core" }
 types_error = { path = "../../../_support/types/types_error" }
 types_nodes = { path = "../../../_support/types/nodes" }

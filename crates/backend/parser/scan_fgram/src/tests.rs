@@ -418,3 +418,17 @@ fn literal_buffer_stops_at_max_alloc_size() {
     assert_eq!(err.message(), "invalid memory alloc request size 1073741824");
     sc.literalbuf.clear();
 }
+
+#[test]
+fn means_is_contextual_op() {
+    let pred = codes("body means 'paid'");
+    assert_eq!(
+        pred,
+        vec![tokens::IDENT, tokens::Op, tokens::SCONST]
+    );
+    assert_eq!(lex_all("body MEANS 'paid'")[1].1, "=means");
+    assert_eq!(codes("select means")[1], tokens::IDENT);
+    assert_eq!(codes("select body as means")[3], tokens::IDENT);
+    assert_eq!(codes("select t.means")[3], tokens::IDENT);
+    assert_eq!(codes("select (body) means 'x'")[4], tokens::Op);
+}

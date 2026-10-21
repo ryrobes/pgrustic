@@ -161,6 +161,9 @@ heapam = { path = "../../access/heap/heapam" }
 # CURRENT-OF eligibility probe's AM narrowing (execcurrent.rs).
 reloptions = { path = "../../access/common/reloptions" }
 orderedsetaggs = { path = "../../utils/adt/orderedsetaggs" }
+rvbbit_dispatch = { path = "../../../rvbbit/rvbbit_dispatch" }
+rvbbit_oids = { path = "../../../rvbbit/rvbbit_oids" }
+rvbbit_plan = { path = "../../../rvbbit/rvbbit_plan" }
 
 [dev-dependencies]
 adt_numeric = { path = "../../utils/adt/numeric" }

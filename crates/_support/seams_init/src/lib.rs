@@ -457,7 +457,7 @@ pub fn init_all_with_transport(transport: Transport) {
     ts_cache::init_hooks();
     seclabel::init();
 
-    static EXTRA_BUILTINS: [&[types_fmgr::FmgrBuiltin]; 8] = [
+    static EXTRA_BUILTINS: [&[types_fmgr::FmgrBuiltin]; 9] = [
         adt_misc::builtins::MISC_BUILTINS,
         catalog_namespace::builtins::NAMESPACE_BUILTINS,
         format_type::builtins::FORMAT_TYPE_BUILTINS,
@@ -473,8 +473,12 @@ pub fn init_all_with_transport(transport: Transport) {
         // whose pg_proc rows janitor::bootstrap backfills into every
         // database on first connection (no install script).
         janitor::JANITOR_BUILTINS,
+        // pgrust-native (reserved-range oid 9020): rvbbit_means. No pg_proc
+        // row; cache_syscache synthesizes the planner projections.
+        rvbbit_builtins::MEANS_BUILTINS,
     ];
     fmgr_core::install_extra_builtins(&EXTRA_BUILTINS);
+    rvbbit_dispatch::start();
 }
 
 // A PgError-payload panic is the ereport-through-infallible-C idiom (a sort

@@ -16,6 +16,7 @@ parse_agg = { path = "../../../parser/parse_agg" }
 parse_relation = { path = "../../../parser/parse_relation" }
 parser_analyze = { path = "../../../parser/parser_analyze" }
 mcx = { path = "../../../../_support/mcx" }
+rvbbit_plan = { path = "../../../../rvbbit/rvbbit_plan" }
 datum = { path = "../../../../_support/types/datum" }
 detoast = { path = "../../../access/common/detoast" }
 adt_numeric = { path = "../../../utils/adt/numeric" }

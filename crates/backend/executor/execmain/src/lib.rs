@@ -39,6 +39,7 @@ mod nodegather;
 mod nodegathermerge;
 mod nodeprojectset;
 mod noderesult;
+mod semantic;
 mod nodesubplan;
 pub mod p8census;
 mod procnode;
@@ -69,6 +70,7 @@ pub use nodegather::GatherState;
 pub use nodegathermerge::GatherMergeState;
 pub use nodeprojectset::ProjectSetState;
 pub use noderesult::ResultState;
+pub use semantic::{semantic_stats, SemanticStats};
 pub use procnode::{
     exec_end_node, exec_init_node, exec_proc_node, exec_shutdown_node, PlanStateBase, PlanStateNode,
 };

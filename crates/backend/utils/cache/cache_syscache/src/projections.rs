@@ -1464,6 +1464,9 @@ fn pg_type_typrelid(typid: Oid) -> PgResult<Option<Oid>> {
 }
 
 fn pg_proc_proname(funcid: Oid) -> PgResult<Option<types_tuple::NameData>> {
+    if funcid == rvbbit_oids::MEANS_OID {
+        return Ok(Some(means_proc_name()));
+    }
     let Some(tuple) = SearchSysCache1(PROCOID, SysCacheKey::Value(Datum::from_oid(funcid)))? else {
         return Ok(None);
     };
@@ -1485,6 +1488,9 @@ fn lookup_pg_proc_shape(funcid: Oid) -> PgResult<Option<syscache_seams::PgProcSh
 }
 
 fn lookup_pg_proc_shape_uncached(funcid: Oid) -> PgResult<Option<syscache_seams::PgProcShape>> {
+    if funcid == rvbbit_oids::MEANS_OID {
+        return Ok(Some(means_proc_shape()));
+    }
     let Some(tuple) = SearchSysCache1(PROCOID, SysCacheKey::Value(Datum::from_oid(funcid)))? else {
         return Ok(None);
     };
@@ -1914,7 +1920,45 @@ fn lookup_pg_cast_shape_uncached(sourcetypeid: Oid, targettypeid: Oid) -> PgResu
     Ok(Some(shape))
 }
 
+/// Synthetic pg_proc row for `rvbbit_means`. There is no catalog tuple:
+/// fmgr dispatches the OID through the extra-builtin table, and these
+/// projections keep planning, parallel-safety, and EXPLAIN deparse working.
+fn means_proc_name() -> NameData {
+    let mut name = NameData::default();
+    name.namestrcpy(rvbbit_oids::MEANS_NAME);
+    name
+}
+
+fn means_proc_shape() -> syscache_seams::PgProcShape {
+    syscache_seams::PgProcShape {
+        pronamespace: types_core::PG_CATALOG_NAMESPACE,
+        prorettype: types_core::BOOLOID,
+        provariadic: InvalidOid,
+        prosupport: InvalidOid,
+        prolang: 12,
+        pronargs: 2,
+        prokind: b'f' as i8,
+        provolatile: b'v' as i8,
+        proparallel: b'u' as i8,
+        proretset: false,
+        proisstrict: true,
+        proleakproof: false,
+        prosecdef: false,
+        proconfig_isnull: true,
+    }
+}
+
 fn pg_proc_cost_shape(funcid: Oid) -> PgResult<Option<syscache_seams::PgProcCostShape>> {
+    if funcid == rvbbit_oids::MEANS_OID {
+        // High cost so the planner does not treat the predicate as cheap,
+        // and so a const-fold of a volatile call is not attractive. The
+        // executor batches the call anyway.
+        return Ok(Some(syscache_seams::PgProcCostShape {
+            procost: 1.0e6_f32,
+            prorows: 0.0,
+            prosupport: InvalidOid,
+        }));
+    }
     let Some(tuple) = SearchSysCache1(PROCOID, SysCacheKey::Value(Datum::from_oid(funcid)))? else {
         return Ok(None);
     };

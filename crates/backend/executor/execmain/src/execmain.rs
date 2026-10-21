@@ -503,6 +503,9 @@ fn skeleton_disarm_in_place(qd: &mut QueryDescData) -> PgResult<Option<i32>> {
 }
 
 pub(crate) fn executor_start_seam(h: QueryDescHandle, eflags: i32) -> PgResult<()> {
+    // EXPLAIN ANALYZE reads these after the run and before executor end.
+    // A nested SPI query clears the map; the spike does not nest MEANS.
+    crate::semantic::clear_stats();
     querydesc::with_qd(h, |qd| qd.start_eflags = eflags);
     tap_executor_start::call_if(|f| f(h));
     querydesc::with_qd(h, |qd| {

@@ -44,6 +44,7 @@ impl<'mcx> Scanner<'mcx> {
             if let Lex::Tok(tok) = self.do_action(act)? {
                 *lvalp = tok.value;
                 *llocp = tok.location;
+                self.prev_token = tok.token;
                 return Ok(tok.token);
             }
         }
@@ -424,6 +425,16 @@ impl<'mcx> Scanner<'mcx> {
                     self.encoding,
                 )?;
                 let ident = mcx::vec_borrow_in(self.mcx, ident)?;
+                // Contextual infix predicate. After an expression, `means`
+                // is the existing Op token (so `expr MEANS 'text'` parses
+                // with no new grammar rule). Anywhere else it stays an
+                // identifier, which is the unreserved-keyword behaviour:
+                // `SELECT means`, `AS means`, and quoted "MEANS" still work.
+                // A bare alias (`SELECT expr means FROM t`) is the one form
+                // this cannot accept; `AS means` covers it.
+                if ident == b"means" && token_ends_expr(self.prev_token) {
+                    return Ok(self.make(tokens::Op, CoreYYSTYPE::Str(ident)));
+                }
                 Ok(self.make(tokens::IDENT, CoreYYSTYPE::Str(ident)))
             }
             72 => {
@@ -769,6 +780,29 @@ fn encoding_name(enc: wchar::pg_enc) -> &'static str {
 
 // pg_strtoint32_safe over the matched literal bytes; the DFA guarantees pure
 // ASCII, and soft errors (out of range) yield None.
+/// Tokens that can end an a_expr, so a following `means` is the infix
+/// predicate rather than an identifier. Keyword token codes are the
+/// existing gram.y values; `)` and `]` are the character tokens the
+/// scanner already emits.
+fn token_ends_expr(tok: i32) -> bool {
+    matches!(
+        tok,
+        tokens::IDENT
+            | tokens::UIDENT
+            | tokens::FCONST
+            | tokens::SCONST
+            | tokens::USCONST
+            | tokens::BCONST
+            | tokens::XCONST
+            | tokens::ICONST
+            | tokens::PARAM
+            | tokens::TRUE_P
+            | tokens::FALSE_P
+            | tokens::NULL_P
+    ) || tok == b')' as i32
+        || tok == b']' as i32
+}
+
 fn parse_int32(bytes: &[u8]) -> Option<i32> {
     debug_assert!(bytes.is_ascii());
     // SAFETY: matched decinteger/hexinteger/... text is ASCII by the DFA.

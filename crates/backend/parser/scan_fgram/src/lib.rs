@@ -246,6 +246,11 @@ pub struct Scanner<'mcx> {
     warn_on_first_escape: bool,
     saw_non_ascii: bool,
     yylloc: i32,
+    /// Previous token code, so `MEANS` can be an infix operator after an
+    /// expression and an identifier everywhere else. The bison tables are
+    /// generated from upstream gram.c; a new keyword production would
+    /// renumber the hand-ported actions.
+    prev_token: i32,
 }
 
 // scan.l:1316 addlit grows literalbuf to pg_nextpower2_32(literallen + yleng
@@ -286,6 +291,7 @@ impl<'mcx> Scanner<'mcx> {
             warn_on_first_escape: false,
             saw_non_ascii: false,
             yylloc: 0,
+            prev_token: 0,
         }
     }
 

@@ -439,6 +439,8 @@ pub fn standard_planner<'mcx>(
     }
 
     debug_assert!(run.glob.finalrtable.is_nil());
+    // Lift MEANS quals onto a batch Result before setrefs retargets Vars.
+    let top_plan = rvbbit_plan::lift_semantic_filters(mcx, top_plan)?;
     let top_plan = set_plan_references(&mut run, top_plan)?;
     // ... and the subplans, each under its own root (C's forboth over
     // glob->subplans/glob->subroots, planner.c:561-567). A cell NULLed by an
@@ -451,6 +453,10 @@ pub fn standard_planner<'mcx>(
             core::mem::swap(&mut run.subroots[i].root, &mut run.root);
             let top_tlist =
                 core::mem::replace(&mut run.processed_tlist, run.subroots[i].processed_tlist);
+            let subplan = match subplan {
+                Some(plan) => Some(rvbbit_plan::lift_semantic_filters(mcx, plan)?),
+                None => None,
+            };
             let fixed = crate::setrefs::set_plan_references_opt(&mut run, subplan);
             core::mem::swap(&mut run.subroots[i].root, &mut run.root);
             run.processed_tlist = top_tlist;

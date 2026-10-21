@@ -246,6 +246,13 @@ fn transformAExprOp<'mcx>(
         return transformExprRecurse(mcx, pstate, n);
     }
 
+    // `expr MEANS 'text'` is lexed as the existing Op token. Turn that one
+    // operator name into the built-in semantic predicate. Every other Op
+    // still goes through make_op.
+    if is_means_op(&a.name) {
+        return transform_means(mcx, pstate, a);
+    }
+
     if lexpr.is_some_and(|n| n.node_tag() == NodeTag::T_RowExpr)
         && rexpr.is_some_and(|n| {
             n.as_sub_link()
@@ -289,6 +296,60 @@ fn transformAExprOp<'mcx>(
     let ltypeId = lexpr.map_or(types_core::InvalidOid, expr_type);
     let rtypeId = rexpr.map_or(types_core::InvalidOid, expr_type);
     parse_oper::make_op(mcx, pstate, &a.name, lexpr, rexpr, ltypeId, rtypeId, last_srf, a.location)
+}
+
+fn is_means_op(name: &types_nodes::list::NodeList<'_>) -> bool {
+    name.len() == 1
+        && name.first().and_then(|n| n.as_string()).is_some_and(|s| {
+            s.sval.eq_ignore_ascii_case("means")
+        })
+}
+
+fn transform_means<'mcx>(
+    mcx: Mcx<'mcx>,
+    pstate: &mut ParseState<'_, 'mcx>,
+    a: &A_Expr<'mcx>,
+) -> PgResult<Node<'mcx>> {
+    let lexpr = a.lexpr.ok_or_else(|| means_err("MEANS requires a left operand"))?;
+    let rexpr = a.rexpr.ok_or_else(|| means_err("MEANS requires a right operand"))?;
+    let lexpr = transformExprRecurse(mcx, pstate, lexpr)?;
+    let rexpr = transformExprRecurse(mcx, pstate, rexpr)?;
+    let lexpr = coerce::coerce_to_specific_type(
+        mcx,
+        pstate,
+        lexpr,
+        expr_type(lexpr),
+        a.location,
+        types_core::TEXTOID,
+        "MEANS",
+    )?;
+    let rexpr = coerce::coerce_to_specific_type(
+        mcx,
+        pstate,
+        rexpr,
+        expr_type(rexpr),
+        a.location,
+        types_core::TEXTOID,
+        "MEANS",
+    )?;
+    Node::mk(
+        mcx,
+        types_nodes::primnodes::FuncExpr {
+            funcid: rvbbit_oids::MEANS_OID,
+            funcresulttype: types_core::BOOLOID,
+            funcretset: false,
+            funcvariadic: false,
+            funcformat: types_nodes::primnodes::CoercionForm::COERCE_EXPLICIT_CALL,
+            funccollid: types_core::InvalidOid,
+            inputcollid: types_core::InvalidOid,
+            args: types_nodes::NodeList::make2(mcx, lexpr, rexpr)?,
+            location: a.location,
+        },
+    )
+}
+
+fn means_err(message: &str) -> Box<types_error::PgError> {
+    Box::new(types_error::PgError::error(message.to_string()))
 }
 
 fn transformAExprOpAny<'mcx>(

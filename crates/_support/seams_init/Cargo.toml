@@ -80,6 +80,8 @@ executils = { path = "../../backend/executor/executils" }
 execexpr = { path = "../../backend/executor/execexpr" }
 execjunk = { path = "../../backend/executor/execjunk" }
 execmain = { path = "../../backend/executor/execmain" }
+rvbbit_builtins = { path = "../../rvbbit/rvbbit_builtins" }
+rvbbit_dispatch = { path = "../../rvbbit/rvbbit_dispatch" }
 execscan = { path = "../../backend/executor/execscan" }
 nodeseqscan = { path = "../../backend/executor/nodeseqscan" }
 nodesamplescan = { path = "../../backend/executor/nodesamplescan" }
