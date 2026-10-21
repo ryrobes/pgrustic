@@ -37,6 +37,9 @@ CHAT=${HUTCH_MODEL:-openai/gpt-4o-mini}
 DECISION=${HUTCH_DECISION_MODEL:-typesafe/jev-1.14}
 export HUTCH_MODEL="$CHAT"
 export HUTCH_DECISION_MODEL="$DECISION"
+# Bootstrap's backend "hutch" and rvbbit.calls both use this URL.
+# Without it, calls reads the default port 8099 and the query fails.
+export RVBBIT_HUTCH_URL="http://127.0.0.1:${HUTCH_PORT}"
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
 export PATH="$PG_BIN:$PATH"

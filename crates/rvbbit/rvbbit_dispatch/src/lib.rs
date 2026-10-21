@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use rvbbit_contract::{
     cache_header, client_cache_key_hex, BatchRequest, BatchResponse, CacheKeyParts,
-    CacheLookupRequest, CacheLookupResponse, CacheMode, CallMeter, ItemRequest, Operation,
+    CacheLookupRequest, CacheLookupResponse, CacheMode, CallMeter, DecisionStack, ItemRequest,
+    Operation,
     CONTRACT_VERSION, HEADER_AUTHORIZATION, HEADER_CACHE, HEADER_CONTRACT,
 };
 use rvbbit_oids::POOL_THREADS;
@@ -352,6 +353,7 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
                     Some(ep.label_descriptions.clone())
                 }
             },
+            extract_mode: None,
         });
     }
     let req = BatchRequest {
@@ -361,13 +363,28 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
         temperature: ep.temperature,
         max_tokens: ep.max_tokens,
         items: req_items,
-        decision: None,
+        decision: noul_stack(ep, operation),
     };
     serde_json::to_string(&req).map_err(|e| format!("hutch encode: {e}"))
 }
 
 /// Fold a non-empty label set into the schema string that the cache key
 /// already hashes. Empty labels leave the schema unchanged.
+/// A function or operator `THRESHOLD` becomes the noul cutoff. Absent
+/// keeps the hutch server default. Classify and extract ignore it.
+fn noul_stack(ep: &Endpoint, operation: Operation) -> Option<DecisionStack> {
+    if !matches!(operation, Operation::Predict | Operation::Decide) {
+        return None;
+    }
+    let threshold = ep.threshold?;
+    Some(DecisionStack {
+        models: Vec::new(),
+        takes: None,
+        combine: None,
+        threshold: Some(threshold),
+    })
+}
+
 fn return_schema(ep: &Endpoint) -> String {
     if ep.labels.is_empty() {
         return ep.return_type.clone();
@@ -430,6 +447,7 @@ pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
             "items": meter.items,
             "tenant": meter.tenant,
             "generation_id": meter.generation_id,
+            "score": meter.score,
             "ts": meter.timestamp,
         }));
     }

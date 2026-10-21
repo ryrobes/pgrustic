@@ -153,6 +153,7 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
         prompt: None,
         labels: None,
         label_descriptions: None,
+        extract_mode: None,
     }
 }
 
@@ -200,6 +201,8 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
         "not json at all".to_string()
     } else if text.contains("JSON_CASE") {
         "{\"creature\":\"sasquatch\",\"confidence\":0.8}".into()
+    } else if text.contains("PLAIN_CASE") {
+        "sasquatch".into()
     } else if text.contains("FREEFORM") {
         "forest".into()
     } else if text.contains("FALSE_CASE") {
@@ -419,6 +422,27 @@ fn predict_extract_cache_and_errors() {
     extract.items[0].key = "e".into();
     let got = post(&format!("{}/v1/extract", h.hutch), "read-write", &extract);
     assert_eq!(got.outputs[0].value.as_ref().unwrap()["creature"], "sasquatch");
+
+    let mut scalar = predict("PLAIN_CASE", "ignored");
+    scalar.operation = Operation::Extract;
+    scalar.items[0].key = "s".into();
+    scalar.items[0].extract_mode = Some("scalar".into());
+    let plain = post(&format!("{}/v1/extract", h.hutch), "read-write", &scalar);
+    assert_eq!(plain.outputs[0].value, Some(serde_json::json!("sasquatch")));
+    assert!(plain.outputs[0].error.is_none(), "{:?}", plain.outputs[0].error);
+    let before_scalar = h.provider_hits.load(Ordering::SeqCst);
+    let again = post(&format!("{}/v1/extract", h.hutch), "read-write", &scalar);
+    assert_eq!(again.outputs[0].value, Some(serde_json::json!("sasquatch")));
+    assert_eq!(
+        h.provider_hits.load(Ordering::SeqCst),
+        before_scalar,
+        "a scalar extract answer is cached"
+    );
+    let mut as_json = scalar.clone();
+    as_json.items[0].extract_mode = None;
+    as_json.items[0].cache_key = format!("{}json", as_json.items[0].cache_key);
+    let rejected = post(&format!("{}/v1/extract", h.hutch), "off", &as_json);
+    assert_eq!(rejected.outputs[0].error.as_ref().unwrap().code, "parse");
 
     let mut bad = extract.clone();
     bad.items[0] = item("BAD_JSON", None);

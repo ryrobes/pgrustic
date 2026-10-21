@@ -109,7 +109,7 @@ pub fn summarize_produced(calls: &[CallMeter]) -> (Option<f64>, String, Option<S
 
 pub fn meter_log_line(meter: &CallMeter, api_key: &str) -> String {
     let line = format!(
-        "hutch_call ts={} op={} model={} tokens_in={} tokens_out={} cost_usd={} cost_saved_usd={} provider_latency_ms={} latency_ms={} cache={} items={} tenant={} generation_id={}",
+        "hutch_call ts={} op={} model={} tokens_in={} tokens_out={} cost_usd={} cost_saved_usd={} provider_latency_ms={} latency_ms={} cache={} items={} tenant={} generation_id={} score={}",
         meter.timestamp,
         log_token(&meter.op),
         log_token(&meter.model),
@@ -123,6 +123,7 @@ pub fn meter_log_line(meter: &CallMeter, api_key: &str) -> String {
         meter.items,
         log_token(&meter.tenant),
         meter.generation_id.as_deref().map(log_token).unwrap_or_else(|| "-".into()),
+        opt_f64(meter.score),
     );
     redact_key(&line, api_key)
 }
@@ -287,6 +288,7 @@ mod tests {
             tenant: "local".into(),
             timestamp: "2026-10-21T00:00:00.000Z".into(),
             generation_id: None,
+            score: None,
         };
         let line = meter_log_line(&meter, "sk-secret");
         assert!(line.starts_with("hutch_call "));

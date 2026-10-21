@@ -146,6 +146,12 @@ pub struct ItemRequest {
     /// description is empty, so label-only cache keys stay put.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_descriptions: Option<Vec<String>>,
+    /// Extract decode. Absent or `json` requires a JSON value (catalog
+    /// EXTRACT). `scalar` accepts a JSON scalar or plain text and stores
+    /// the text as a string. Not part of the client cache key: callers
+    /// that change the mode also change the prompt, which is hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -224,6 +230,10 @@ pub struct CallMeter {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
+    /// Yes-probability for a noul call, or the winning label's
+    /// probability for a choice call. Absent on chat and on errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

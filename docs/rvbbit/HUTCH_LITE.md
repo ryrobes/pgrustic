@@ -149,3 +149,43 @@ Fake-endpoint tests (no key, no network provider):
 ```bash
 cargo test -p rvbbit_hutch_lite
 ```
+
+## Cutoff and extract mode
+
+`HUTCH_DECISION_THRESHOLD` (default 0.5) is the noul cutoff when a function
+does not set one. Broad criteria such as "a sound, a dark shape, or any
+unusual event" score about 0.92–0.98, so 0.5 matches them. Set a higher
+cut on the function or the operator:
+
+```sql
+CREATE SEMANTIC FUNCTION means(text text, criterion text) RETURNS boolean
+  MODEL jev PROMPT $$Does the text match the criterion?$$ THRESHOLD 0.97;
+CREATE SEMANTIC OPERATOR means (
+  LEFTARG = text, RIGHTARG = text, FUNCTION = means, THRESHOLD = 0.97
+);
+```
+
+The operator value wins when both are set. Absent means the server
+default. The first `ensure` also creates `about` as a copy of `means`
+with `THRESHOLD 0.9`. 0.9 still matches a criterion that scores 0.92, so
+raise it when a loose predicate should reject those rows. Replacing
+`means` does not refresh `about`.
+
+Catalog `EXTRACT` still requires JSON. `extract_mode = scalar` on an
+item accepts a JSON scalar or plain text and caches that string. A JSON
+object stays an error in scalar mode.
+
+`rvbbit.calls` reads each distinct hutch URL once. Two backends that
+share a URL do not duplicate the log. The live demo exports
+`RVBBIT_HUTCH_URL` so that read is the demo hutch, not port 8099.
+
+Decision calls record `score` (the noul, or the winning choice
+probability) on the call log and in `hutch_call` lines.
+
+The trimmed noul JSON for the fixed six-row fixture, criterion
+`a large hairy biped was seen`, prompt `Does the text match the
+criterion?`, model `typesafe/jev-1.14`, is 72–79 rough tokens and
+202–240 bytes (`rough_tokens` counts words plus punctuation). Row 1 is
+79 tokens and 240 bytes, down from the old 125-token body. Live
+provider `input_tokens` of 291–379 include Jev's own prompt on top of
+this JSON. That wrapper is not in the request we post.
