@@ -132,7 +132,8 @@ fn reload() -> PgResult<()> {
                 COALESCE(b.batch_size, 32)::text, COALESCE(b.max_concurrent, 4)::text, \
                 COALESCE(b.timeout_ms, 30000)::text, COALESCE(b.retries, 5)::text, \
                 COALESCE(f.cache_mode, 'memoize'), COALESCE(f.labels, ''), \
-                COALESCE(o.threshold, f.threshold)::text \
+                COALESCE(o.threshold, f.threshold)::text, \
+                COALESCE(f.clauses, '') \
          FROM rvbbit.semfn f \
          LEFT JOIN rvbbit.semop o ON o.func_name = f.name \
          LEFT JOIN rvbbit.model m ON m.name = f.model_name \
@@ -185,6 +186,7 @@ fn reload() -> PgResult<()> {
                 label_descriptions,
                 threshold: cell_opt(&r, 18).and_then(|s| s.parse().ok()),
                 extract_mode: None,
+                default_clauses: cell_opt(&r, 19),
             },
         });
     }
@@ -250,6 +252,7 @@ fn load_trees() -> PgResult<()> {
                 label_descriptions: Vec::new(),
                 threshold: None,
                 extract_mode: None,
+                default_clauses: None,
             },
         });
     }
@@ -434,7 +437,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
         "argnames = {an}, argtypes = {at}, rettype = {rt}, model_name = {model}, \
          system_prompt = {sys}, user_prompt = {prompt}, max_tokens = {max}, temperature = {temp}, \
          cache_mode = {cache}, tests = {tests}, procoid = {procoid}, version = {version_sql}, \
-         labels = {labels}, threshold = {threshold}",
+         labels = {labels}, threshold = {threshold}, clauses = {clauses}",
         an = text_array(&args.iter().map(|a| a.name.clone()).collect::<Vec<_>>()),
         at = text_array(&args.iter().map(|a| a.typ.clone()).collect::<Vec<_>>()),
         rt = qlit(returns),
@@ -447,6 +450,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
         tests = tests,
         labels = labels_sql(&clauses.labels, &clauses.label_descriptions),
         threshold = opt_f64(clauses.threshold),
+        clauses = opt_text(&clauses.clauses),
     );
     let oid = if let Some(oid) = existing {
         clear_deps("semfn", &oid)?;
@@ -455,8 +459,8 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
     } else {
         let oid = next_oid()?;
         exec(&format!(
-            "INSERT INTO rvbbit.semfn (oid, name, nsp, argnames, argtypes, rettype, model_name, system_prompt, user_prompt, max_tokens, temperature, cache_mode, tests, procoid, owner_name, version, labels, threshold) \
-             VALUES ({oid}, {name}, 'rvbbit', {an}, {at}, {rt}, {model}, {sys}, {prompt}, {max}, {temp}, {cache}, {tests}, {procoid}, current_user, {ver}, {labels}, {threshold})",
+            "INSERT INTO rvbbit.semfn (oid, name, nsp, argnames, argtypes, rettype, model_name, system_prompt, user_prompt, max_tokens, temperature, cache_mode, tests, procoid, owner_name, version, labels, threshold, clauses) \
+             VALUES ({oid}, {name}, 'rvbbit', {an}, {at}, {rt}, {model}, {sys}, {prompt}, {max}, {temp}, {cache}, {tests}, {procoid}, current_user, {ver}, {labels}, {threshold}, {clauses})",
             name = qlit(name),
             an = text_array(&args.iter().map(|a| a.name.clone()).collect::<Vec<_>>()),
             at = text_array(&args.iter().map(|a| a.typ.clone()).collect::<Vec<_>>()),
@@ -471,6 +475,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
             ver = clauses.version.unwrap_or(1),
             labels = labels_sql(&clauses.labels, &clauses.label_descriptions),
             threshold = opt_f64(clauses.threshold),
+            clauses = opt_text(&clauses.clauses),
         ))?;
         oid
     };
@@ -999,6 +1004,9 @@ fn ensure_schema() -> PgResult<()> {
     if !catalog_column("semop", "threshold")? {
         exec("ALTER TABLE rvbbit.semop ADD COLUMN IF NOT EXISTS threshold float8")?;
     }
+    if !catalog_column("semfn", "clauses")? {
+        exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS clauses text")?;
+    }
     // rvbbit.calls is a view over the live hutch log. Clusters created
     // before it already have dump_sql, so this is not part of FUNCTION_DDL.
     if scalar(
@@ -1019,7 +1027,7 @@ fn ensure_schema() -> PgResult<()> {
     .is_none()
     {
         exec(CALLS_VIEW)?;
-    } else if !catalog_column("calls", "node")? || !catalog_column("calls", "score")? {
+    } else if !catalog_column("calls", "node")? || !catalog_column("calls", "score")? || !catalog_column("calls", "identical")? {
         exec(CALLS_VIEW)?;
     }
     if scalar(
@@ -1049,6 +1057,11 @@ fn ensure_schema() -> PgResult<()> {
             "extract_typed",
             "kind text, input text, fallback text",
             "rvbbit_extract_typed",
+        ),
+        (
+            "apply_clauses",
+            "kind text, input text, extra text, clauses text",
+            "rvbbit_apply_clauses",
         ),
     ] {
         if scalar(&format!(
@@ -1125,6 +1138,7 @@ const SCHEMA_DDL: &[&str] = &[
         version int NOT NULL DEFAULT 1,
         labels text,
         threshold float8,
+        clauses text,
         UNIQUE (nsp, name))",
     "CREATE TABLE IF NOT EXISTS rvbbit.semop (
         oid oid PRIMARY KEY,
@@ -1184,12 +1198,13 @@ const SCHEMA_DDL: &[&str] = &[
 const CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.calls AS \
     SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
            latency_ms, provider_latency_ms, cache, items, tenant, \
-           generation_id, node, score, ts::timestamptz AS ts \
+           generation_id, node, score, identical, ts::timestamptz AS ts \
     FROM json_to_recordset(rvbbit.call_log()::json) AS r( \
         op text, model text, tokens_in bigint, tokens_out bigint, \
         cost float8, cost_saved float8, latency_ms float8, \
         provider_latency_ms float8, cache text, items int, \
-        tenant text, generation_id text, node text, score float8, ts text)";
+        tenant text, generation_id text, node text, score float8, \
+        identical boolean, ts text)";
 
 const FUNCTION_DDL: &[&str] = &[
     "CREATE OR REPLACE FUNCTION rvbbit.dump_sql() RETURNS text
@@ -1260,7 +1275,7 @@ fn render_dump() -> PgResult<String> {
     let fns = query(
         "SELECT name, argnames::text, argtypes::text, rettype, model_name, system_prompt, user_prompt, \
                 max_tokens::text, temperature::text, cache_mode, tests, version::text, labels, \
-                threshold::text, comment \
+                threshold::text, comment, clauses \
          FROM rvbbit.semfn WHERE nsp = 'rvbbit' ORDER BY name",
     )?;
     for r in &fns {
@@ -1414,6 +1429,9 @@ fn render_function(r: &[Option<String>]) -> String {
         for line in tests.lines() {
             s.push_str(&format!(" TEST {line}"));
         }
+    }
+    if let Some(tail) = cell_opt(r, 15) {
+        s.push_str(&format!(" DEFAULT CLAUSES ({})", dollar(&tail)));
     }
     s.push_str(&format!(" VERSION {};", cell(r, 11)));
     s

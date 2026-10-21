@@ -606,6 +606,8 @@ fn decision_stack_alias_and_classify() {
         takes: None,
         combine: Some("mean".into()),
         threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
     });
     let got = post(&format!("{}/v1/predict", h.hutch), "off", &mean);
     assert_eq!(got.outputs[0].value, Some(serde_json::json!(true)));
@@ -630,6 +632,8 @@ fn decision_stack_alias_and_classify() {
         takes: Some(3),
         combine: Some("mean".into()),
         threshold: Some(0.5),
+        phrasings: Vec::new(),
+        pick: None,
     });
     let before = h.provider_hits.load(Ordering::SeqCst);
     let thrice = post(&format!("{}/v1/predict", h.hutch), "off", &repeats);
@@ -721,6 +725,8 @@ fn decision_stack_alias_and_classify() {
         takes: Some(1),
         combine: None,
         threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
     });
     let averaged = post(&format!("{}/v1/classify", h.hutch), "off", &stacked);
     assert_eq!(averaged.outputs[0].value, Some(serde_json::json!("bigfoot")));

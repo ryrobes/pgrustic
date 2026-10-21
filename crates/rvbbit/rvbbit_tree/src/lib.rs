@@ -27,6 +27,8 @@ pub struct AskReq {
     /// `vote` is the backend's majority bool.
     pub combine: String,
     pub threshold: f64,
+    pub takes: Option<u32>,
+    pub phrasings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +46,8 @@ pub struct ChoiceReq {
     pub meanings: Vec<String>,
     pub models: Vec<String>,
     pub combine: String,
+    pub takes: Option<u32>,
+    pub phrasings: Vec<String>,
 }
 
 pub trait Decisions {
@@ -80,6 +84,8 @@ enum Node {
         threshold: f64,
         using: Vec<String>,
         combine: String,
+        takes: Option<u32>,
+        phrasings: Vec<String>,
         yes: usize,
         no: usize,
     },
@@ -88,6 +94,8 @@ enum Node {
         question: String,
         using: Vec<String>,
         combine: String,
+        takes: Option<u32>,
+        phrasings: Vec<String>,
         arms: Vec<(String, String, usize)>,
     },
     Leaf {
@@ -210,6 +218,8 @@ fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> R
             threshold,
             using,
             combine,
+            takes,
+            phrasings,
             yes,
             no,
         } => {
@@ -220,6 +230,8 @@ fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> R
                 models: using.clone(),
                 combine: combine.clone(),
                 threshold: *threshold,
+                takes: *takes,
+                phrasings: phrasings.clone(),
             })?;
             ans.into_iter()
                 .map(|a| {
@@ -235,6 +247,8 @@ fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> R
             question,
             using,
             combine,
+            takes,
+            phrasings,
             arms,
         } => {
             let labels: Vec<String> = arms.iter().map(|(l, _, _)| l.clone()).collect();
@@ -247,6 +261,8 @@ fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> R
                 meanings,
                 models: using.clone(),
                 combine: combine.clone(),
+                takes: *takes,
+                phrasings: phrasings.clone(),
             })?;
             chosen
                 .into_iter()
@@ -330,6 +346,8 @@ fn build_into(v: &Value, nodes: &mut Vec<Node>, fallback_id: &str) -> Result<usi
                 threshold,
                 using: string_list(v.get("using")),
                 combine: combine_of(v),
+                takes: v.get("takes").and_then(|n| n.as_u64()).map(|n| n as u32),
+                phrasings: string_list(v.get("phrasings")),
                 yes,
                 no,
             };
@@ -374,6 +392,8 @@ fn build_into(v: &Value, nodes: &mut Vec<Node>, fallback_id: &str) -> Result<usi
                 question,
                 using: string_list(v.get("using")),
                 combine: combine_of(v),
+                takes: v.get("takes").and_then(|n| n.as_u64()).map(|n| n as u32),
+                phrasings: string_list(v.get("phrasings")),
                 arms,
             };
             Ok(idx)

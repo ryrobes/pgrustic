@@ -40,6 +40,9 @@ pub const EXTRACT_TYPED_OID: u32 = 9030;
 /// `rvbbit_classify_enum(text, text, text) -> text`. Native
 /// `CLASSIFY(x AS enum)`.
 pub const CLASSIFY_ENUM_OID: u32 = 9031;
+/// `rvbbit_apply_clauses(text, text, text, text) -> text`.
+/// Clause tail on a semantic call. The SQL result is a JSON report.
+pub const APPLY_CLAUSES_OID: u32 = 9032;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -52,6 +55,7 @@ pub const DECIDE_NAME: &str = "rvbbit_decide";
 pub const CLASSIFY_LABELS_NAME: &str = "rvbbit_classify_labels";
 pub const EXTRACT_TYPED_NAME: &str = "rvbbit_extract_typed";
 pub const CLASSIFY_ENUM_NAME: &str = "rvbbit_classify_enum";
+pub const APPLY_CLAUSES_NAME: &str = "rvbbit_apply_clauses";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

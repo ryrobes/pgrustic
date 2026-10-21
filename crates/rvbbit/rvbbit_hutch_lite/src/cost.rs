@@ -291,6 +291,7 @@ mod tests {
             generation_id: None,
             node: None,
             score: None,
+            identical: None,
             payload: None,
         };
         let line = meter_log_line(&meter, "sk-secret");

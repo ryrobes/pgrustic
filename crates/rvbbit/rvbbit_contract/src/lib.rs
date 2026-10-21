@@ -86,9 +86,9 @@ pub fn cache_header(mode: CacheMode, key_hex: Option<&str>, ttl_secs: Option<u64
 
 /// Optional stack of decision-model calls for `predict`, `decide`, and
 /// fixed-label `classify`. Absent means one call to `model` (or the
-/// server default). The SQL parser does not emit this yet; TAKES stays
-/// unimplemented until M5. A decision-tree node with `USING (...) COMBINE`
-/// fills this. Hutch-lite honors it when a client sends it.
+/// server default). A decision-tree node with `USING (...) COMBINE`,
+/// `TAKES`, or `PHRASINGS` fills this. Hutch-lite honors it when a
+/// client sends it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DecisionStack {
     /// Model slugs, in order. Empty means the request `model`.
@@ -103,6 +103,13 @@ pub struct DecisionStack {
     /// Cut for a boolean. Absent means the server default (0.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f64>,
+    /// Extra phrasings of the same question. Empty means the item prompt
+    /// once. Each phrasing is another decision call, then `combine`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phrasings: Vec<String>,
+    /// `mean`, `vote`, `consensus`, `judge`, or `first`. Absent means `combine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -192,6 +199,11 @@ pub struct ItemResponse {
     pub calls: Option<Vec<CallMeter>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ItemError>,
+    /// True when two or more takes of the same model returned the same
+    /// score. A deterministic model (Jev) sets this. Absent when the
+    /// item was a single take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identical_takes: Option<bool>,
 }
 
 /// One provider call, or a cache hit that avoided one.
@@ -236,6 +248,10 @@ pub struct CallMeter {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
+    /// True when this call was one of several same-model takes that
+    /// agreed. Absent on a single take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identical: Option<bool>,
     /// Decision-tree node that caused this call. Absent for MEANS,
     /// classify, and extract.
     #[serde(default, skip_serializing_if = "Option::is_none")]

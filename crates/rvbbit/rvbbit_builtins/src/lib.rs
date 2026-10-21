@@ -6,12 +6,11 @@
 
 use datum::Datum;
 use rvbbit_oids::{
-    CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_ENUM_NAME, CLASSIFY_ENUM_OID, CLASSIFY_LABELS_NAME,
-    CLASSIFY_LABELS_OID, CLASSIFY_NAME, CLASSIFY_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME,
-    DUMP_OID, EXTRACT_NAME,
-    EXTRACT_OID, EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME,
-    MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID,
-    RESTORE_NAME, RESTORE_OID,
+    APPLY_CLAUSES_NAME, APPLY_CLAUSES_OID, CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_ENUM_NAME,
+    CLASSIFY_ENUM_OID, CLASSIFY_LABELS_NAME, CLASSIFY_LABELS_OID, CLASSIFY_NAME, CLASSIFY_OID,
+    DECIDE_NAME, DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_NAME, EXTRACT_OID, EXTRACT_TYPED_NAME,
+    EXTRACT_TYPED_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME,
+    MEANS_SCORE_OID, RESTORE_NAME, RESTORE_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -216,6 +215,18 @@ pub fn rvbbit_extract_typed(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo)
     }
 }
 
+/// Clause tail. `clauses` is the postfix text (`WITH TAKES 3 PICK BY VOTE`).
+/// The result is JSON `{winner, score, retries, identical, fallback}`.
+pub fn rvbbit_apply_clauses(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let kind = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let input = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let extra = arg_text(fcinfo, 2)?.unwrap_or_default();
+    let tail = arg_text(fcinfo, 3)?.unwrap_or_default();
+    let text = rvbbit_dispatch::apply_clauses_text(&kind, &input, &extra, &tail)?;
+    text_datum(fcinfo, &text)
+}
+
 fn arg_text(fcinfo: &Fcinfo, index: usize) -> PgResult<Option<String>> {
     if fcinfo.argisnull(index) {
         return Ok(None);
@@ -396,5 +407,13 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: false,
         retset: false,
         func: rvbbit_extract_typed as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: APPLY_CLAUSES_OID,
+        name: APPLY_CLAUSES_NAME,
+        nargs: 4,
+        strict: false,
+        retset: false,
+        func: rvbbit_apply_clauses as PGFunction,
     },
 ];

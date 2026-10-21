@@ -30,6 +30,7 @@ use rvbbit_oids::POOL_THREADS;
 use rvbbit_resolve::Endpoint;
 use types_error::{PgError, PgResult};
 
+pub mod clauses;
 mod memo;
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
@@ -172,8 +173,25 @@ pub fn define_gucs() {
         PGC_USERSET,
         0,
     );
+    // Call clause wins, then the function DEFAULT CLAUSES, then these.
+    // Empty string means "unset" so a higher tier can fill the field.
+    for (name, desc) in [
+        ("semantic.model", "Default decision model slug."),
+        ("semantic.takes", "Default takes per model."),
+        ("semantic.temperature", "Default sampling temperature."),
+        ("semantic.max_tokens", "Default max tokens."),
+        ("semantic.pick", "Default reducer: vote, mean score, consensus, judge, or first valid."),
+        ("semantic.timeout", "Default clause timeout, in seconds."),
+        ("semantic.budget", "Session USD cap. A wave that would pass it aborts."),
+        ("semantic.retry", "Default RETRY count."),
+        ("semantic.threshold", "Default noul cutoff."),
+    ] {
+        let _ = guc::DefineCustomStringVariable(name, Some(desc), None, Some(""), PGC_USERSET, 0);
+    }
     guc::MarkGUCPrefixReserved("semantic");
-    memo::set_guc_reader(|name| guc::GetConfigOption(name, true, false).ok().flatten());
+    let read = |name: &str| guc::GetConfigOption(name, true, false).ok().flatten();
+    memo::set_guc_reader(read);
+    clauses::set_guc_reader(read);
 }
 
 /// Clear the per-query memo. Executor start calls this.
@@ -629,6 +647,7 @@ fn prepare_batch(ep: &Endpoint, url: &str, body: &str, header: &str) -> PgResult
                             scores: None,
                             calls: None,
                             error: None,
+                            identical_takes: None,
                         });
                     }
                 }
@@ -824,6 +843,8 @@ fn noul_stack(ep: &Endpoint, operation: Operation) -> Option<DecisionStack> {
         takes: None,
         combine: None,
         threshold: Some(threshold),
+        phrasings: Vec::new(),
+        pick: None,
     })
 }
 
@@ -891,6 +912,7 @@ pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
             "generation_id": meter.generation_id,
             "node": meter.node,
             "score": meter.score,
+            "identical": meter.identical,
             "ts": meter.timestamp,
         }));
     }
@@ -1083,6 +1105,8 @@ impl Decisions for HutchTree<'_> {
             &req.models,
             &req.combine,
             Some(req.threshold),
+            req.takes,
+            &req.phrasings,
         )?;
         let raw = post_tree(self.ep, "predict", body)?;
         self.http_calls = self.http_calls.saturating_add(raw.http_calls);
@@ -1101,6 +1125,8 @@ impl Decisions for HutchTree<'_> {
             &req.models,
             &req.combine,
             None,
+            req.takes,
+            &req.phrasings,
         )?;
         let raw = post_tree(self.ep, "classify", body)?;
         self.http_calls = self.http_calls.saturating_add(raw.http_calls);
@@ -1132,6 +1158,8 @@ fn encode_tree_items(
     models: &[String],
     combine: &str,
     threshold: Option<f64>,
+    takes: Option<u32>,
+    phrasings: &[String],
 ) -> Result<String, String> {
     let mut req_items = Vec::with_capacity(inputs.len());
     for (i, input) in inputs.iter().enumerate() {
@@ -1151,6 +1179,12 @@ fn encode_tree_items(
         }
         if !combine.is_empty() {
             opts["combine"] = serde_json::json!(combine);
+        }
+        if let Some(n) = takes {
+            opts["takes"] = serde_json::json!(n);
+        }
+        if !phrasings.is_empty() {
+            opts["phrasings"] = serde_json::json!(phrasings);
         }
         let cache_key = client_cache_key_hex(&CacheKeyParts {
             fn_name: &ep.fn_name,
@@ -1185,7 +1219,13 @@ fn encode_tree_items(
             extract_mode: None,
         });
     }
-    let stacked = !models.is_empty() || combine == "vote" || threshold.is_some_and(|t| (t - 0.5).abs() > 1e-9);
+    let guc = clauses::guc_clauses();
+    let takes = takes.or(guc.takes);
+    let stacked = !models.is_empty()
+        || combine == "vote"
+        || threshold.is_some_and(|t| (t - 0.5).abs() > 1e-9)
+        || takes.is_some_and(|n| n > 1)
+        || !phrasings.is_empty();
     let req = BatchRequest {
         contract: CONTRACT_VERSION.to_string(),
         operation,
@@ -1195,9 +1235,11 @@ fn encode_tree_items(
         items: req_items,
         decision: stacked.then(|| DecisionStack {
             models: models.to_vec(),
-            takes: None,
+            takes,
             combine: (combine == "vote").then(|| "vote".to_string()),
             threshold,
+            phrasings: phrasings.to_vec(),
+            pick: None,
         }),
     };
     serde_json::to_string(&req).map_err(|e| format!("hutch encode: {e}"))
@@ -1275,6 +1317,212 @@ pub fn forget_decide(keys: &[(String, String)]) {
     for key in keys {
         memo.remove(key);
     }
+}
+
+/// Clause tail. One hutch batch is a wave: takes, models, and phrasings
+/// fan out inside that batch. `RETRY` sends another wave. `FALLBACK`
+/// redispatches once. `BUDGET` aborts when this session's recorded USD
+/// would pass the cap. The text is a JSON report.
+pub fn apply_clauses_text(kind: &str, input: &str, extra: &str, tail: &str) -> PgResult<String> {
+    let call = clauses::parse_tail(tail).map_err(pg)?;
+    let ep = decision_endpoint();
+    let function = ep
+        .default_clauses
+        .as_deref()
+        .map(|s| clauses::parse_tail(s).unwrap_or_default())
+        .unwrap_or_default();
+    let merged = clauses::merge(call, &function, &clauses::guc_clauses());
+    if let Some(cond) = &merged.check_input {
+        let ok = match cond {
+            clauses::Cond::LenGte(n) => input.chars().count() >= *n,
+            clauses::Cond::NonEmpty => !input.is_empty(),
+            clauses::Cond::ScoreGte(_) | clauses::Cond::ScoreLt(_) => true,
+        };
+        if !ok {
+            return Err(pg("CHECK INPUT failed"));
+        }
+    }
+    let mut retries = 0u32;
+    let limit = merged.retry.unwrap_or(0);
+    let mut fallback_used = false;
+    loop {
+        let model = if fallback_used { merged.fallback.clone() } else { merged.model.clone() };
+        let hit = post_clause(&ep, kind, input, extra, &merged, model.as_deref())?;
+        if let Some(cost) = hit.cost {
+            clauses::add_spent(cost);
+        }
+        if let Some(budget) = merged.budget {
+            if clauses::spent() > budget + 1e-12 {
+                return Err(pg(format!(
+                    "semantic budget exceeded ({:.6} > {budget})",
+                    clauses::spent()
+                )));
+            }
+        }
+        if let Some(message) = hit.error {
+            if merged.fallback.is_some() && !fallback_used {
+                fallback_used = true;
+                continue;
+            }
+            return Err(pg(message));
+        }
+        let score = hit.score.unwrap_or(0.0);
+        let output_ok = merged.check_output.as_ref().is_none_or(|cond| match cond {
+            clauses::Cond::ScoreGte(n) => score >= *n,
+            clauses::Cond::ScoreLt(n) => score < *n,
+            clauses::Cond::NonEmpty => !hit.value.is_empty(),
+            clauses::Cond::LenGte(n) => hit.value.len() >= *n,
+        });
+        let until_ok = merged.until.as_ref().is_none_or(|cond| match cond {
+            clauses::Cond::ScoreGte(n) => score >= *n,
+            clauses::Cond::ScoreLt(n) => score < *n,
+            clauses::Cond::NonEmpty => !hit.value.is_empty(),
+            clauses::Cond::LenGte(_) => true,
+        });
+        let ok = output_ok && until_ok;
+        if ok || retries >= limit {
+            if !ok {
+                return Err(pg("RETRY exhausted"));
+            }
+            let report = serde_json::json!({
+                "winner": hit.value,
+                "score": hit.score,
+                "retries": retries,
+                "identical": hit.identical,
+                "fallback": fallback_used,
+            });
+            return Ok(report.to_string());
+        }
+        retries += 1;
+    }
+}
+
+struct ClauseHit {
+    value: String,
+    score: Option<f64>,
+    cost: Option<f64>,
+    identical: Option<bool>,
+    error: Option<String>,
+}
+
+fn post_clause(
+    ep: &Endpoint,
+    kind: &str,
+    input: &str,
+    extra: &str,
+    merged: &clauses::Clauses,
+    model: Option<&str>,
+) -> PgResult<ClauseHit> {
+    let mut ep = ep.clone();
+    if let Some(model) = model {
+        if !model.is_empty() && model != "default" {
+            ep.model = model.to_string();
+        }
+    }
+    if let Some(t) = merged.temperature {
+        ep.temperature = t;
+    }
+    if let Some(n) = merged.max_tokens {
+        ep.max_tokens = Some(n);
+    }
+    if let Some(t) = merged.threshold {
+        ep.threshold = Some(t);
+    }
+    if let Some(cache) = merged.cache.as_deref() {
+        ep.cache_mode = match cache {
+            "off" => "off".into(),
+            "refresh" => "refresh".into(),
+            _ => "memoize".into(),
+        };
+    }
+    let (op, operation) = match kind {
+        "classify" => ("classify", Operation::Classify),
+        "extract" => ("extract", Operation::Extract),
+        _ => ("predict", Operation::Predict),
+    };
+    if kind == "classify" {
+        let labels: Vec<String> = extra.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        if labels.len() >= 2 {
+            ep.labels = labels;
+        }
+    }
+    let inputs = match kind {
+        "classify" => serde_json::json!({ "input": input }),
+        "extract" => serde_json::json!({ "input": input }),
+        _ => serde_json::json!({ "input": input, "criterion": extra }),
+    };
+    if kind == "extract" {
+        ep = typed_extract_endpoint(extra);
+        if let Some(t) = merged.temperature {
+            ep.temperature = t;
+        }
+    }
+    let body = encode_items(&ep, operation, &[inputs]).map_err(pg)?;
+    let mut req: BatchRequest = serde_json::from_str(&body).map_err(|e| pg(e.to_string()))?;
+    let models = if merged.across.is_empty() {
+        if ep.model.is_empty() { Vec::new() } else { vec![ep.model.clone()] }
+    } else {
+        merged.across.clone()
+    };
+    let combine = match merged.pick {
+        Some(clauses::Pick::Vote) => Some("vote".to_string()),
+        _ => merged.pick.map(|_| "mean".to_string()),
+    };
+    if merged.takes.is_some() || !models.is_empty() || !merged.phrasings.is_empty() || combine.is_some() {
+        req.decision = Some(DecisionStack {
+            models,
+            takes: merged.takes,
+            combine,
+            threshold: merged.threshold.or(ep.threshold),
+            phrasings: merged.phrasings.clone(),
+            pick: None,
+        });
+    }
+    if !merged.phrasings.is_empty() {
+        for item in &mut req.items {
+            item.prompt = merged.phrasings.first().cloned();
+        }
+    }
+    let body = serde_json::to_string(&req).map_err(|e| pg(e.to_string()))?;
+    let raw = post_op(&ep, op, body)?;
+    decode_clause(&raw.body).map_err(pg)
+}
+
+fn decode_clause(text: &str) -> Result<ClauseHit, String> {
+    let parsed = parsed_batch(text)?;
+    let item = parsed.outputs.first().ok_or("hutch returned no items")?;
+    if let Some(err) = &item.error {
+        return Ok(ClauseHit {
+            value: String::new(),
+            score: None,
+            cost: None,
+            identical: None,
+            error: Some(format!("{} {}", err.code, err.message)),
+        });
+    }
+    let value = match &item.value {
+        Some(serde_json::Value::Bool(v)) => v.to_string(),
+        Some(serde_json::Value::String(v)) => v.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    let mut cost = 0.0;
+    let mut saw = false;
+    if let Some(calls) = &item.calls {
+        for call in calls {
+            if let Some(usd) = call.cost_usd {
+                cost += usd;
+                saw = true;
+            }
+        }
+    }
+    Ok(ClauseHit {
+        value,
+        score: item.score,
+        cost: saw.then_some(cost),
+        identical: item.identical_takes,
+        error: None,
+    })
 }
 
 /// A value the project batcher already computed, or the item error the

@@ -185,5 +185,6 @@ pub fn hit_response(key: &str, hit: &MemoHit) -> ItemResponse {
         scores: None,
         calls: None,
         error: None,
+        identical_takes: None,
     }
 }

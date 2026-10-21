@@ -68,10 +68,14 @@ are free; the charge is input tokens of the state and the criteria.
 A binary-only model would need three `noul` calls per row and then
 argmax. That fallback is not implemented.
 
-`TAKES` / `PICK` are not in the demo. The parser still rejects them until
-milestone M5. A client can still send `decision.models` / `decision.takes`
-(cap 8). Embed and rerank are per-item `unsupported`. Decide is the same
-`noul` path as predict.
+`TAKES`, `PHRASINGS`, and `PICK` are clause tails. A call-site clause
+wins over `DEFAULT CLAUSES` on the function, which wins over the
+`semantic.*` GUCs. The reducer runs in dispatch (Reduce, RetryWave,
+CHECK, FALLBACK, BUDGET). Hutch fans takes, models, and phrasings out
+inside one batch. Same-model takes that return the same score set
+`identical` on the call row. `semantic.budget` aborts the session when
+`rvbbit.calls` cost would pass the cap. Embed and rerank are per-item
+`unsupported`. Decide is the same `noul` path as predict.
 
 ## Fresh Ubuntu
 

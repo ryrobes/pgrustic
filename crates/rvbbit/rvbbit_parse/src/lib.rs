@@ -234,6 +234,8 @@ pub struct FnClauses {
     pub label_descriptions: Vec<Option<String>>,
     /// Noul cutoff in `[0, 1]`. Absent means the server default (0.5).
     pub threshold: Option<f64>,
+    /// `DEFAULT CLAUSES (...)` tail. Call-site clauses override it.
+    pub clauses: Option<String>,
 }
 
 impl Default for FnClauses {
@@ -250,6 +252,7 @@ impl Default for FnClauses {
             labels: Vec::new(),
             label_descriptions: Vec::new(),
             threshold: None,
+            clauses: None,
         }
     }
 }
@@ -870,7 +873,26 @@ impl<'a> Parser<'a> {
                 }
                 c.labels = labels;
                 c.label_descriptions = descriptions;
-            } else if self.eat_kw(Kw::Steps) || self.eat_kw(Kw::Takes) || self.eat_kw(Kw::Ward) {
+            } else if self.eat_kw(Kw::Default) {
+                self.expect_kw(Kw::Clauses, "CLAUSES")?;
+                self.expect_sym('(')?;
+                let body = self.string()?;
+                self.expect_sym(')')?;
+                if body.trim().is_empty() {
+                    return Err("DEFAULT CLAUSES is empty".into());
+                }
+                c.clauses = Some(body);
+            } else if self.eat_kw(Kw::Takes) {
+                let n = self.int()?;
+                if n < 1 {
+                    return Err("TAKES must be at least 1".into());
+                }
+                let extra = format!("WITH TAKES {n}");
+                c.clauses = Some(match c.clauses.take() {
+                    Some(prev) => format!("{prev} {extra}"),
+                    None => extra,
+                });
+            } else if self.eat_kw(Kw::Steps) || self.eat_kw(Kw::Ward) {
                 return Err(format!(
                     "{} is not implemented until milestone M5",
                     self.prev_text()
@@ -905,6 +927,7 @@ impl<'a> Parser<'a> {
                 }
                 threshold = Some(n);
             }
+            let (takes, phrasings) = self.stack_opts()?;
             let (using, combine) = self.using_combine()?;
             self.expect_kw(Kw::Yes, "YES")?;
             self.eat_sym(':');
@@ -923,6 +946,12 @@ impl<'a> Parser<'a> {
             if let Some(t) = threshold {
                 node["threshold"] = json!(t);
             }
+            if let Some(n) = takes {
+                node["takes"] = json!(n);
+            }
+            if !phrasings.is_empty() {
+                node["phrasings"] = json!(phrasings);
+            }
             if !using.is_empty() {
                 node["using"] = json!(using);
             }
@@ -930,6 +959,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(Kw::Choose) {
             let question = self.string()?;
+            let (takes, phrasings) = self.stack_opts()?;
             let (using, combine) = self.using_combine()?;
             let mut when = Vec::new();
             if !self.eat_kw(Kw::When) {
@@ -959,6 +989,12 @@ impl<'a> Parser<'a> {
                 "combine": combine,
                 "when": when
             });
+            if let Some(n) = takes {
+                node["takes"] = json!(n);
+            }
+            if !phrasings.is_empty() {
+                node["phrasings"] = json!(phrasings);
+            }
             if !using.is_empty() {
                 node["using"] = json!(using);
             }
@@ -1006,6 +1042,32 @@ impl<'a> Parser<'a> {
         Ok((using, combine))
     }
 
+    /// `TAKES n` and `PHRASINGS ('...', ...)`. Absent means one wording, one take.
+    fn stack_opts(&mut self) -> Result<(Option<i64>, Vec<String>), String> {
+        let takes = if self.eat_kw(Kw::Takes) {
+            Some(self.int()?)
+        } else {
+            None
+        };
+        let mut phrasings = Vec::new();
+        if self.eat_kw(Kw::Phrasings) {
+            self.expect_sym('(')?;
+            if !self.at_sym(')') {
+                loop {
+                    phrasings.push(self.string()?);
+                    if !self.eat_sym(',') {
+                        break;
+                    }
+                }
+            }
+            self.expect_sym(')')?;
+            if phrasings.len() < 2 {
+                return Err("PHRASINGS needs at least two wordings".into());
+            }
+        }
+        Ok((takes, phrasings))
+    }
+
     fn arg_list(&mut self) -> Result<Vec<Arg>, String> {
         self.expect_sym('(')?;
         let mut args = Vec::new();
@@ -1030,7 +1092,7 @@ impl<'a> Parser<'a> {
         // Stop before a clause keyword.
         let stop = [
             Kw::Model, Kw::System, Kw::Prompt, Kw::Max, Kw::Temperature, Kw::Cache, Kw::Test,
-            Kw::Version, Kw::Steps, Kw::Takes, Kw::Ward, Kw::As, Kw::Labels,
+            Kw::Version, Kw::Steps, Kw::Takes, Kw::Ward, Kw::As, Kw::Labels, Kw::Default,
         ];
         let mut depth = 0i32;
         let mut parts = Vec::new();
@@ -1439,7 +1501,7 @@ enum Kw {
     Returns, System, Prompt, Max, Tokens, Temperature, Cache, Test, Expect, For,
     Leftarg, Rightarg, Symbol, Negator, Ask, Yes, No, Choose, When, Then, Meaning,
     Threshold, Using, Combine, As, Version, Set, Cascade, Restrict, Usage, Execute, To, From, Is,
-    Null, Steps, Takes, Ward, Labels, True, False,
+    Null, Steps, Takes, Ward, Labels, True, False, Default, Clauses, Phrasings,
 }
 
 impl Kw {
@@ -1518,6 +1580,9 @@ impl Kw {
             Kw::Labels => "labels",
             Kw::True => "true",
             Kw::False => "false",
+            Kw::Default => "default",
+            Kw::Clauses => "clauses",
+            Kw::Phrasings => "phrasings",
         }
     }
 
@@ -1595,6 +1660,9 @@ impl Kw {
             "steps" => Kw::Steps,
             "takes" => Kw::Takes,
             "ward" => Kw::Ward,
+            "default" => Kw::Default,
+            "clauses" => Kw::Clauses,
+            "phrasings" => Kw::Phrasings,
             "labels" => Kw::Labels,
             _ => return None,
         })
@@ -1926,6 +1994,32 @@ mod tests {
                 assert_eq!(nodes["yes"]["value"], true);
                 assert_eq!(nodes["yes"]["id"], "n2");
                 assert_eq!(nodes["no"]["value"], false);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let stacked = parse_command(
+            "CREATE DECISION TREE ufo_stack (notes text) MODEL jev AS \
+             ASK 'sky?' YES: CHOOSE 'What is the most likely explanation?' \
+               TAKES 3 PHRASINGS ('What is the most likely explanation?', 'Which ordinary cause fits?') \
+               WHEN 'aircraft' THEN 'aircraft' WHEN 'other' THEN 'other' NO: FALSE",
+        )
+        .unwrap();
+        match stacked {
+            Command::CreateTree { nodes, .. } => {
+                assert_eq!(nodes["yes"]["takes"], 3);
+                assert_eq!(nodes["yes"]["phrasings"][1], "Which ordinary cause fits?");
+            }
+            other => panic!("{other:?}"),
+        }
+        let defaults = parse_command(
+            "CREATE SEMANTIC FUNCTION means(input text, criterion text) RETURNS boolean \
+             DEFAULT CLAUSES ($$WITH TAKES 3 PICK BY VOTE$$) MODEL jev",
+        )
+        .unwrap();
+        match defaults {
+            Command::CreateFunction { clauses, .. } => {
+                assert_eq!(clauses.clauses.as_deref(), Some("WITH TAKES 3 PICK BY VOTE"));
             }
             other => panic!("{other:?}"),
         }

@@ -272,6 +272,7 @@ fn route(
                     scores: None,
                     calls: None,
                     error: None,
+                    identical_takes: None,
                 }
             })
             .collect();
@@ -335,6 +336,7 @@ pub fn item_error(key: &str, message: &str) -> ItemResponse {
             code: "mock".into(),
             message: message.into(),
         }),
+        identical_takes: None,
     }
 }
 

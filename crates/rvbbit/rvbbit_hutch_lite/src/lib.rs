@@ -171,6 +171,8 @@ struct Scored {
     generation_id: Option<String>,
     /// Meters for this invocation. Cleared before the value is stored.
     calls: Vec<CallMeter>,
+    /// Set when two or more takes of one model agreed.
+    identical_takes: Option<bool>,
 }
 
 impl Scored {
@@ -183,6 +185,7 @@ impl Scored {
             model: String::new(),
             generation_id: None,
             calls: Vec::new(),
+            identical_takes: None,
         }
     }
 
@@ -201,6 +204,7 @@ impl Scored {
             model,
             generation_id,
             calls,
+            identical_takes: None,
         }
     }
 }
@@ -458,6 +462,7 @@ fn run_batch(
             scores: None,
             calls: None,
             error: None,
+            identical_takes: None,
         };
         req.items.len()
     ]));
@@ -480,6 +485,7 @@ fn run_batch(
                         scores: scored.scores,
                         calls: if scored.calls.is_empty() { None } else { Some(scored.calls) },
                         error: None,
+                        identical_takes: scored.identical_takes,
                     },
                     Err(err) => ItemResponse {
                         key: item.key.clone(),
@@ -488,6 +494,7 @@ fn run_batch(
                         scores: None,
                         calls: None,
                         error: Some(err),
+                        identical_takes: None,
                     },
                 };
             });
@@ -732,6 +739,7 @@ struct DecisionPlan {
     takes: u32,
     combine: Combine,
     threshold: f64,
+    phrasings: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -755,6 +763,8 @@ fn decision_plan(cfg: &Config, req: &BatchRequest) -> DecisionPlan {
         takes: None,
         combine: None,
         threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
     });
     let mut models: Vec<String> = stack
         .models
@@ -775,6 +785,7 @@ fn decision_plan(cfg: &Config, req: &BatchRequest) -> DecisionPlan {
         takes,
         combine,
         threshold: stack.threshold.unwrap_or(cfg.decision_threshold),
+        phrasings: stack.phrasings,
     }
 }
 
@@ -796,31 +807,82 @@ fn decision_scored(
     memo: bool,
 ) -> Result<Scored, ItemError> {
     let plan = decision_plan(&server.cfg, req);
-    let mut scores = Vec::with_capacity(plan.models.len() * plan.takes as usize);
+    let phrasings = plan_phrasings(&plan);
+    let mut scores = Vec::new();
     let mut calls = Vec::new();
+    let mut prints: Vec<(String, String)> = Vec::new();
     for model in &plan.models {
-        for take in 0..plan.takes {
-            let (text, meter) = decision_http(
-                server,
-                tenant,
-                operation,
-                DecisionKind::Noul,
-                model,
-                take,
-                item,
-                memo,
-            )?;
-            calls.push(meter);
-            scores.push(parse_noul(&text).map_err(map_decision_err)?);
+        for phrasing in &phrasings {
+            let mut asked = item.clone();
+            if !phrasing.is_empty() {
+                asked.criterion = Some(phrasing.clone());
+                asked.prompt = Some(phrasing.clone());
+            }
+            for take in 0..plan.takes {
+                let (text, meter) = decision_http(
+                    server,
+                    tenant,
+                    operation,
+                    DecisionKind::Noul,
+                    model,
+                    take,
+                    &asked,
+                    memo,
+                )?;
+                calls.push(meter);
+                let score = parse_noul(&text).map_err(map_decision_err)?;
+                prints.push((format!("{model}\n{phrasing}"), format!("{score:.6}")));
+                scores.push(score);
+            }
+        }
+    }
+    let identical = identical_prints(&prints);
+    if prints.len() >= 2 {
+        for call in &mut calls {
+            call.identical = Some(identical);
         }
     }
     let (matched, mean) = combine_noul(plan.combine, plan.threshold, &scores);
-    Ok(Scored::from_calls(
+    let mut scored = Scored::from_calls(
         serde_json::Value::Bool(matched),
         Some(mean),
         None,
         calls,
-    ))
+    );
+    if prints.len() >= 2 {
+        scored.identical_takes = Some(identical);
+    }
+    Ok(scored)
+}
+
+fn plan_phrasings(plan: &DecisionPlan) -> Vec<String> {
+    if plan.phrasings.is_empty() {
+        vec![String::new()]
+    } else {
+        plan.phrasings.clone()
+    }
+}
+
+/// True when every model+phrasing that was asked more than once returned
+/// the same fingerprint. A single take does not count. Jev's repeated
+/// takes of one phrasing set this even when another phrasing scores
+/// differently. A take that disagrees with its siblings clears it.
+fn identical_prints(prints: &[(String, String)]) -> bool {
+    let mut repeated = false;
+    for (i, (model, fp)) in prints.iter().enumerate() {
+        let group: Vec<_> = prints.iter().filter(|(m, _)| m == model).map(|(_, f)| f).collect();
+        if group.len() < 2 {
+            continue;
+        }
+        if i > 0 && prints[..i].iter().any(|(m, _)| m == model) {
+            continue;
+        }
+        repeated = true;
+        if group.iter().any(|f| *f != fp) {
+            return false;
+        }
+    }
+    repeated
 }
 
 /// One `choice` question per call. Stacked calls average `probabilities`
@@ -847,28 +909,45 @@ fn choice_scored(
         ));
     }
     let plan = decision_plan(&server.cfg, req);
+    let phrasings = plan_phrasings(&plan);
     let mut sums: HashMap<String, f64> = HashMap::new();
     let mut calls = 0f64;
     let mut meters = Vec::new();
+    let mut prints: Vec<(String, String)> = Vec::new();
     for model in &plan.models {
-        for take in 0..plan.takes {
-            let (text, meter) = decision_http(
-                server,
-                tenant,
-                operation,
-                DecisionKind::Choice,
-                model,
-                take,
-                item,
-                memo,
-            )?;
-            meters.push(meter);
-            let hit = parse_choice(&text).map_err(map_decision_err)?;
-            for label in &labels {
-                let p = hit.probabilities.get(label).copied().unwrap_or(0.0);
-                *sums.entry(label.clone()).or_insert(0.0) += p;
+        for phrasing in &phrasings {
+            let mut asked = item.clone();
+            if !phrasing.is_empty() {
+                asked.prompt = Some(phrasing.clone());
             }
-            calls += 1.0;
+            for take in 0..plan.takes {
+                let (text, meter) = decision_http(
+                    server,
+                    tenant,
+                    operation,
+                    DecisionKind::Choice,
+                    model,
+                    take,
+                    &asked,
+                    memo,
+                )?;
+                meters.push(meter);
+                let hit = parse_choice(&text).map_err(map_decision_err)?;
+                let mut fp = String::new();
+                for label in &labels {
+                    let p = hit.probabilities.get(label).copied().unwrap_or(0.0);
+                    *sums.entry(label.clone()).or_insert(0.0) += p;
+                    fp.push_str(&format!("{label}={p:.6};"));
+                }
+                prints.push((format!("{model}\n{phrasing}"), fp));
+                calls += 1.0;
+            }
+        }
+    }
+    let identical = identical_prints(&prints);
+    if prints.len() >= 2 {
+        for meter in &mut meters {
+            meter.identical = Some(identical);
         }
     }
     let mut scores = serde_json::Map::new();
@@ -882,12 +961,16 @@ fn choice_scored(
             best_label = label.clone();
         }
     }
-    Ok(Scored::from_calls(
+    let mut scored = Scored::from_calls(
         serde_json::Value::String(best_label),
         Some(best),
         Some(serde_json::Value::Object(scores)),
         meters,
-    ))
+    );
+    if prints.len() >= 2 {
+        scored.identical_takes = Some(identical);
+    }
+    Ok(scored)
 }
 
 fn combine_noul(combine: Combine, threshold: f64, scores: &[f64]) -> (bool, f64) {
@@ -1374,6 +1457,7 @@ fn miss_meter(
         generation_id: usage.generation_id.clone(),
         node,
         score,
+        identical: None,
         payload: audit_payload(),
     }
 }
@@ -1411,6 +1495,7 @@ fn saved_meter(
         generation_id: usage.generation_id.clone(),
         node,
         score,
+        identical: None,
         payload: audit_payload(),
     }
 }
@@ -1444,6 +1529,7 @@ fn meter_cached(
         generation_id: stored.generation_id.clone(),
         node,
         score: stored.score,
+        identical: stored.identical_takes,
         payload: audit_payload(),
     };
     record_call(server, &meter);

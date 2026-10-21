@@ -38,6 +38,8 @@ pub struct Endpoint {
     pub threshold: Option<f64>,
     /// Extract decode. `Some("scalar")` accepts plain text. `None` is JSON.
     pub extract_mode: Option<String>,
+    /// `DEFAULT CLAUSES` tail. Empty when the function did not set one.
+    pub default_clauses: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -229,5 +231,6 @@ pub fn default_endpoint() -> Endpoint {
         label_descriptions: Vec::new(),
         threshold: None,
         extract_mode: None,
+        default_clauses: None,
     }
 }

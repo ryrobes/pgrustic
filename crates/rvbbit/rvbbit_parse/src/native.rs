@@ -76,7 +76,7 @@ pub fn rewrite_native_semantic(sql: &str) -> Option<String> {
 
 fn mentions(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
-    lower.contains("classify") || lower.contains("extract")
+    lower.contains("classify") || lower.contains("extract") || lower.contains("means")
 }
 
 fn rewrite_all(sql: &str) -> String {
@@ -131,6 +131,12 @@ fn rewrite_all(sql: &str) -> String {
                     continue;
                 }
             }
+            if folded == "means" {
+                if let Some(end) = rewrite_means(sql, i, &mut out) {
+                    i = end;
+                    continue;
+                }
+            }
             out.push_str(word);
             continue;
         }
@@ -151,15 +157,19 @@ fn rewrite_call(kind: &str, sql: &str, paren: usize) -> Option<(usize, String)> 
     let body_end = end_paren(b, paren)?;
     let body = rewrite_all(&sql[body_start..body_end]);
     let after = body_end + 1;
-    let (fallback, end) = on_error(sql, after);
+    let (fallback, mut end) = on_error(sql, after);
     let opted_in = fallback.is_some();
     let fallback_sql = fallback.unwrap_or_else(|| "NULL".into());
+    let tail = clause_tail(sql, end);
+    if let Some((tail_end, _)) = &tail {
+        end = *tail_end;
+    }
     if kind == "classify" {
         let (expr, labels, enum_name) = split_classify(&body)?;
-        let call = if let Some(enum_name) = enum_name {
+        let call = if let Some(enum_name) = enum_name.as_deref() {
             format!(
                 "rvbbit.classify_enum(({expr}), {name}, {fallback_sql})",
-                name = sql_string(&enum_name),
+                name = sql_string(enum_name),
             )
         } else {
             format!(
@@ -167,6 +177,18 @@ fn rewrite_call(kind: &str, sql: &str, paren: usize) -> Option<(usize, String)> 
                 labels = sql_string(&labels.join("\u{1f}")),
             )
         };
+        if let Some((_, tail_sql)) = tail {
+            let extra = if let Some(enum_name) = enum_name.as_deref() {
+                sql_string(enum_name)
+            } else {
+                sql_string(&labels.join("\u{1f}"))
+            };
+            let call = format!(
+                "rvbbit.apply_clauses('classify', ({expr}), {extra}, {})",
+                sql_string(&tail_sql),
+            );
+            return Some((end, call));
+        }
         return Some((end, call));
     }
     let (field, expr) = split_extract(&body)?;
@@ -179,11 +201,200 @@ fn rewrite_call(kind: &str, sql: &str, paren: usize) -> Option<(usize, String)> 
     if is_datetime(&field) && !opted_in {
         return None;
     }
+    if let Some((_, tail_sql)) = tail {
+        let call = format!(
+            "rvbbit.apply_clauses('extract', ({expr}), {}, {})",
+            sql_string(&field),
+            sql_string(&tail_sql),
+        );
+        return Some((end, call));
+    }
     let call = format!(
         "rvbbit.extract_typed({field}, ({expr}), {fallback_sql})",
         field = sql_string(&field),
     );
     Some((end, call))
+}
+
+/// `MEANS` with a clause tail becomes `rvbbit.apply_clauses`. A plain
+/// `MEANS` returns `None` and the caller keeps the operator.
+fn rewrite_means(sql: &str, means_end: usize, out: &mut String) -> Option<usize> {
+    let b = sql.as_bytes();
+    let right_at = skip_ws(b, means_end);
+    let right_end = simple_expr_end(sql, right_at)?;
+    let (tail_end, tail) = clause_tail(sql, right_end)?;
+    let left = pop_simple_expr(out)?;
+    let right = sql[right_at..right_end].trim();
+    out.push_str(&format!(
+        "rvbbit.apply_clauses('means', ({left}), ({right}), {})",
+        sql_string(&tail),
+    ));
+    Some(tail_end)
+}
+
+fn clause_tail(sql: &str, at: usize) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    let start = skip_ws(b, at);
+    if start >= b.len() {
+        return None;
+    }
+    let head = sql[start..].trim_start().to_ascii_lowercase();
+    let starts = [
+        "using model",
+        "with takes",
+        "with temperature",
+        "with phrasings",
+        "with max",
+        "with across",
+        "pick by",
+        "retry ",
+        "check input",
+        "check output",
+        "no cache",
+        "refresh",
+        "timeout ",
+        "budget ",
+        "cache",
+        "threshold ",
+    ];
+    if !starts.iter().any(|k| head.starts_with(k)) {
+        return None;
+    }
+    let end = clause_end(sql, start);
+    let tail = sql[start..end].trim().trim_end_matches(';').trim().to_string();
+    if tail.is_empty() {
+        return None;
+    }
+    Some((end, tail))
+}
+
+fn clause_end(sql: &str, start: usize) -> usize {
+    let b = sql.as_bytes();
+    let mut i = start;
+    let mut depth = 0i32;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            i = end_quote(b, i);
+            continue;
+        }
+        if b[i] == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if b[i] == b')' {
+            if depth == 0 {
+                return i;
+            }
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        if depth == 0 && b[i] == b',' {
+            return i;
+        }
+        if depth == 0 && b[i] == b';' {
+            return i;
+        }
+        if depth == 0 && is_ident_start(b[i]) && (i == 0 || !is_ident_cont(b[i - 1])) {
+            let word_at = i;
+            i += 1;
+            while i < b.len() && is_ident_cont(b[i]) {
+                i += 1;
+            }
+            let word = sql[word_at..i].to_ascii_lowercase();
+            if word_at > start && matches!(
+                word.as_str(),
+                "from" | "where" | "group" | "order" | "limit" | "union" | "offset"
+                    | "window" | "having" | "and" | "or" | "join"
+            ) {
+                return word_at;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+fn simple_expr_end(sql: &str, at: usize) -> Option<usize> {
+    let b = sql.as_bytes();
+    if at >= b.len() {
+        return None;
+    }
+    if b[at] == b'\'' {
+        return Some(end_quote(b, at));
+    }
+    if b[at] == b'(' {
+        return end_paren(b, at).map(|i| i + 1);
+    }
+    if is_ident_start(b[at]) {
+        let mut i = at + 1;
+        while i < b.len() && (is_ident_cont(b[i]) || b[i] == b'.') {
+            i += 1;
+        }
+        let next = skip_ws(b, i);
+        if next < b.len() && b[next] == b'(' {
+            return end_paren(b, next).map(|n| n + 1);
+        }
+        return Some(i);
+    }
+    None
+}
+
+fn pop_simple_expr(out: &mut String) -> Option<String> {
+    let trimmed = out.trim_end();
+    let drop_ws = out.len() - trimmed.len();
+    if drop_ws > 0 {
+        out.truncate(out.len() - drop_ws);
+    }
+    let b = out.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    if b[b.len() - 1] == b')' {
+        let mut depth = 0i32;
+        let mut i = b.len();
+        while i > 0 {
+            i -= 1;
+            if b[i] == b')' {
+                depth += 1;
+            } else if b[i] == b'(' {
+                depth -= 1;
+                if depth == 0 {
+                    while i > 0 && (is_ident_cont(b[i - 1]) || b[i - 1] == b'.') {
+                        i -= 1;
+                    }
+                    let expr = out[i..].trim().to_string();
+                    out.truncate(i);
+                    return Some(expr);
+                }
+            }
+        }
+        return None;
+    }
+    if b[b.len() - 1] == b'\'' {
+        let mut i = b.len() - 1;
+        while i > 0 {
+            i -= 1;
+            if b[i] == b'\'' {
+                let expr = out[i..].to_string();
+                out.truncate(i);
+                return Some(expr);
+            }
+        }
+        return None;
+    }
+    let mut i = b.len();
+    while i > 0 && (is_ident_cont(b[i - 1]) || b[i - 1] == b'.') {
+        i -= 1;
+    }
+    if i == b.len() {
+        return None;
+    }
+    let expr = out[i..].to_string();
+    out.truncate(i);
+    Some(expr)
 }
 
 fn split_classify(body: &str) -> Option<(String, Vec<String>, Option<String>)> {
@@ -507,6 +718,22 @@ mod tests {
             out,
             "SELECT rvbbit.classify_enum((notes), 'sighting_class', 'unclear')"
         );
+    }
+
+    #[test]
+    fn means_clause_tail_is_apply_clauses() {
+        let sql = "SELECT notes MEANS 'a light in the sky' WITH TAKES 3 PICK BY VOTE FROM ufo";
+        let out = rewrite_native_semantic(sql).unwrap();
+        assert!(out.contains("rvbbit.apply_clauses('means'"));
+        assert!(out.contains("WITH TAKES 3 PICK BY VOTE"));
+        assert!(out.contains("FROM ufo"));
+        assert!(!out.to_ascii_lowercase().contains(" means "));
+    }
+
+    #[test]
+    fn plain_means_stays() {
+        let sql = "SELECT notes MEANS 'a light in the sky' FROM ufo";
+        assert!(rewrite_native_semantic(sql).is_none());
     }
 
     #[test]
