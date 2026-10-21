@@ -27,6 +27,10 @@ pub const MEANS_SCORE_OID: u32 = 9025;
 pub const CLASSIFY_OID: u32 = 9026;
 /// `rvbbit_call_log() -> text`. JSON array behind the `rvbbit.calls` view.
 pub const CALL_LOG_OID: u32 = 9027;
+/// `rvbbit_decide(text, text) -> text`. Internal name for `rvbbit.decide`.
+/// The plan's `pg_proc` oid is different; [`rvbbit_resolve::is_decide_func`]
+/// is that oid.
+pub const DECIDE_OID: u32 = 9028;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -35,6 +39,7 @@ pub const EXTRACT_NAME: &str = "rvbbit_extract";
 pub const MEANS_SCORE_NAME: &str = "rvbbit_means_score";
 pub const CLASSIFY_NAME: &str = "rvbbit_classify";
 pub const CALL_LOG_NAME: &str = "rvbbit_call_log";
+pub const DECIDE_NAME: &str = "rvbbit_decide";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

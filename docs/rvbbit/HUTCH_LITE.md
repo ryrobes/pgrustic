@@ -149,3 +149,64 @@ Fake-endpoint tests (no key, no network provider):
 ```bash
 cargo test -p rvbbit_hutch_lite
 ```
+
+## Decision trees
+
+`CREATE DECISION TREE` stores an ask/choose tree. `rvbbit.decide(name, input)`
+walks it. Each ask is one Decisions `noul` (yes/no). Each choose is one
+`choice` over that node's labels. The default model is the tree's
+`MODEL`, which the demo sets to `typesafe/jev-1.14`. An empty or `mock`
+remote name still becomes `HUTCH_DECISION_MODEL`.
+
+```sql
+CREATE DECISION TREE bigfoot_triage (notes text) MODEL jev AS
+  ASK 'Is this a credible report of an unknown creature rather than a known animal?'
+    YES: CHOOSE 'Which report class fits?'
+      WHEN 'class a' MEANING 'a witness saw a large upright figure' THEN
+        ASK 'Does this class A report need a follow-up interview?'
+          YES: TRUE
+          NO: FALSE
+      WHEN 'class b' MEANING 'tracks, knocks, or other signs without a clear sighting' THEN 'class b'
+      WHEN 'class c' MEANING 'secondhand or very weak' THEN 'class c'
+    NO: 'not a sighting';
+```
+
+A boolean leaf comes back as the text `true` or `false`. A string leaf
+comes back as that label. The bigfoot tree returns `not a sighting`,
+`class b`, `class c`, or the follow-up boolean. The UFO tree returns
+`aircraft`, `satellite`, `astronomical`, `unexplained`, or
+`not a sky object`.
+
+`USING (slug, slug, ...) COMBINE mean|vote` is the stack hook on a node.
+The slugs are sent as `decision.models` (at least two). `COMBINE vote`
+is majority; `mean` is the default and compares the mean score with
+`THRESHOLD` (default 0.5). The walker does not call the models itself.
+The live script does not stack, because each extra model is another
+provider call per row at that node.
+
+Rows on the same node are one HTTP batch. Duplicate inputs at that node
+are a memo inside the walk and are not sent. The next level starts after
+this level has branched. `rvbbit.calls.node` is `{id}:{question}` (120
+characters). The contract cache key is per node, so two nodes that ask
+the same question do not share an entry. A MEANS filter on the same
+Result keeps the MEANS batcher, and `decide` in that query runs one row
+at a time. `EXPLAIN` names the batched node `Decision Tree` and, under
+`ANALYZE`, prints batches, HTTP calls, node calls, and memo hits.
+
+`scripts/rvbbit_tree_demo.sh` is the one-command live run. It uses the
+same ports as `scripts/rvbbit_live_demo.sh` (Postgres `55433`, hutch
+`8098`) and will not start if those are taken. It loads the 200-row
+fixtures, copies 8 rows of each into `sightings` and `ufo_sample`, and
+runs both trees on those 8. Worst case is 40 provider calls (3 bigfoot
+levels plus 2 UFO levels, 8 rows). The script aborts above 60. The rerun
+must not change `provider_calls` or `total_cost_usd`.
+
+```bash
+export OPENROUTER_API_KEY=...    # never commit this; the script does not echo it
+bash scripts/rvbbit_tree_demo.sh
+```
+
+Any rvbbit statement in the session creates `rvbbit.decide`. A later
+connection still batches: planning recognizes the function by name, and
+execution loads the tree cache before the first batch. The key stays in
+hutch-lite's environment. Do not put it in `BACKEND AUTH ENV`.

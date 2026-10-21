@@ -153,6 +153,7 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
         prompt: None,
         labels: None,
         label_descriptions: None,
+        node: None,
     }
 }
 
@@ -367,12 +368,15 @@ fn predict(input: &str, criterion: &str) -> BatchRequest {
 #[test]
 fn predict_extract_cache_and_errors() {
     let h = harness(Some("test-key"));
-    let yes = post(&format!("{}/v1/predict", h.hutch), "read-write", &predict("TRUE_CASE", "biped"));
+    let mut first = predict("TRUE_CASE", "biped");
+    first.items[0].node = Some("n1:credible?".into());
+    let yes = post(&format!("{}/v1/predict", h.hutch), "read-write", &first);
     assert_eq!(yes.outputs[0].value, Some(serde_json::json!(true)));
     assert_eq!(yes.outputs[0].score, Some(0.75));
     assert!(yes.outputs[0].scores.is_none());
     let call = &yes.outputs[0].calls.as_ref().unwrap()[0];
     assert_eq!(call.op, "predict");
+    assert_eq!(call.node.as_deref(), Some("n1:credible?"));
     assert_eq!(call.cache, "miss");
     assert_eq!(call.items, 1);
     assert_eq!(call.tokens_in, Some(80));

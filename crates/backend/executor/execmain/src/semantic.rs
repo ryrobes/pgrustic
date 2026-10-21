@@ -33,6 +33,7 @@ static STATS: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, SemanticStats>>>
 
 pub fn clear_stats() {
     STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    crate::treebatch::clear_stats();
 }
 
 pub fn semantic_stats(plan_node_id: i32) -> Option<SemanticStats> {
@@ -48,7 +49,7 @@ struct MeansArgs<'mcx> {
     criterion: PgBox<'mcx, ExprState<'mcx>>,
 }
 
-enum Field {
+pub(crate) enum Field {
     Null,
     ByVal(usize),
     /// Plain or still-toasted varlena image (header included).
@@ -57,7 +58,7 @@ enum Field {
     Fixed(Vec<u8>),
 }
 
-struct SavedTuple {
+pub(crate) struct SavedTuple {
     fields: Vec<Field>,
 }
 
@@ -160,7 +161,7 @@ pub fn compile<'mcx>(
     })))
 }
 
-fn compile_expr<'mcx>(
+pub(crate) fn compile_expr<'mcx>(
     estate: &mut EStateData<'mcx>,
     mcx: Mcx<'mcx>,
     params: execexpr::ParamBind<'mcx>,
@@ -423,7 +424,7 @@ fn row_passes(row: &RowWork, memo: &HashMap<(String, String), bool>) -> bool {
     })
 }
 
-fn eval_text<'mcx>(
+pub(crate) fn eval_text<'mcx>(
     estate: &mut EStateData<'mcx>,
     ecxt: executils::EcxtId,
     expr: &mut ExprState<'mcx>,
@@ -453,7 +454,7 @@ fn datum_to_text<'mcx>(mcx: Mcx<'mcx>, datum: datum::Datum) -> PgResult<String> 
     Ok(String::from_utf8_lossy(&plain[types_tuple::varatt::VARHDRSZ..]).into_owned())
 }
 
-fn snapshot_slot<'mcx>(estate: &mut EStateData<'mcx>, slot: ExecSlotId) -> PgResult<SavedTuple> {
+pub(crate) fn snapshot_slot<'mcx>(estate: &mut EStateData<'mcx>, slot: ExecSlotId) -> PgResult<SavedTuple> {
     let mut fields = Vec::new();
     {
         let data = estate.slot(slot);
@@ -496,7 +497,7 @@ fn snapshot_slot<'mcx>(estate: &mut EStateData<'mcx>, slot: ExecSlotId) -> PgRes
     Ok(SavedTuple { fields })
 }
 
-fn restore_tuple<'mcx>(
+pub(crate) fn restore_tuple<'mcx>(
     estate: &mut EStateData<'mcx>,
     slot_id: ExecSlotId,
     row: &SavedTuple,

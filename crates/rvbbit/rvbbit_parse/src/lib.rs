@@ -879,6 +879,7 @@ impl<'a> Parser<'a> {
         if *count > 255 {
             return Err("decision tree has more than 255 nodes".into());
         }
+        let id_n = *count;
         if self.eat_kw(Kw::Ask) {
             let question = self.string()?;
             let mut threshold = None;
@@ -889,24 +890,21 @@ impl<'a> Parser<'a> {
                 }
                 threshold = Some(n);
             }
-            let mut using = Vec::new();
-            if self.eat_kw(Kw::Using) {
-                self.expect_sym('(')?;
-                loop {
-                    using.push(self.name()?);
-                    if !self.eat_sym(',') {
-                        break;
-                    }
-                }
-                self.expect_sym(')')?;
-            }
+            let (using, combine) = self.using_combine()?;
             self.expect_kw(Kw::Yes, "YES")?;
             self.eat_sym(':');
             let yes = self.tree_limited(depth + 1, count)?;
             self.expect_kw(Kw::No, "NO")?;
             self.eat_sym(':');
             let no = self.tree_limited(depth + 1, count)?;
-            let mut node = json!({"kind": "ask", "question": question, "yes": yes, "no": no});
+            let mut node = json!({
+                "kind": "ask",
+                "id": format!("n{id_n}"),
+                "question": question,
+                "combine": combine,
+                "yes": yes,
+                "no": no
+            });
             if let Some(t) = threshold {
                 node["threshold"] = json!(t);
             }
@@ -917,6 +915,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(Kw::Choose) {
             let question = self.string()?;
+            let (using, combine) = self.using_combine()?;
             let mut when = Vec::new();
             if !self.eat_kw(Kw::When) {
                 return Err(format!("CHOOSE requires WHEN near {}", self.near()));
@@ -935,12 +934,61 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            return Ok(json!({"kind": "choose", "question": question, "when": when}));
+            if when.len() < 2 {
+                return Err("CHOOSE needs at least two WHEN branches".into());
+            }
+            let mut node = json!({
+                "kind": "choose",
+                "id": format!("n{id_n}"),
+                "question": question,
+                "combine": combine,
+                "when": when
+            });
+            if !using.is_empty() {
+                node["using"] = json!(using);
+            }
+            return Ok(node);
+        }
+        if self.eat_kw(Kw::True) {
+            return Ok(json!({"kind": "leaf", "id": format!("n{id_n}"), "type": "bool", "value": true}));
+        }
+        if self.eat_kw(Kw::False) {
+            return Ok(json!({"kind": "leaf", "id": format!("n{id_n}"), "type": "bool", "value": false}));
         }
         if self.at_string() {
-            return Ok(json!({"kind": "leaf", "label": self.string()?}));
+            return Ok(json!({"kind": "leaf", "id": format!("n{id_n}"), "label": self.string()?}));
         }
-        Err(format!("expected ASK, CHOOSE, or a leaf label near {}", self.near()))
+        Err(format!("expected ASK, CHOOSE, TRUE, FALSE, or a leaf label near {}", self.near()))
+    }
+
+    /// `USING (slug, ...)` is the stack hook: those slugs are sent as
+    /// `decision.models`. `COMBINE mean|vote` selects how they join.
+    /// Absent USING is one call to the tree's model.
+    fn using_combine(&mut self) -> Result<(Vec<String>, String), String> {
+        let mut using = Vec::new();
+        if self.eat_kw(Kw::Using) {
+            self.expect_sym('(')?;
+            loop {
+                using.push(self.name()?);
+                if !self.eat_sym(',') {
+                    break;
+                }
+            }
+            self.expect_sym(')')?;
+            if using.len() < 2 {
+                return Err("USING needs at least two models".into());
+            }
+        }
+        let combine = if self.eat_kw(Kw::Combine) {
+            let word = self.name()?;
+            if word != "mean" && word != "vote" {
+                return Err(format!("COMBINE {word} is not mean or vote"));
+            }
+            word
+        } else {
+            "mean".into()
+        };
+        Ok((using, combine))
     }
 
     fn arg_list(&mut self) -> Result<Vec<Arg>, String> {
@@ -1367,8 +1415,8 @@ enum Kw {
     Type, Url, Auth, Env, Secret, With, On, Name, Cost, Input, Output, Dimensions,
     Returns, System, Prompt, Max, Tokens, Temperature, Cache, Test, Expect, For,
     Leftarg, Rightarg, Symbol, Negator, Ask, Yes, No, Choose, When, Then, Meaning,
-    Threshold, Using, As, Version, Set, Cascade, Restrict, Usage, Execute, To, From, Is,
-    Null, Steps, Takes, Ward, Labels,
+    Threshold, Using, Combine, As, Version, Set, Cascade, Restrict, Usage, Execute, To, From, Is,
+    Null, Steps, Takes, Ward, Labels, True, False,
 }
 
 impl Kw {
@@ -1429,6 +1477,7 @@ impl Kw {
             Kw::Meaning => "meaning",
             Kw::Threshold => "threshold",
             Kw::Using => "using",
+            Kw::Combine => "combine",
             Kw::As => "as",
             Kw::Version => "version",
             Kw::Set => "set",
@@ -1444,6 +1493,8 @@ impl Kw {
             Kw::Takes => "takes",
             Kw::Ward => "ward",
             Kw::Labels => "labels",
+            Kw::True => "true",
+            Kw::False => "false",
         }
     }
 
@@ -1504,6 +1555,9 @@ impl Kw {
             "meaning" => Kw::Meaning,
             "threshold" => Kw::Threshold,
             "using" => Kw::Using,
+            "combine" => Kw::Combine,
+            "true" => Kw::True,
+            "false" => Kw::False,
             "as" => Kw::As,
             "version" => Kw::Version,
             "set" => Kw::Set,
@@ -1628,9 +1682,18 @@ mod lexer {
                 });
                 continue;
             }
-            if c.is_ascii_alphabetic() || c == '_' {
+            // Model slugs (`typesafe/jev-1.14`, `~typesafe/jev-latest`) are one
+            // ident. `/`, `-`, `.`, and `~` continue a word; a bare `.` stays
+            // skipped punctuation so it is not a schema separator token.
+            if c.is_ascii_alphabetic() || c == '_' || c == '~' {
                 let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                while i < b.len()
+                    && (b[i].is_ascii_alphanumeric()
+                        || b[i] == b'_'
+                        || ((b[i] == b'/' || b[i] == b'-' || b[i] == b'.' || b[i] == b'~')
+                            && i + 1 < b.len()
+                            && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_' || b[i + 1] == b'~')))
+                {
                     i += 1;
                 }
                 let raw = &sql[start..i];
@@ -1821,6 +1884,25 @@ mod tests {
             Command::CreateTree { nodes, .. } => {
                 assert_eq!(nodes["kind"], "choose");
                 assert_eq!(nodes["when"][0]["then"]["label"], "finance");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let follow = parse_command(
+            "CREATE DECISION TREE bigfoot_triage (notes text) MODEL jev AS \
+             ASK 'credible?' USING (typesafe/high, typesafe/jev-1.14) COMBINE vote \
+               YES: TRUE NO: FALSE",
+        )
+        .unwrap();
+        match follow {
+            Command::CreateTree { nodes, .. } => {
+                assert_eq!(nodes["id"], "n1");
+                assert_eq!(nodes["combine"], "vote");
+                assert_eq!(nodes["using"][0], "typesafe/high");
+                assert_eq!(nodes["using"][1], "typesafe/jev-1.14");
+                assert_eq!(nodes["yes"]["value"], true);
+                assert_eq!(nodes["yes"]["id"], "n2");
+                assert_eq!(nodes["no"]["value"], false);
             }
             other => panic!("{other:?}"),
         }

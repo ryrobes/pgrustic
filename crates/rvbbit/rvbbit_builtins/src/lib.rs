@@ -6,7 +6,8 @@
 
 use datum::Datum;
 use rvbbit_oids::{
-    CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_NAME, CLASSIFY_OID, DUMP_NAME, DUMP_OID, EXTRACT_NAME,
+    CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_NAME, CLASSIFY_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME,
+    DUMP_OID, EXTRACT_NAME,
     EXTRACT_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID,
     RESTORE_NAME, RESTORE_OID,
 };
@@ -97,6 +98,35 @@ pub fn rvbbit_classify(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> Pg
 /// JSON array of recent hutch calls, one object per provider call or
 /// cache hit. `rvbbit.calls` is a view over `json_to_recordset` of this
 /// text. Column `cost` is USD. A hit has cost 0 and `cost_saved` set.
+/// `rvbbit.decide(tree_name, input) -> text`. One row. A batch executor
+/// may have already walked this input; that answer is reused.
+pub fn rvbbit_decide(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let (tree_name, input) = unsafe {
+        (
+            String::from_utf8_lossy(fcinfo.arg_varlena_packed(0)?.data()).into_owned(),
+            String::from_utf8_lossy(fcinfo.arg_varlena_packed(1)?.data()).into_owned(),
+        )
+    };
+    if let Some(hit) = rvbbit_dispatch::recall_decide(&tree_name, &input) {
+        return Ok(varlena_result(varlena::cstring_to_text(
+            fcinfo.result_mcx(),
+            hit.as_bytes(),
+        )?));
+    }
+    let tree = rvbbit_resolve::tree(&tree_name).ok_or_else(|| {
+        Box::new(types_error::PgError::error(format!(
+            "decision tree \"{tree_name}\" does not exist"
+        ))) as Box<types_error::PgError>
+    })?;
+    let reply = rvbbit_dispatch::decide_texts(&tree.endpoint, &tree.nodes, &[input])?;
+    let value = reply.values.first().cloned().unwrap_or_default();
+    Ok(varlena_result(varlena::cstring_to_text(
+        fcinfo.result_mcx(),
+        value.as_bytes(),
+    )?))
+}
+
 pub fn rvbbit_call_log(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     rvbbit_resolve::ensure()?;
     let urls = rvbbit_catalog::hutch_urls()?;
@@ -205,5 +235,13 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: false,
         retset: false,
         func: rvbbit_call_log as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: DECIDE_OID,
+        name: DECIDE_NAME,
+        nargs: 2,
+        strict: true,
+        retset: false,
+        func: rvbbit_decide as PGFunction,
     },
 ];

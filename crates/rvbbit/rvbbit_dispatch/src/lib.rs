@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use rvbbit_contract::{
     cache_header, client_cache_key_hex, BatchRequest, BatchResponse, CacheKeyParts,
-    CacheLookupRequest, CacheLookupResponse, CacheMode, CallMeter, ItemRequest, Operation,
-    CONTRACT_VERSION, HEADER_AUTHORIZATION, HEADER_CACHE, HEADER_CONTRACT,
+    CacheLookupRequest, CacheLookupResponse, CacheMode, CallMeter, DecisionStack, ItemRequest,
+    Operation, CONTRACT_VERSION, HEADER_AUTHORIZATION, HEADER_CACHE, HEADER_CONTRACT,
 };
+use rvbbit_tree::{AskAns, AskReq, ChoiceReq, Decisions};
 use rvbbit_oids::POOL_THREADS;
 use rvbbit_resolve::Endpoint;
 use types_error::{PgError, PgResult};
@@ -345,6 +346,7 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
             system: system.clone(),
             prompt: prompt.clone(),
             labels: if ep.labels.is_empty() { None } else { Some(ep.labels.clone()) },
+            node: None,
             label_descriptions: {
                 if ep.label_descriptions.iter().all(|d| d.is_empty()) {
                     None
@@ -430,6 +432,7 @@ pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
             "items": meter.items,
             "tenant": meter.tenant,
             "generation_id": meter.generation_id,
+            "node": meter.node,
             "ts": meter.timestamp,
         }));
     }
@@ -574,6 +577,224 @@ fn post_once(agent: &ureq::Agent, job: &Job) -> Result<String, PostErr> {
             }
         }
         Err(e) => Err(PostErr::Fatal(format!("hutch transport: {e}"))),
+    }
+}
+
+pub struct DecideReply {
+    pub values: Vec<String>,
+    pub http_calls: u32,
+    pub node_calls: u32,
+    pub memo_hits: u32,
+}
+
+/// Walk `nodes` for every input. One HTTP batch per node per level.
+/// `USING` / `COMBINE` on a node become `decision.models` / `decision.combine`.
+pub fn decide_texts(ep: &Endpoint, nodes: &str, inputs: &[String]) -> PgResult<DecideReply> {
+    let root: serde_json::Value = serde_json::from_str(nodes).map_err(|e| pg(format!("decision tree json: {e}")))?;
+    let mut backend = HutchTree { ep, http_calls: 0 };
+    let report = rvbbit_tree::eval_batch(&root, inputs, &mut backend).map_err(pg)?;
+    Ok(DecideReply {
+        values: report.values,
+        http_calls: backend.http_calls,
+        node_calls: report.node_calls,
+        memo_hits: report.memo_hits,
+    })
+}
+
+struct HutchTree<'a> {
+    ep: &'a Endpoint,
+    http_calls: u32,
+}
+
+impl Decisions for HutchTree<'_> {
+    fn ask(&mut self, req: &AskReq) -> Result<Vec<AskAns>, String> {
+        let body = encode_tree_items(
+            self.ep,
+            Operation::Predict,
+            &req.node,
+            &req.question,
+            &req.inputs,
+            &[],
+            &[],
+            &req.models,
+            &req.combine,
+            Some(req.threshold),
+        )?;
+        let raw = post_tree(self.ep, "predict", body)?;
+        self.http_calls = self.http_calls.saturating_add(raw.http_calls);
+        decode_ask(&raw.body)
+    }
+
+    fn choose(&mut self, req: &ChoiceReq) -> Result<Vec<String>, String> {
+        let body = encode_tree_items(
+            self.ep,
+            Operation::Classify,
+            &req.node,
+            &req.question,
+            &req.inputs,
+            &req.labels,
+            &req.meanings,
+            &req.models,
+            &req.combine,
+            None,
+        )?;
+        let raw = post_tree(self.ep, "classify", body)?;
+        self.http_calls = self.http_calls.saturating_add(raw.http_calls);
+        decode_labels(&raw.body)
+    }
+}
+
+fn post_tree(ep: &Endpoint, op: &str, body: String) -> Result<RawReply, String> {
+    let auth = bearer(ep)?;
+    let ticket = enqueue(
+        format!("{}/v1/{op}", ep.base_url.trim_end_matches('/')),
+        auth,
+        ep,
+        body,
+        cache_header(cache_mode_of(ep), None, None),
+    )
+    .map_err(|e| e.to_string())?;
+    wait_raw(ticket).map_err(|e| e.to_string())
+}
+
+fn encode_tree_items(
+    ep: &Endpoint,
+    operation: Operation,
+    node: &str,
+    question: &str,
+    inputs: &[String],
+    labels: &[String],
+    meanings: &[String],
+    models: &[String],
+    combine: &str,
+    threshold: Option<f64>,
+) -> Result<String, String> {
+    let mut req_items = Vec::with_capacity(inputs.len());
+    for (i, input) in inputs.iter().enumerate() {
+        let inputs = if operation == Operation::Predict {
+            serde_json::json!({ "input": input, "criterion": question })
+        } else {
+            serde_json::json!({ "input": input })
+        };
+        let mut schema_ep = ep.clone();
+        schema_ep.user_prompt = question.to_string();
+        schema_ep.labels = labels.to_vec();
+        schema_ep.label_descriptions = meanings.to_vec();
+        let schema = return_schema(&schema_ep);
+        let cache_key = client_cache_key_hex(&CacheKeyParts {
+            fn_name: &ep.fn_name,
+            fn_version: ep.fn_version,
+            system_prompt: "",
+            user_prompt: question,
+            return_schema: &schema,
+            model: &ep.model,
+            temperature: 0.0,
+            max_tokens: None,
+            take_index: 0,
+            seed: node,
+            inputs: &inputs,
+        });
+        req_items.push(ItemRequest {
+            key: i.to_string(),
+            cache_key,
+            inputs: inputs.clone(),
+            criterion: if operation == Operation::Predict { Some(question.to_string()) } else { None },
+            system: None,
+            prompt: Some(question.to_string()),
+            labels: if labels.is_empty() { None } else { Some(labels.to_vec()) },
+            label_descriptions: if meanings.iter().all(|m| m.is_empty()) {
+                None
+            } else {
+                Some(meanings.to_vec())
+            },
+            node: Some(node_meter(node, question)),
+        });
+    }
+    let stacked = !models.is_empty() || combine == "vote" || threshold.is_some_and(|t| (t - 0.5).abs() > 1e-9);
+    let req = BatchRequest {
+        contract: CONTRACT_VERSION.to_string(),
+        operation,
+        model: ep.model.clone(),
+        temperature: 0.0,
+        max_tokens: None,
+        items: req_items,
+        decision: stacked.then(|| DecisionStack {
+            models: models.to_vec(),
+            takes: None,
+            combine: (combine == "vote").then(|| "vote".to_string()),
+            threshold,
+        }),
+    };
+    serde_json::to_string(&req).map_err(|e| format!("hutch encode: {e}"))
+}
+
+fn node_meter(id: &str, question: &str) -> String {
+    let mut s = format!("{id}:{question}");
+    if s.chars().count() > 120 {
+        s = s.chars().take(120).collect();
+    }
+    s
+}
+
+fn decode_ask(text: &str) -> Result<Vec<AskAns>, String> {
+    let parsed = parsed_batch(text)?;
+    let mut out = Vec::with_capacity(parsed.outputs.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            return Err(format!("hutch item {i}: {} {}", err.code, err.message));
+        }
+        let yes = item
+            .value
+            .as_ref()
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| format!("hutch item {i} is not a bool"))?;
+        let score = item.score.unwrap_or(if yes { 1.0 } else { 0.0 });
+        out.push(AskAns { yes, score });
+    }
+    Ok(out)
+}
+
+fn decode_labels(text: &str) -> Result<Vec<String>, String> {
+    let parsed = parsed_batch(text)?;
+    let mut out = Vec::with_capacity(parsed.outputs.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            return Err(format!("hutch item {i}: {} {}", err.code, err.message));
+        }
+        let label = item
+            .value
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("hutch item {i} has no label"))?;
+        out.push(label.to_string());
+    }
+    Ok(out)
+}
+
+static DECIDE_MEMO: std::sync::LazyLock<Mutex<HashMap<(String, String), String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Answer computed for this tree and input by the batch executor.
+/// The row-at-a-time builtin returns it instead of calling hutch again.
+pub fn remember_decide(tree: &str, input: &str, value: &str) {
+    DECIDE_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((tree.to_string(), input.to_string()), value.to_string());
+}
+
+pub fn recall_decide(tree: &str, input: &str) -> Option<String> {
+    DECIDE_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(tree.to_string(), input.to_string()))
+        .cloned()
+}
+
+pub fn forget_decide(keys: &[(String, String)]) {
+    let mut memo = DECIDE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    for key in keys {
+        memo.remove(key);
     }
 }
 

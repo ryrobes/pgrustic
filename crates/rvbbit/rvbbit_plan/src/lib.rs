@@ -56,11 +56,20 @@ pub fn lift_semantic_filters<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult
         unsafe { plan.with_plan_mut(|p| p.righttree = Some(new_right)) }.expect("plan node");
     }
     lift_list_field(mcx, plan)?;
-    if is_base_scan(plan) && qual_contains_means(&plan.as_plan().expect("plan").qual) {
-        wrap_scan(mcx, plan)
+    // MEANS stays a filter on a Result. A top-level `rvbbit.decide` in a
+    // scan target list is the same kind of Result: the scan emits the
+    // columns, and the Result evaluates the tree. Leaving the call on the
+    // scan would make setrefs turn the Result expression into a plain Var
+    // of an already-computed column, and the batcher would never see it.
+    let plan = if is_base_scan(plan) && qual_contains_means(&plan.as_plan().expect("plan").qual) {
+        wrap_scan(mcx, plan)?
+    } else if is_base_scan(plan) && tlist_contains_decide(&plan.as_plan().expect("plan").targetlist) {
+        wrap_decide(mcx, plan)?
     } else {
-        Ok(plan)
-    }
+        plan
+    };
+    strip_child_decide(mcx, plan)?;
+    Ok(plan)
 }
 
 fn is_base_scan(plan: Node<'_>) -> bool {
@@ -212,6 +221,140 @@ fn add_junk_inputs<'mcx>(
         tlist.lappend(mcx, tle)?;
         next_resno = next_resno.saturating_add(1);
     }
+    Ok(())
+}
+
+/// `pg_proc` name lookup. The decide oid is not a fixed builtin number, and
+/// a fresh backend has not loaded the rvbbit cache yet. Missing seams (planner
+/// unit tests) count as "not decide" so ordinary plans are unchanged.
+fn func_is_decide(funcid: types_core::Oid) -> bool {
+    if rvbbit_resolve::is_decide_func(funcid) {
+        return true;
+    }
+    if !syscache_seams::pg_proc_proname::is_installed()
+        || !syscache_seams::lookup_pg_proc_shape::is_installed()
+        || !syscache_seams::pg_namespace_nspname::is_installed()
+    {
+        return false;
+    }
+    let Ok(Some(name)) = syscache_seams::pg_proc_proname::call(funcid) else {
+        return false;
+    };
+    if name.name_str() != b"decide" {
+        return false;
+    }
+    let Ok(Some(shape)) = syscache_seams::lookup_pg_proc_shape::call(funcid) else {
+        return false;
+    };
+    let Ok(Some(ns)) = syscache_seams::pg_namespace_nspname::call(shape.pronamespace) else {
+        return false;
+    };
+    ns.name_str() == b"rvbbit"
+}
+
+fn expr_contains_decide(node: Node<'_>) -> bool {
+    match node.node_tag() {
+        NodeTag::T_FuncExpr => {
+            let f = node.as_func_expr().expect("FuncExpr");
+            func_is_decide(f.funcid) || f.args.iter().any(expr_contains_decide)
+        }
+        NodeTag::T_BoolExpr => node
+            .as_bool_expr()
+            .expect("BoolExpr")
+            .args
+            .iter()
+            .any(expr_contains_decide),
+        NodeTag::T_RelabelType => expr_contains_decide(node.as_relabel_type().expect("Relabel").arg),
+        NodeTag::T_CoerceViaIO => expr_contains_decide(node.as_coerce_via_io().expect("CoerceViaIO").arg),
+        NodeTag::T_OpExpr => node
+            .as_op_expr()
+            .expect("OpExpr")
+            .args
+            .iter()
+            .any(expr_contains_decide),
+        NodeTag::T_List => node.as_list().is_some_and(|list| list.iter().any(expr_contains_decide)),
+        _ => false,
+    }
+}
+
+fn tlist_contains_decide(tlist: &NodeList<'_>) -> bool {
+    tlist.iter().any(|tle| {
+        tle.as_target_entry()
+            .is_some_and(|te| expr_contains_decide(te.expr))
+    })
+}
+
+fn tlist_without_decide<'mcx>(
+    mcx: Mcx<'mcx>,
+    tlist: &NodeList<'mcx>,
+) -> PgResult<NodeList<'mcx>> {
+    let cloned = tlist.clone_in(mcx)?;
+    let mut kept = NodeList::nil();
+    let mut decide_exprs = NodeList::nil();
+    for tle_node in cloned.iter() {
+        let tle = tle_node.as_target_entry().expect("TargetEntry");
+        if expr_contains_decide(tle.expr) {
+            decide_exprs.lappend(mcx, tle.expr)?;
+        } else {
+            kept.lappend(mcx, tle_node)?;
+        }
+    }
+    let mut resno = 1i16;
+    for tle_node in kept.iter() {
+        unsafe { tle_node.with_mut::<TargetEntry, _>(|te| te.resno = resno) }.expect("TargetEntry");
+        resno = resno.saturating_add(1);
+    }
+    add_junk_inputs(mcx, &decide_exprs, &mut kept)?;
+    Ok(kept)
+}
+
+fn wrap_decide<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {
+    let base = scan.as_plan().expect("scan plan");
+    let result_tlist = base.targetlist.clone_in(mcx)?;
+    let scan_tlist = tlist_without_decide(mcx, &base.targetlist)?;
+    let startup_cost = base.startup_cost;
+    let total_cost = base.total_cost;
+    let plan_rows = base.plan_rows;
+    let plan_width = base.plan_width;
+    unsafe {
+        scan.with_plan_mut(|p| {
+            p.targetlist = scan_tlist;
+            p.parallel_safe = false;
+        })
+    }
+    .expect("scan plan");
+    let mut result = Node::build::<ResultPlan<'mcx>>(mcx)?;
+    result.plan.targetlist = result_tlist;
+    result.plan.qual = NodeList::nil();
+    result.plan.lefttree = Some(scan);
+    result.plan.startup_cost = startup_cost;
+    result.plan.total_cost = total_cost;
+    result.plan.plan_rows = plan_rows;
+    result.plan.plan_width = plan_width;
+    result.plan.parallel_aware = false;
+    result.plan.parallel_safe = false;
+    result.resconstantqual = None;
+    Ok(result.seal())
+}
+
+/// A MEANS Result was wrapped around a scan that still projects `decide`.
+/// Drop that call from the scan so setrefs leaves it on the Result.
+fn strip_child_decide<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<()> {
+    if plan.node_tag() != NodeTag::T_Result {
+        return Ok(());
+    }
+    let Some(child) = plan.as_plan().and_then(|p| p.lefttree) else {
+        return Ok(());
+    };
+    if !is_base_scan(child) {
+        return Ok(());
+    }
+    let tlist = &child.as_plan().expect("scan").targetlist;
+    if !tlist_contains_decide(tlist) {
+        return Ok(());
+    }
+    let new_tlist = tlist_without_decide(mcx, tlist)?;
+    unsafe { child.with_plan_mut(|p| p.targetlist = new_tlist) }.expect("scan");
     Ok(())
 }
 

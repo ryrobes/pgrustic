@@ -48,6 +48,16 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
     by_word: None,
     by_oid: None,
 });
+static TREES: Mutex<Option<HashMap<String, DecisionTree>>> = Mutex::new(None);
+static DECIDE_OID: Mutex<Option<u32>> = Mutex::new(None);
+
+/// One `CREATE DECISION TREE` row, joined to its model's backend.
+#[derive(Clone, Debug)]
+pub struct DecisionTree {
+    pub name: String,
+    pub nodes: String,
+    pub endpoint: Endpoint,
+}
 
 struct Cache {
     by_word: Option<HashMap<String, Resolved>>,
@@ -83,6 +93,29 @@ pub fn execute(sql: &str) -> PgResult<()> {
             "rvbbit catalog hook is not installed".to_string(),
         ))),
     }
+}
+
+pub fn install_trees(trees: Vec<DecisionTree>) {
+    let mut map = HashMap::new();
+    for tree in trees {
+        map.insert(tree.name.to_ascii_lowercase(), tree);
+    }
+    *lock_hooks(&TREES) = Some(map);
+}
+
+pub fn tree(name: &str) -> Option<DecisionTree> {
+    lock_hooks(&TREES)
+        .as_ref()
+        .and_then(|m| m.get(&name.to_ascii_lowercase()).cloned())
+}
+
+/// `pg_proc` oid of `rvbbit.decide(text, text)`.
+pub fn set_decide_oid(oid: u32) {
+    *lock_hooks(&DECIDE_OID) = Some(oid);
+}
+
+pub fn is_decide_func(oid: u32) -> bool {
+    lock_hooks(&DECIDE_OID).is_some_and(|id| id == oid)
 }
 
 pub fn install(entries: Vec<Resolved>) {

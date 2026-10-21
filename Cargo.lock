@@ -17164,6 +17164,7 @@ dependencies = [
  "rvbbit_contract",
  "rvbbit_oids",
  "rvbbit_resolve",
+ "rvbbit_tree",
  "serde_json",
  "types_error",
  "ureq",
@@ -17196,6 +17197,8 @@ version = "0.0.0"
 dependencies = [
  "mcx",
  "rvbbit_resolve",
+ "syscache_seams",
+ "types_core",
  "types_error",
  "types_nodes",
 ]
@@ -17206,6 +17209,13 @@ version = "0.0.0"
 dependencies = [
  "rvbbit_oids",
  "types_error",
+]
+
+[[package]]
+name = "rvbbit_tree"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

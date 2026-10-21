@@ -662,6 +662,11 @@ pub fn ExplainNode<'mcx>(
     stack_depth_core::check_stack_depth()?;
     let plan = plan_of(node);
     let save_indent = es.indent;
+    let decide = if node.node_tag() == NodeTag::T_Result {
+        execmain::decide_shape(es.str.allocator(), &plan.targetlist)?
+    } else {
+        execmain::DecideShape::default()
+    };
 
     let mut strategy: Option<&str> = None;
     let mut partialmode: Option<&str> = None;
@@ -670,6 +675,8 @@ pub fn ExplainNode<'mcx>(
         NodeTag::T_Result => {
             if rvbbit_plan::qual_contains_means(&plan.qual) {
                 ("Semantic Filter", "Semantic Filter")
+            } else if decide.batched {
+                ("Decision Tree", "Decision Tree")
             } else {
                 ("Result", "Result")
             }
@@ -1344,6 +1351,29 @@ pub fn ExplainNode<'mcx>(
                         );
                     }
                 }
+                if decide.present {
+                    ExplainPropertyText("Decide", "per-row", es);
+                }
+            } else if decide.batched {
+                ExplainPropertyText("Decision Tree", "decide", es);
+                ExplainPropertyInteger(
+                    "Batch Size",
+                    None,
+                    rvbbit_resolve::batch_rows() as i64,
+                    es,
+                );
+                if es.analyze {
+                    if let Some(st) = execmain::tree_stats(plan.plan_node_id) {
+                        ExplainPropertyInteger("Batches", None, st.batches as i64, es);
+                        ExplainPropertyInteger("HTTP Calls", None, st.http_calls as i64, es);
+                        ExplainPropertyInteger("Node Calls", None, st.node_calls as i64, es);
+                        ExplainPropertyInteger("Memo Hits", None, st.memo_hits as i64, es);
+                        ExplainPropertyInteger("Tree Rows In", None, st.rows_in as i64, es);
+                        ExplainPropertyInteger("Tree Rows Out", None, st.rows_out as i64, es);
+                    }
+                }
+            } else if decide.present {
+                ExplainPropertyText("Decide", "per-row", es);
             }
         }
         NodeTag::T_Sort => {

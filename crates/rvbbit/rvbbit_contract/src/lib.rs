@@ -87,7 +87,8 @@ pub fn cache_header(mode: CacheMode, key_hex: Option<&str>, ttl_secs: Option<u64
 /// Optional stack of decision-model calls for `predict`, `decide`, and
 /// fixed-label `classify`. Absent means one call to `model` (or the
 /// server default). The SQL parser does not emit this yet; TAKES stays
-/// unimplemented until M5. Hutch-lite honors it when a client sends it.
+/// unimplemented until M5. A decision-tree node with `USING (...) COMBINE`
+/// fills this. Hutch-lite honors it when a client sends it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DecisionStack {
     /// Model slugs, in order. Empty means the request `model`.
@@ -146,6 +147,11 @@ pub struct ItemRequest {
     /// description is empty, so label-only cache keys stay put.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_descriptions: Option<Vec<String>>,
+    /// Decision-tree node id (`n3`). Omitted from the provider body.
+    /// Copied onto each [`CallMeter`] for this item so `rvbbit.calls`
+    /// can group cost by node. Not part of the cache key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -224,6 +230,10 @@ pub struct CallMeter {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
+    /// Decision-tree node that caused this call. Absent for MEANS,
+    /// classify, and extract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

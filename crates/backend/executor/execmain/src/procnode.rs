@@ -3369,6 +3369,7 @@ fn release_owned(node: &mut PlanStateNode<'_>) {
             end_base(&mut rs.ps);
             rs.resconstantqual = None;
             rs.rvbbit.take();
+            rs.tree.take();
         }
         PlanStateNode::ProjectSet(ps) => {
             end_base(&mut ps.ps);

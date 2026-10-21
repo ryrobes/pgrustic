@@ -184,6 +184,69 @@ fn reload() -> PgResult<()> {
         });
     }
     rvbbit_resolve::install(entries);
+    load_trees()?;
+    if let Some(oid) = scalar(
+        "SELECT p.oid::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = 'decide'",
+    )? {
+        if let Ok(oid) = oid.parse::<u32>() {
+            rvbbit_resolve::set_decide_oid(oid);
+        }
+    }
+    Ok(())
+}
+
+fn load_trees() -> PgResult<()> {
+    let rows = query(
+        "SELECT t.name, t.nodes::text, COALESCE(t.version, 1)::text, \
+                COALESCE(m.remote_name, ''), \
+                COALESCE(b.url, ''), b.auth_env, \
+                COALESCE(b.batch_size, 32)::text, COALESCE(b.max_concurrent, 4)::text, \
+                COALESCE(b.timeout_ms, 30000)::text, COALESCE(b.retries, 5)::text \
+         FROM rvbbit.decision_tree t \
+         LEFT JOIN rvbbit.model m ON m.name = t.model_name \
+         LEFT JOIN rvbbit.backend b ON b.oid = m.backend_oid \
+         ORDER BY t.name",
+    )?;
+    let mut trees = Vec::with_capacity(rows.len());
+    for r in rows {
+        let url = {
+            let raw = cell(&r, 4);
+            if raw.is_empty() {
+                rvbbit_resolve::default_base_url()
+            } else {
+                raw
+            }
+        };
+        let auth = {
+            let v = r.get(5).and_then(|c| c.clone());
+            if v.as_deref().unwrap_or("").is_empty() { None } else { v }
+        };
+        trees.push(rvbbit_resolve::DecisionTree {
+            name: cell(&r, 0),
+            nodes: cell(&r, 1),
+            endpoint: Endpoint {
+                base_url: url,
+                auth_env: auth,
+                batch_rows: cell(&r, 6).parse().unwrap_or(32),
+                max_concurrent: cell(&r, 7).parse().unwrap_or(4),
+                timeout_ms: cell(&r, 8).parse().unwrap_or(30_000),
+                retries: cell(&r, 9).parse().unwrap_or(5),
+                model: cell(&r, 3),
+                temperature: 0.0,
+                max_tokens: None,
+                fn_name: cell(&r, 0),
+                fn_version: cell(&r, 2).parse().unwrap_or(1),
+                system_prompt: String::new(),
+                user_prompt: String::new(),
+                return_type: "text".into(),
+                cache_mode: "memoize".into(),
+                labels: Vec::new(),
+                label_descriptions: Vec::new(),
+            },
+        });
+    }
+    rvbbit_resolve::install_trees(trees);
     Ok(())
 }
 
@@ -928,6 +991,27 @@ fn ensure_schema() -> PgResult<()> {
     .is_none()
     {
         exec(CALLS_VIEW)?;
+    } else if scalar(
+        "SELECT 1 FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'rvbbit' AND c.relname = 'calls' \
+           AND a.attname = 'node' AND NOT a.attisdropped",
+    )?
+    .is_none()
+    {
+        exec(CALLS_VIEW)?;
+    }
+    if scalar(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = 'decide'",
+    )?
+    .is_none()
+    {
+        exec(
+            "CREATE FUNCTION rvbbit.decide(tree_name text, input text) RETURNS text \
+             LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_decide'",
+        )?;
     }
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
@@ -1048,12 +1132,12 @@ const SCHEMA_DDL: &[&str] = &[
 const CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.calls AS \
     SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
            latency_ms, provider_latency_ms, cache, items, tenant, \
-           generation_id, ts::timestamptz AS ts \
+           generation_id, node, ts::timestamptz AS ts \
     FROM json_to_recordset(rvbbit.call_log()::json) AS r( \
         op text, model text, tokens_in bigint, tokens_out bigint, \
         cost float8, cost_saved float8, latency_ms float8, \
         provider_latency_ms float8, cache text, items int, \
-        tenant text, generation_id text, ts text)";
+        tenant text, generation_id text, node text, ts text)";
 
 const FUNCTION_DDL: &[&str] = &[
     "CREATE OR REPLACE FUNCTION rvbbit.dump_sql() RETURNS text

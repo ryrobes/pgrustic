@@ -897,6 +897,7 @@ members = [
     "crates/rvbbit/rvbbit_builtins",
     "crates/rvbbit/rvbbit_contract",
     "crates/rvbbit/rvbbit_parse",
+    "crates/rvbbit/rvbbit_tree",
     "crates/rvbbit/rvbbit_resolve",
     "crates/rvbbit/rvbbit_catalog",
     "crates/rvbbit/hutch_mock",

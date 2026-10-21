@@ -489,7 +489,9 @@ fn run_item(
             store(server, &storage, &value, ttl);
             Ok(value)
         }
-        CacheMode::ReadWrite => get_or_compute(server, &storage, ttl, operation, tenant, started, compute),
+        CacheMode::ReadWrite => {
+            get_or_compute(server, &storage, ttl, operation, tenant, started, item.node.clone(), compute)
+        }
     }
 }
 
@@ -500,6 +502,7 @@ fn get_or_compute(
     operation: Operation,
     tenant: &str,
     started: Instant,
+    node: Option<String>,
     compute: impl FnOnce() -> Result<Scored, ItemError>,
 ) -> Result<Scored, ItemError> {
     {
@@ -507,13 +510,21 @@ fn get_or_compute(
         if let Some(hit) = fresh(&cache, storage) {
             cache.hits += 1;
             drop(cache);
-            return Ok(meter_cached(server, operation, tenant, &hit, "hit", started));
+            return Ok(meter_cached(server, operation, tenant, &hit, "hit", started, node.clone()));
         }
         if let Some(flight) = cache.inflight.get(storage).cloned() {
             cache.single_flight_waits += 1;
             drop(cache);
             let shared = wait_flight(&flight)?;
-            return Ok(meter_cached(server, operation, tenant, &shared, "single-flight", started));
+            return Ok(meter_cached(
+                server,
+                operation,
+                tenant,
+                &shared,
+                "single-flight",
+                started,
+                node.clone(),
+            ));
         }
         let flight = Arc::new(Flight {
             lock: Mutex::new(None),
@@ -583,7 +594,17 @@ fn provider_call(
         Operation::Extract => Some(256),
         _ => Some(32),
     });
-    let (text, meter) = chat(server, operation, tenant, &model, req.temperature, max_tokens, &system, &user)
+    let (text, meter) = chat(
+        server,
+        operation,
+        tenant,
+        &model,
+        req.temperature,
+        max_tokens,
+        &system,
+        &user,
+        item.node.clone(),
+    )
         .map_err(|message| item_err("provider", &message))?;
     let value = match operation {
         Operation::Extract => parse_json_value(&text).map_err(|message| item_err("parse", &message))?,
@@ -836,7 +857,7 @@ fn decision_http(
         DecisionKind::Choice => choice_body(model, item)?,
     };
     if !memo {
-        return fetch_decision(server, operation, tenant, model, kind, &body);
+        return fetch_decision(server, operation, tenant, model, kind, &body, item.node.clone());
     }
     // Take index is part of the memo key so stacked repeats each call the
     // provider. It is not sent: the Decisions API has no take field, and
@@ -854,7 +875,7 @@ fn decision_http(
             cache.hits += 1;
             drop(cache);
             let usage = usage_from_body(&text);
-            let meter = saved_meter(operation, tenant, model, &usage, "hit", started);
+            let meter = saved_meter(operation, tenant, model, &usage, "hit", started, item.node.clone());
             record_call(server, &meter);
             return Ok((text, meter));
         }
@@ -863,7 +884,15 @@ fn decision_http(
             drop(cache);
             let text = wait_decision(&existing)?;
             let usage = usage_from_body(&text);
-            let meter = saved_meter(operation, tenant, model, &usage, "single-flight", started);
+            let meter = saved_meter(
+                operation,
+                tenant,
+                model,
+                &usage,
+                "single-flight",
+                started,
+                item.node.clone(),
+            );
             record_call(server, &meter);
             return Ok((text, meter));
         }
@@ -874,7 +903,7 @@ fn decision_http(
         cache.decision_inflight.insert(key.clone(), Arc::clone(&flight));
         flight
     };
-    let result = fetch_decision(server, operation, tenant, model, kind, &body).map(|(text, meter)| {
+    let result = fetch_decision(server, operation, tenant, model, kind, &body, item.node.clone()).map(|(text, meter)| {
         let mut cache = lock(&server.cache);
         cache.decision_memo.insert(key.clone(), text.clone());
         (text, meter)
@@ -901,6 +930,7 @@ fn fetch_decision(
     model: &str,
     kind: DecisionKind,
     body: &str,
+    node: Option<String>,
 ) -> Result<(String, CallMeter), ItemError> {
     {
         let mut cache = lock(&server.cache);
@@ -911,7 +941,7 @@ fn fetch_decision(
         Ok(text) => text,
         Err(message) => {
             let ms = elapsed_ms(started);
-            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms);
+            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms, node.clone());
             record_call(server, &meter);
             return Err(item_err("provider", &message));
         }
@@ -925,7 +955,7 @@ fn fetch_decision(
         fill_generation(server, &mut usage);
     }
     let latency_ms = elapsed_ms(started);
-    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms);
+    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms, node);
     record_call(server, &meter);
     let parsed = match kind {
         DecisionKind::Noul => parse_noul(&text).map(|_| ()),
@@ -1166,6 +1196,7 @@ fn chat(
     max_tokens: Option<u32>,
     system: &str,
     user: &str,
+    node: Option<String>,
 ) -> Result<(String, CallMeter), String> {
     let cfg = &server.cfg;
     let key = cfg.api_key.as_deref().unwrap_or("");
@@ -1197,7 +1228,7 @@ fn chat(
         Ok(text) => text,
         Err(message) => {
             let ms = elapsed_ms(started);
-            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms);
+            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms, node.clone());
             record_call(server, &meter);
             return Err(message);
         }
@@ -1211,7 +1242,7 @@ fn chat(
         fill_generation(server, &mut usage);
     }
     let latency_ms = elapsed_ms(started);
-    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms);
+    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms, node);
     record_call(server, &meter);
     let content = completion_text(&text).map_err(|e| redact(&e, key))?;
     Ok((content, meter))
@@ -1228,6 +1259,7 @@ fn miss_meter(
     usage: &ProviderUsage,
     provider_ms: u64,
     latency_ms: u64,
+    node: Option<String>,
 ) -> CallMeter {
     CallMeter {
         op: op_name(operation).into(),
@@ -1247,6 +1279,7 @@ fn miss_meter(
         tenant: tenant.to_string(),
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
+        node,
     }
 }
 
@@ -1260,6 +1293,7 @@ fn saved_meter(
     usage: &ProviderUsage,
     cache: &str,
     started: Instant,
+    node: Option<String>,
 ) -> CallMeter {
     CallMeter {
         op: op_name(operation).into(),
@@ -1279,6 +1313,7 @@ fn saved_meter(
         tenant: tenant.to_string(),
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
+        node,
     }
 }
 
@@ -1293,6 +1328,7 @@ fn meter_cached(
     stored: &Scored,
     cache: &str,
     started: Instant,
+    node: Option<String>,
 ) -> Scored {
     let meter = CallMeter {
         op: op_name(operation).into(),
@@ -1308,6 +1344,7 @@ fn meter_cached(
         tenant: tenant.to_string(),
         timestamp: rfc3339_now(),
         generation_id: stored.generation_id.clone(),
+        node,
     };
     record_call(server, &meter);
     let mut scored = stored.clone();
@@ -1856,6 +1893,7 @@ mod tests {
             prompt: Some("Does the text match the criterion?".into()),
             labels: None,
             label_descriptions: None,
+            node: None,
         }
     }
 
