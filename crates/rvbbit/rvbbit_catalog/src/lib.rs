@@ -894,7 +894,18 @@ fn ensure_schema() -> PgResult<()> {
         }
     }
     // Clusters created before fixed-label classify have no labels column.
-    exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS labels text")?;
+    // Skip the ALTER when the column is already there. ADD COLUMN IF NOT
+    // EXISTS still emits a notice, and ensure runs on ordinary queries.
+    let have_labels = scalar(
+        "SELECT 1 FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'rvbbit' AND c.relname = 'semfn' \
+           AND a.attname = 'labels' AND NOT a.attisdropped",
+    )?;
+    if have_labels.is_none() {
+        exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS labels text")?;
+    }
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'dump_sql'",
