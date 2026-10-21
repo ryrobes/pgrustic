@@ -289,7 +289,22 @@ short input snippet to that log.
 Hutch `HUTCH_CACHE` is `memory` (default), `off`, or `persistent`.
 Persistent entries are files in `HUTCH_CACHE_DIR` (default `hutch-cache`),
 keyed by the tenant-mixed storage key. A restarted hutch serves them
-with no provider call. `POST /reset` deletes those files.
+with no provider call. Each file also keeps the producing op, model, and
+`produced_cost_usd`, so a lookup after restart still adds that cost to
+`cost_saved_usd` and to the per-op hit count. `POST /reset` deletes those
+files.
+
+`POST /v1/cache/lookup` is a read. A hit adds `produced_cost_usd` to
+`cost_saved_usd` and increments that op+model's `hits` in
+`latency_by_op_model`. A miss is only a missing key: it is not a cache
+miss counter. The follow-up batch counts the miss when it calls the
+provider, so a lookup-then-batch of 32 keys is 32 misses, not 64.
+
+`bash scripts/rvbbit_cache_demo.sh` runs the fake provider. It does not
+call OpenRouter when `OPENROUTER_API_KEY` happens to be set.
+`RVBBIT_CACHE_LIVE=1 bash scripts/rvbbit_cache_demo.sh` opts in: it
+restarts hutch in persistent mode with the key, repeats the call, and
+expects the second process to report `provider_calls` 0.
 
 `rvbbit.calls` reads each distinct hutch URL once. Two backends that
 share a URL do not duplicate the log. The live demo and the tree demo

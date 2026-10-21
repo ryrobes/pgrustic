@@ -10,11 +10,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-pub fn save(dir: &Path, storage: &str, value: &Value, score: Option<f64>, ttl_ms: Option<u128>) {
+/// What a restart needs in order to credit a lookup hit: the value, the
+/// score, and the op/model/cost of the miss that produced it. Older files
+/// that only stored value and score still load; those hits count globally
+/// and do not invent a per-op latency row.
+#[derive(Clone, Debug)]
+pub struct DiskEntry {
+    pub value: Value,
+    pub score: Option<f64>,
+    pub op: String,
+    pub model: String,
+    pub produced_cost_usd: Option<f64>,
+}
+
+pub fn save(dir: &Path, storage: &str, entry: &DiskEntry, ttl_ms: Option<u128>) {
     let _ = fs::create_dir_all(dir);
     let mut body = serde_json::json!({
-        "value": value,
-        "score": score,
+        "value": entry.value,
+        "score": entry.score,
+        "op": entry.op,
+        "model": entry.model,
+        "produced_cost_usd": entry.produced_cost_usd,
     });
     if let Some(ms) = ttl_ms {
         if let Some(n) = serde_json::Number::from_u128(now_ms().saturating_add(ms)) {
@@ -27,7 +43,7 @@ pub fn save(dir: &Path, storage: &str, value: &Value, score: Option<f64>, ttl_ms
     }
 }
 
-pub fn load(dir: &Path, storage: &str) -> Option<(Value, Option<f64>)> {
+pub fn load(dir: &Path, storage: &str) -> Option<DiskEntry> {
     let path = dir.join(format!("{storage}.json"));
     let text = fs::read_to_string(&path).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
@@ -39,7 +55,19 @@ pub fn load(dir: &Path, storage: &str) -> Option<(Value, Option<f64>)> {
     }
     let value = v.get("value")?.clone();
     let score = v.get("score").and_then(|n| n.as_f64()).filter(|n| n.is_finite());
-    Some((value, score))
+    let op = v.get("op").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let model = v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let produced_cost_usd = v
+        .get("produced_cost_usd")
+        .and_then(|n| n.as_f64())
+        .filter(|n| n.is_finite());
+    Some(DiskEntry {
+        value,
+        score,
+        op,
+        model,
+        produced_cost_usd,
+    })
 }
 
 pub fn remove(dir: &Path, storage: &str) {

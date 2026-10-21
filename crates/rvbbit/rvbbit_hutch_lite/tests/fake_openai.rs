@@ -530,6 +530,17 @@ fn persistent_cache_survives_restart() {
         .unwrap();
     assert!(looked.contains("\"hits\""), "{looked}");
     assert!(!looked.contains("\"misses\":[\""), "{looked}");
+    let stats = stats_of(&second.url);
+    assert_eq!(stats["misses"], 0, "a lookup hit is not a miss: {stats}");
+    assert!(stats["hits"].as_u64().unwrap_or(0) >= 1, "{stats}");
+    assert!(
+        near(stats["cost_saved_usd"].as_f64(), 0.00000336),
+        "restarted lookup should credit the stored cost: {stats}"
+    );
+    assert!(
+        predict_hits(&stats) >= 1,
+        "restarted lookup should count a per-op hit: {stats}"
+    );
     let again = post(&format!("{}/v1/predict", second.url), "read-write", &req);
     assert_eq!(again.outputs[0].value, Some(serde_json::json!(true)));
     assert_eq!(second.provider_hits.load(Ordering::SeqCst), 0, "restarted hutch served the file");
@@ -539,6 +550,70 @@ fn persistent_cache_survives_restart() {
 struct Spawned {
     url: String,
     provider_hits: Arc<AtomicU64>,
+}
+
+fn stats_of(url: &str) -> serde_json::Value {
+    let text = ureq::get(&format!("{url}/stats")).call().unwrap().into_string().unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+fn predict_hits(stats: &serde_json::Value) -> u64 {
+    stats["latency_by_op_model"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["op"] == "predict")
+        .map(|row| row["hits"].as_u64().unwrap_or(0))
+        .sum()
+}
+
+fn lookup_body(url: &str, keys: &[String]) -> serde_json::Value {
+    let body = serde_json::json!({ "keys": keys });
+    let text = ureq::post(&format!("{url}/v1/cache/lookup"))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .unwrap()
+        .into_string()
+        .unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn lookup_credits_saved_cost_without_double_counting_misses() {
+    let h = harness(Some("test-key"));
+    let req = predict("TRUE_CASE", "biped");
+    let key = req.items[0].cache_key.clone();
+    let unknown = lookup_body(&h.hutch, &[format!("{key}-absent")]);
+    assert_eq!(unknown["hits"].as_array().unwrap().len(), 0, "{unknown}");
+    assert_eq!(unknown["misses"].as_array().unwrap().len(), 1, "{unknown}");
+    let before = stats_of(&h.hutch);
+    assert_eq!(before["misses"], 0, "lookup does not count a miss: {before}");
+    assert_eq!(before["hits"], 0, "{before}");
+    assert!(near(before["cost_saved_usd"].as_f64(), 0.0), "{before}");
+
+    let got = post(&format!("{}/v1/predict", h.hutch), "read-write", &req);
+    assert_eq!(got.outputs[0].value, Some(serde_json::json!(true)));
+    let produced = stats_of(&h.hutch);
+    assert_eq!(
+        produced["misses"], 1,
+        "the batch miss is the only miss; lookup must not have added one: {produced}"
+    );
+    assert!(near(produced["cost_saved_usd"].as_f64(), 0.0), "{produced}");
+
+    let hit = lookup_body(&h.hutch, &[key]);
+    assert_eq!(hit["hits"].as_array().unwrap().len(), 1, "{hit}");
+    assert!(hit["misses"].as_array().unwrap().is_empty(), "{hit}");
+    let after = stats_of(&h.hutch);
+    assert_eq!(after["misses"], 1, "{after}");
+    assert!(after["hits"].as_u64().unwrap_or(0) >= 1, "{after}");
+    assert!(
+        near(after["cost_saved_usd"].as_f64(), 0.00000336),
+        "lookup hit should add produced_cost_usd: {after}"
+    );
+    assert!(
+        predict_hits(&after) >= 1,
+        "lookup hit should show up in latency_by_op_model: {after}"
+    );
 }
 
 fn spawn_hutch(store: &str, dir: &std::path::Path) -> Spawned {
@@ -802,6 +877,70 @@ fn missing_key_is_a_config_error_without_calling_upstream() {
     let text = resp.into_string().unwrap();
     assert!(text.contains("upstream api key is not set"), "{text}");
     assert_eq!(h.provider_hits.load(Ordering::SeqCst), 0);
+}
+
+/// Real provider, then a second hutch process on the same persistent
+/// directory. Opt in with `RVBBIT_CACHE_LIVE=1` (the cache demo does this).
+/// An ambient `OPENROUTER_API_KEY` is not enough: that flag is what starts
+/// the spend. Does not print the key. Expects the second process to report
+/// `provider_calls` 0.
+#[test]
+#[ignore]
+fn live_persistent_cache_restart() {
+    if std::env::var("RVBBIT_CACHE_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("skip live_persistent_cache_restart: set RVBBIT_CACHE_LIVE=1");
+        return;
+    }
+    let key = match std::env::var("OPENROUTER_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => panic!("RVBBIT_CACHE_LIVE=1 requires OPENROUTER_API_KEY"),
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "hutch-live-persist-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let first = spawn_live(&dir);
+    let mut req = predict(
+        "A large hairy biped crossed the logging road.",
+        "a large biped was seen",
+    );
+    req.model = "mock".into();
+    let got = post(&format!("{}/v1/predict", first), "read-write", &req);
+    let text = serde_json::to_string(&got).unwrap();
+    assert!(!text.contains(&key), "response echoed the api key");
+    assert!(got.outputs[0].error.is_none(), "{text}");
+    assert!(got.outputs[0].value.as_ref().is_some_and(|v| v.is_boolean()), "{text}");
+    let first_stats = stats_of(&first);
+    assert!(
+        first_stats["provider_calls"].as_u64().unwrap_or(0) >= 1,
+        "live call should reach the provider: {first_stats}"
+    );
+    let second = spawn_live(&dir);
+    let again = post(&format!("{}/v1/predict", second), "read-write", &req);
+    let again_text = serde_json::to_string(&again).unwrap();
+    assert!(!again_text.contains(&key), "response echoed the api key");
+    assert!(again.outputs[0].error.is_none(), "{again_text}");
+    let second_stats = stats_of(&second);
+    assert_eq!(
+        second_stats["provider_calls"], 0,
+        "persistent restart should serve the file: {second_stats}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn spawn_live(dir: &std::path::Path) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut cfg = rvbbit_hutch_lite::Config::from_env();
+    cfg.cache_store = "persistent".into();
+    cfg.cache_dir = dir.display().to_string();
+    thread::spawn(move || {
+        let _ = rvbbit_hutch_lite::serve_listener(listener, cfg);
+    });
+    thread::sleep(Duration::from_millis(30));
+    format!("http://127.0.0.1:{port}")
 }
 
 /// One real OpenRouter call. Opt in with `cargo test -p rvbbit_hutch_lite -- --ignored`.

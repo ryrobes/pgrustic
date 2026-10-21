@@ -167,6 +167,10 @@ struct Scored {
     /// USD charged by misses while producing this value. None when there
     /// was no miss, or when a miss omitted cost. Memo hits do not add.
     produced_cost_usd: Option<f64>,
+    /// Operation that produced the value. Empty for a bare put and for a
+    /// file written before op was persisted. Lookup uses it for the
+    /// per-op hit and skips that row when it is empty.
+    op: String,
     model: String,
     generation_id: Option<String>,
     /// Meters for this invocation. Cleared before the value is stored.
@@ -182,6 +186,7 @@ impl Scored {
             score,
             scores,
             produced_cost_usd: None,
+            op: String::new(),
             model: String::new(),
             generation_id: None,
             calls: Vec::new(),
@@ -196,15 +201,30 @@ impl Scored {
         calls: Vec<CallMeter>,
     ) -> Self {
         let (produced_cost_usd, model, generation_id) = summarize_produced(&calls);
+        let op = calls.first().map(|c| c.op.clone()).unwrap_or_default();
         Self {
             value,
             score,
             scores,
             produced_cost_usd,
+            op,
             model,
             generation_id,
             calls,
             identical_takes: None,
+        }
+    }
+
+    fn from_disk(entry: persist::DiskEntry) -> Self {
+        Self {
+            value: entry.value,
+            score: entry.score,
+            scores: None,
+            produced_cost_usd: entry.produced_cost_usd,
+            op: entry.op,
+            model: entry.model,
+            generation_id: None,
+            calls: Vec::new(),
         }
     }
 }
@@ -1804,22 +1824,63 @@ fn storage_of(client_hex: &str, tenant: &str) -> String {
 fn lookup(server: &Server, tenant: &str, req: &CacheLookupRequest) -> String {
     let mut hits = Vec::new();
     let mut misses = Vec::new();
-    let mut cache = lock(&server.cache);
-    for key in &req.keys {
-        let storage = storage_of(key, tenant);
-        if let Some(hit) = fresh(server, &mut cache, &storage) {
-            cache.hits += 1;
-            hits.push(CacheHit {
-                key: key.clone(),
-                output: hit.value,
-                score: hit.score,
-            });
-        } else {
-            cache.misses += 1;
-            misses.push(key.clone());
+    // `record_call` takes the cache lock. Collect meters, drop the lock,
+    // then record so a lookup hit cannot deadlock on itself.
+    let mut credited = Vec::new();
+    {
+        let mut cache = lock(&server.cache);
+        for key in &req.keys {
+            let storage = storage_of(key, tenant);
+            if let Some(hit) = fresh(server, &mut cache, &storage) {
+                cache.hits += 1;
+                if hit.op.is_empty() {
+                    // A put, or a file from before op was stored. Credit
+                    // the dollars when we have them, and do not invent a
+                    // blank latency row.
+                    if let Some(saved) = hit.produced_cost_usd.filter(|n| n.is_finite()) {
+                        cache.cost_saved_usd += saved;
+                    }
+                } else {
+                    credited.push(lookup_hit_meter(tenant, &hit));
+                }
+                hits.push(CacheHit {
+                    key: key.clone(),
+                    output: hit.value,
+                    score: hit.score,
+                });
+            } else {
+                // The key is absent. The follow-up batch counts the miss
+                // if it actually calls the provider. Counting it here made
+                // 32 calls look like 64 misses.
+                misses.push(key.clone());
+            }
         }
     }
+    for meter in &credited {
+        record_call(server, meter);
+    }
     serde_json::to_string(&CacheLookupResponse { hits, misses }).unwrap_or_else(|_| "{}".into())
+}
+
+fn lookup_hit_meter(tenant: &str, stored: &Scored) -> CallMeter {
+    CallMeter {
+        op: stored.op.clone(),
+        model: stored.model.clone(),
+        tokens_in: Some(0),
+        tokens_out: Some(0),
+        cost_usd: Some(0.0),
+        cost_saved_usd: stored.produced_cost_usd,
+        provider_latency_ms: None,
+        latency_ms: 0,
+        cache: "hit".into(),
+        items: 1,
+        tenant: tenant.to_string(),
+        timestamp: rfc3339_now(),
+        generation_id: stored.generation_id.clone(),
+        node: None,
+        score: stored.score,
+        payload: audit_payload(),
+    }
 }
 
 fn put(server: &Server, tenant: &str, req: &CachePutRequest) -> String {
@@ -1872,8 +1933,13 @@ fn store(server: &Server, storage: &str, scored: &Scored, ttl: Duration) {
         persist::save(
             std::path::Path::new(&server.cfg.cache_dir),
             storage,
-            &kept.value,
-            kept.score,
+            &persist::DiskEntry {
+                value: kept.value.clone(),
+                score: kept.score,
+                op: kept.op.clone(),
+                model: kept.model.clone(),
+                produced_cost_usd: kept.produced_cost_usd,
+            },
             ttl_ms,
         );
     }
@@ -1898,8 +1964,8 @@ fn fresh(server: &Server, cache: &mut Cache, storage: &str) -> Option<Scored> {
     if server.cfg.cache_store != "persistent" {
         return None;
     }
-    let (value, score) = persist::load(std::path::Path::new(&server.cfg.cache_dir), storage)?;
-    let scored = Scored::bare(value, score, None);
+    let loaded = persist::load(std::path::Path::new(&server.cfg.cache_dir), storage)?;
+    let scored = Scored::from_disk(loaded);
     cache.entries.insert(
         storage.to_string(),
         CacheEntry {
