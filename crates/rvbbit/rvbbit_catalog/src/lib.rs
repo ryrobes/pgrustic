@@ -17,6 +17,7 @@ use types_error::{PgError, PgResult};
 pub fn ensure_and_load() -> PgResult<()> {
     ensure_schema()?;
     bootstrap_means()?;
+    ensure_about()?;
     reload()
 }
 
@@ -54,7 +55,7 @@ pub fn semfn_def(name: &str) -> PgResult<Option<String>> {
     let rows = query(&format!(
         "SELECT name, argnames::text, argtypes::text, rettype, model_name, system_prompt, \
                 user_prompt, max_tokens::text, temperature::text, cache_mode, tests, version::text, \
-                labels \
+                labels, threshold::text \
          FROM rvbbit.semfn WHERE nsp = 'rvbbit' AND name = {} ORDER BY name",
         qlit(name)
     ))?;
@@ -117,6 +118,7 @@ fn bootstrap_means() -> PgResult<()> {
         symbol: None,
         negator: None,
         version: Some(1),
+        threshold: None,
     })?;
     Ok(())
 }
@@ -129,7 +131,8 @@ fn reload() -> PgResult<()> {
                 COALESCE(m.remote_name, 'mock'), b.url, b.auth_env, \
                 COALESCE(b.batch_size, 32)::text, COALESCE(b.max_concurrent, 4)::text, \
                 COALESCE(b.timeout_ms, 30000)::text, COALESCE(b.retries, 5)::text, \
-                COALESCE(f.cache_mode, 'memoize'), COALESCE(f.labels, '') \
+                COALESCE(f.cache_mode, 'memoize'), COALESCE(f.labels, ''), \
+                COALESCE(o.threshold, f.threshold)::text \
          FROM rvbbit.semfn f \
          LEFT JOIN rvbbit.semop o ON o.func_name = f.name \
          LEFT JOIN rvbbit.model m ON m.name = f.model_name \
@@ -180,6 +183,8 @@ fn reload() -> PgResult<()> {
                 },
                 labels,
                 label_descriptions,
+                threshold: cell_opt(&r, 18).and_then(|s| s.parse().ok()),
+                extract_mode: None,
             },
         });
     }
@@ -243,6 +248,8 @@ fn load_trees() -> PgResult<()> {
                 cache_mode: "memoize".into(),
                 labels: Vec::new(),
                 label_descriptions: Vec::new(),
+                threshold: None,
+                extract_mode: None,
             },
         });
     }
@@ -262,8 +269,18 @@ fn apply(cmd: Command) -> PgResult<()> {
             create_function(or_replace, &name, &args, &returns, &clauses)
         }
         Command::CreateOperator {
-            or_replace, word, left, right, function, symbol, negator, version,
-        } => create_operator(or_replace, &word, &left, &right, &function, symbol.as_deref(), negator.as_deref(), version),
+            or_replace, word, left, right, function, symbol, negator, version, threshold,
+        } => create_operator(
+            or_replace,
+            &word,
+            &left,
+            &right,
+            &function,
+            symbol.as_deref(),
+            negator.as_deref(),
+            version,
+            threshold,
+        ),
         Command::CreateTree { or_replace, name, args, model, body, nodes, version } => {
             create_tree(or_replace, &name, &args, model.as_deref(), &body, &nodes, version)
         }
@@ -417,7 +434,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
         "argnames = {an}, argtypes = {at}, rettype = {rt}, model_name = {model}, \
          system_prompt = {sys}, user_prompt = {prompt}, max_tokens = {max}, temperature = {temp}, \
          cache_mode = {cache}, tests = {tests}, procoid = {procoid}, version = {version_sql}, \
-         labels = {labels}",
+         labels = {labels}, threshold = {threshold}",
         an = text_array(&args.iter().map(|a| a.name.clone()).collect::<Vec<_>>()),
         at = text_array(&args.iter().map(|a| a.typ.clone()).collect::<Vec<_>>()),
         rt = qlit(returns),
@@ -429,6 +446,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
         cache = qlit(clauses.cache.as_deref().unwrap_or("memoize")),
         tests = tests,
         labels = labels_sql(&clauses.labels, &clauses.label_descriptions),
+        threshold = opt_f64(clauses.threshold),
     );
     let oid = if let Some(oid) = existing {
         clear_deps("semfn", &oid)?;
@@ -437,8 +455,8 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
     } else {
         let oid = next_oid()?;
         exec(&format!(
-            "INSERT INTO rvbbit.semfn (oid, name, nsp, argnames, argtypes, rettype, model_name, system_prompt, user_prompt, max_tokens, temperature, cache_mode, tests, procoid, owner_name, version, labels) \
-             VALUES ({oid}, {name}, 'rvbbit', {an}, {at}, {rt}, {model}, {sys}, {prompt}, {max}, {temp}, {cache}, {tests}, {procoid}, current_user, {ver}, {labels})",
+            "INSERT INTO rvbbit.semfn (oid, name, nsp, argnames, argtypes, rettype, model_name, system_prompt, user_prompt, max_tokens, temperature, cache_mode, tests, procoid, owner_name, version, labels, threshold) \
+             VALUES ({oid}, {name}, 'rvbbit', {an}, {at}, {rt}, {model}, {sys}, {prompt}, {max}, {temp}, {cache}, {tests}, {procoid}, current_user, {ver}, {labels}, {threshold})",
             name = qlit(name),
             an = text_array(&args.iter().map(|a| a.name.clone()).collect::<Vec<_>>()),
             at = text_array(&args.iter().map(|a| a.typ.clone()).collect::<Vec<_>>()),
@@ -452,6 +470,7 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
             tests = if clauses.tests.is_empty() { "NULL".to_string() } else { qlit(&clauses.tests.join("\n")) },
             ver = clauses.version.unwrap_or(1),
             labels = labels_sql(&clauses.labels, &clauses.label_descriptions),
+            threshold = opt_f64(clauses.threshold),
         ))?;
         oid
     };
@@ -472,6 +491,7 @@ fn create_operator(
     symbol: Option<&str>,
     negator: Option<&str>,
     version: Option<i64>,
+    threshold: Option<f64>,
 ) -> PgResult<()> {
     let foid = fn_oid(function)?;
     if let Some(oid) = scalar(&format!("SELECT oid::text FROM rvbbit.semop WHERE word = {}", qlit(word)))? {
@@ -481,21 +501,22 @@ fn create_operator(
         clear_deps("semop", &oid)?;
         exec(&format!(
             "UPDATE rvbbit.semop SET symbol = {sym}, lefttype = {left}, righttype = {right}, \
-             func_name = {func}, negator = {neg}, version = {ver} WHERE oid = {oid}",
+             func_name = {func}, negator = {neg}, version = {ver}, threshold = {threshold} WHERE oid = {oid}",
             sym = opt_text(&symbol.map(|s| s.to_string())),
             left = qlit(left),
             right = qlit(right),
             func = qlit(function),
             neg = opt_text(&negator.map(|s| s.to_string())),
             ver = version_expr(version),
+            threshold = opt_f64(threshold),
         ))?;
         depend("semop", &oid, "semfn", &foid)?;
         return Ok(());
     }
     let oid = next_oid()?;
     exec(&format!(
-        "INSERT INTO rvbbit.semop (oid, word, symbol, lefttype, righttype, func_name, negator, owner_name, version) \
-         VALUES ({oid}, {word}, {sym}, {left}, {right}, {func}, {neg}, current_user, {ver})",
+        "INSERT INTO rvbbit.semop (oid, word, symbol, lefttype, righttype, func_name, negator, owner_name, version, threshold) \
+         VALUES ({oid}, {word}, {sym}, {left}, {right}, {func}, {neg}, current_user, {ver}, {threshold})",
         word = qlit(word),
         sym = opt_text(&symbol.map(|s| s.to_string())),
         left = qlit(left),
@@ -503,6 +524,7 @@ fn create_operator(
         func = qlit(function),
         neg = opt_text(&negator.map(|s| s.to_string())),
         ver = version.unwrap_or(1),
+        threshold = opt_f64(threshold),
     ))?;
     depend("semop", &oid, "semfn", &foid)?;
     Ok(())
@@ -971,6 +993,12 @@ fn ensure_schema() -> PgResult<()> {
     if have_labels.is_none() {
         exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS labels text")?;
     }
+    if !catalog_column("semfn", "threshold")? {
+        exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS threshold float8")?;
+    }
+    if !catalog_column("semop", "threshold")? {
+        exec("ALTER TABLE rvbbit.semop ADD COLUMN IF NOT EXISTS threshold float8")?;
+    }
     // rvbbit.calls is a view over the live hutch log. Clusters created
     // before it already have dump_sql, so this is not part of FUNCTION_DDL.
     if scalar(
@@ -991,15 +1019,7 @@ fn ensure_schema() -> PgResult<()> {
     .is_none()
     {
         exec(CALLS_VIEW)?;
-    } else if scalar(
-        "SELECT 1 FROM pg_attribute a \
-         JOIN pg_class c ON c.oid = a.attrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = 'rvbbit' AND c.relname = 'calls' \
-           AND a.attname = 'node' AND NOT a.attisdropped",
-    )?
-    .is_none()
-    {
+    } else if !catalog_column("calls", "node")? || !catalog_column("calls", "score")? {
         exec(CALLS_VIEW)?;
     }
     if scalar(
@@ -1074,6 +1094,7 @@ const SCHEMA_DDL: &[&str] = &[
         comment text,
         version int NOT NULL DEFAULT 1,
         labels text,
+        threshold float8,
         UNIQUE (nsp, name))",
     "CREATE TABLE IF NOT EXISTS rvbbit.semop (
         oid oid PRIMARY KEY,
@@ -1085,7 +1106,8 @@ const SCHEMA_DDL: &[&str] = &[
         negator text,
         owner_name text NOT NULL,
         comment text,
-        version int NOT NULL DEFAULT 1)",
+        version int NOT NULL DEFAULT 1,
+        threshold float8)",
     "CREATE TABLE IF NOT EXISTS rvbbit.decision_tree (
         oid oid PRIMARY KEY,
         name text UNIQUE NOT NULL,
@@ -1132,12 +1154,12 @@ const SCHEMA_DDL: &[&str] = &[
 const CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.calls AS \
     SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
            latency_ms, provider_latency_ms, cache, items, tenant, \
-           generation_id, node, ts::timestamptz AS ts \
+           generation_id, node, score, ts::timestamptz AS ts \
     FROM json_to_recordset(rvbbit.call_log()::json) AS r( \
         op text, model text, tokens_in bigint, tokens_out bigint, \
         cost float8, cost_saved float8, latency_ms float8, \
         provider_latency_ms float8, cache text, items int, \
-        tenant text, generation_id text, node text, ts text)";
+        tenant text, generation_id text, node text, score float8, ts text)";
 
 const FUNCTION_DDL: &[&str] = &[
     "CREATE OR REPLACE FUNCTION rvbbit.dump_sql() RETURNS text
@@ -1207,7 +1229,8 @@ fn render_dump() -> PgResult<String> {
     }
     let fns = query(
         "SELECT name, argnames::text, argtypes::text, rettype, model_name, system_prompt, user_prompt, \
-                max_tokens::text, temperature::text, cache_mode, tests, version::text, labels, comment \
+                max_tokens::text, temperature::text, cache_mode, tests, version::text, labels, \
+                threshold::text, comment \
          FROM rvbbit.semfn WHERE nsp = 'rvbbit' ORDER BY name",
     )?;
     for r in &fns {
@@ -1215,7 +1238,7 @@ fn render_dump() -> PgResult<String> {
         out.push('\n');
     }
     let ops = query(
-        "SELECT word, lefttype, righttype, func_name, symbol, negator, version::text, comment FROM rvbbit.semop ORDER BY word",
+        "SELECT word, lefttype, righttype, func_name, symbol, negator, version::text, threshold::text, comment FROM rvbbit.semop ORDER BY word",
     )?;
     for r in &ops {
         out.push_str(&format!(
@@ -1230,6 +1253,9 @@ fn render_dump() -> PgResult<String> {
         }
         if let Some(neg) = cell_opt(r, 5) {
             out.push_str(&format!(", NEGATOR = {neg}"));
+        }
+        if let Some(threshold) = cell_opt(r, 7) {
+            out.push_str(&format!(", THRESHOLD = {threshold}"));
         }
         out.push_str(&format!(") VERSION {};\n", cell(r, 6)));
     }
@@ -1347,6 +1373,9 @@ fn render_function(r: &[Option<String>]) -> String {
     }
     if let Some(temp) = cell_opt(r, 8) {
         s.push_str(&format!(" TEMPERATURE {temp}"));
+    }
+    if let Some(threshold) = cell_opt(r, 13) {
+        s.push_str(&format!(" THRESHOLD {threshold}"));
     }
     if let Some(cache) = cell_opt(r, 9) {
         s.push_str(&format!(" CACHE {}", qident(&cache)));
@@ -1474,6 +1503,19 @@ fn fn_oid(name: &str) -> PgResult<String> {
 
 fn next_oid() -> PgResult<String> {
     scalar("SELECT nextval('rvbbit.oid_seq')::oid::text")?.ok_or_else(|| pg("oid sequence returned nothing"))
+}
+
+fn catalog_column(rel: &str, column: &str) -> PgResult<bool> {
+    Ok(scalar(&format!(
+        "SELECT 1 FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'rvbbit' AND c.relname = {} \
+           AND a.attname = {} AND NOT a.attisdropped",
+        qlit(rel),
+        qlit(column)
+    ))?
+    .is_some())
 }
 
 fn must(v: Option<String>, kind: &str, name: &str) -> PgResult<String> {
@@ -1621,11 +1663,72 @@ fn dollar(s: &str) -> String {
 pub fn hutch_urls() -> PgResult<Vec<String>> {
     ensure_schema()?;
     let rows = query("SELECT url FROM rvbbit.backend WHERE kind = 'hutch' ORDER BY name")?;
-    Ok(rows
+    let mut urls = Vec::new();
+    let mut seen = Vec::new();
+    for mut row in rows {
+        let Some(Some(url)) = row.pop() else { continue };
+        let key = url.trim().trim_end_matches('/').to_string();
+        if key.is_empty() || seen.iter().any(|s: &String| s == &key) {
+            continue;
+        }
+        seen.push(key);
+        urls.push(url);
+    }
+    Ok(urls)
+}
+
+/// `about` is MEANS with a higher noul cutoff. Broad criteria score in
+/// the 0.9s, so the server default of 0.5 matches them. Copy the current
+/// `means` row the first time so ABOUT uses the same model and prompts.
+fn ensure_about() -> PgResult<()> {
+    if scalar("SELECT 1 FROM rvbbit.semfn WHERE nsp = 'rvbbit' AND name = 'about'")?.is_some() {
+        return Ok(());
+    }
+    let rows = query(
+        "SELECT model_name, system_prompt, user_prompt, max_tokens::text, temperature::text, \
+                cache_mode, argnames::text, argtypes::text, rettype \
+         FROM rvbbit.semfn WHERE nsp = 'rvbbit' AND name = 'means'",
+    )?;
+    let Some(r) = rows.into_iter().next() else {
+        return Ok(());
+    };
+    let names = parse_pg_array(&cell(&r, 6));
+    let types = parse_pg_array(&cell(&r, 7));
+    if names.len() != types.len() || names.is_empty() {
+        return Ok(());
+    }
+    let mut clauses = FnClauses::default();
+    clauses.model = cell_opt(&r, 0);
+    clauses.system = cell_opt(&r, 1);
+    clauses.prompt = cell_opt(&r, 2);
+    clauses.max_tokens = cell_opt(&r, 3).and_then(|s| s.parse().ok());
+    clauses.temperature = cell_opt(&r, 4).and_then(|s| s.parse().ok());
+    clauses.cache = cell_opt(&r, 5);
+    clauses.threshold = Some(0.9);
+    let args = names
         .into_iter()
-        .filter_map(|mut row| row.pop())
-        .flatten()
-        .collect())
+        .zip(types)
+        .map(|(name, typ)| Arg { name, typ })
+        .collect();
+    apply(Command::CreateFunction {
+        or_replace: true,
+        name: "about".into(),
+        args,
+        returns: cell(&r, 8),
+        clauses,
+    })?;
+    apply(Command::CreateOperator {
+        or_replace: true,
+        word: "about".into(),
+        left: "text".into(),
+        right: "text".into(),
+        function: "about".into(),
+        symbol: None,
+        negator: None,
+        version: Some(1),
+        threshold: None,
+    })?;
+    Ok(())
 }
 
 fn pg(message: impl Into<String>) -> Box<PgError> {

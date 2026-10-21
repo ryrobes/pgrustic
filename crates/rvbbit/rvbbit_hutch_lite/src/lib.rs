@@ -607,7 +607,8 @@ fn provider_call(
     )
         .map_err(|message| item_err("provider", &message))?;
     let value = match operation {
-        Operation::Extract => parse_json_value(&text).map_err(|message| item_err("parse", &message))?,
+        Operation::Extract => parse_extract(&text, item.extract_mode.as_deref())
+            .map_err(|message| item_err("parse", &message))?,
         Operation::Classify => serde_json::Value::String(text.trim().to_string()),
         _ => return Err(item_err("unsupported", "operation is not implemented in hutch-lite")),
     };
@@ -626,7 +627,13 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| match operation {
             Operation::Predict => "Answer with only true or false.".into(),
-            Operation::Extract => "Return only JSON. No markdown.".into(),
+            Operation::Extract => {
+                if item.extract_mode.as_deref() == Some("scalar") {
+                    "Return one short noun or literal, at most three words. No sentence, no description, no markdown, no quotes.".into()
+                } else {
+                    "Return only JSON. No markdown.".into()
+                }
+            }
             Operation::Classify => "Reply with only the label.".into(),
             _ => String::new(),
         });
@@ -642,7 +649,11 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
         }
         Operation::Extract => {
             let input = json_str(&item.inputs, "input").unwrap_or_else(|| item.inputs.to_string());
-            format!("Extract JSON from this text:\n{input}")
+            if item.extract_mode.as_deref() == Some("scalar") {
+                format!("Extract one short value from this text:\n{input}")
+            } else {
+                format!("Extract JSON from this text:\n{input}")
+            }
         }
         Operation::Classify => {
             let input = json_str(&item.inputs, "input").unwrap_or_else(|| item.inputs.to_string());
@@ -875,7 +886,16 @@ fn decision_http(
             cache.hits += 1;
             drop(cache);
             let usage = usage_from_body(&text);
-            let meter = saved_meter(operation, tenant, model, &usage, "hit", started, item.node.clone());
+            let meter = saved_meter(
+                operation,
+                tenant,
+                model,
+                &usage,
+                "hit",
+                started,
+                item.node.clone(),
+                decision_score(kind, &text),
+            );
             record_call(server, &meter);
             return Ok((text, meter));
         }
@@ -892,6 +912,7 @@ fn decision_http(
                 "single-flight",
                 started,
                 item.node.clone(),
+                decision_score(kind, &text),
             );
             record_call(server, &meter);
             return Ok((text, meter));
@@ -941,7 +962,7 @@ fn fetch_decision(
         Ok(text) => text,
         Err(message) => {
             let ms = elapsed_ms(started);
-            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms, node.clone());
+            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms, node.clone(), None);
             record_call(server, &meter);
             return Err(item_err("provider", &message));
         }
@@ -955,7 +976,16 @@ fn fetch_decision(
         fill_generation(server, &mut usage);
     }
     let latency_ms = elapsed_ms(started);
-    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms, node);
+    let meter = miss_meter(
+        operation,
+        tenant,
+        model,
+        &usage,
+        provider_ms,
+        latency_ms,
+        node,
+        decision_score(kind, &text),
+    );
     record_call(server, &meter);
     let parsed = match kind {
         DecisionKind::Noul => parse_noul(&text).map(|_| ()),
@@ -1228,7 +1258,7 @@ fn chat(
         Ok(text) => text,
         Err(message) => {
             let ms = elapsed_ms(started);
-            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms, node.clone());
+            let meter = miss_meter(operation, tenant, model, &ProviderUsage::default(), ms, ms, node.clone(), None);
             record_call(server, &meter);
             return Err(message);
         }
@@ -1242,7 +1272,7 @@ fn chat(
         fill_generation(server, &mut usage);
     }
     let latency_ms = elapsed_ms(started);
-    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms, node);
+    let meter = miss_meter(operation, tenant, model, &usage, provider_ms, latency_ms, node, None);
     record_call(server, &meter);
     let content = completion_text(&text).map_err(|e| redact(&e, key))?;
     Ok((content, meter))
@@ -1260,6 +1290,7 @@ fn miss_meter(
     provider_ms: u64,
     latency_ms: u64,
     node: Option<String>,
+    score: Option<f64>,
 ) -> CallMeter {
     CallMeter {
         op: op_name(operation).into(),
@@ -1280,6 +1311,7 @@ fn miss_meter(
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
         node,
+        score,
     }
 }
 
@@ -1294,6 +1326,7 @@ fn saved_meter(
     cache: &str,
     started: Instant,
     node: Option<String>,
+    score: Option<f64>,
 ) -> CallMeter {
     CallMeter {
         op: op_name(operation).into(),
@@ -1314,6 +1347,7 @@ fn saved_meter(
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
         node,
+        score,
     }
 }
 
@@ -1345,6 +1379,7 @@ fn meter_cached(
         timestamp: rfc3339_now(),
         generation_id: stored.generation_id.clone(),
         node,
+        score: stored.score,
     };
     record_call(server, &meter);
     let mut scored = stored.clone();
@@ -1467,6 +1502,61 @@ pub fn parse_bool(text: &str) -> Option<bool> {
         "true" | "yes" => Some(true),
         "false" | "no" => Some(false),
         _ => None,
+    }
+}
+
+fn parse_extract(text: &str, mode: Option<&str>) -> Result<serde_json::Value, String> {
+    match mode.unwrap_or("json") {
+        "json" => parse_json_value(text),
+        "scalar" => parse_scalar_value(text),
+        other => Err(format!("extract mode {other} is not json or scalar")),
+    }
+}
+
+/// Typed scalar extract. A JSON string, number, bool, or null is that
+/// value. Any other non-empty answer is the trimmed text, so a model
+/// that returns `sasquatch` instead of a JSON string still caches.
+/// A JSON object or array is an error: that is the json mode's job.
+pub fn parse_scalar_value(text: &str) -> Result<serde_json::Value, String> {
+    let stripped = strip_fences(text.trim());
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stripped) {
+        return match v {
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                Err("scalar extract got a JSON object or array".into())
+            }
+            other => Ok(other),
+        };
+    }
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return Err("scalar extract was empty".into());
+    }
+    Ok(serde_json::Value::String(unwrap_quotes(trimmed).to_string()))
+}
+
+fn unwrap_quotes(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 {
+        let quote = bytes[0];
+        if (quote == b'"' || quote == b'\'') && bytes[bytes.len() - 1] == quote {
+            return &text[1..text.len() - 1];
+        }
+    }
+    text
+}
+
+/// Noul value, or the highest choice probability. Absent when the body
+/// is not a decision answer.
+fn decision_score(kind: DecisionKind, text: &str) -> Option<f64> {
+    match kind {
+        DecisionKind::Noul => parse_noul(text).ok(),
+        DecisionKind::Choice => parse_choice(text).ok().and_then(|hit| {
+            hit.probabilities
+                .values()
+                .copied()
+                .filter(|n| n.is_finite())
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        }),
     }
 }
 
@@ -1894,6 +1984,7 @@ mod tests {
             labels: None,
             label_descriptions: None,
             node: None,
+            extract_mode: None,
         }
     }
 
@@ -2001,6 +2092,48 @@ mod tests {
         );
         assert!(new_choice.contains(r#""bigfoot":"bigfoot""#), "{new_choice}");
         assert!(!new_choice.contains("best described"), "{new_choice}");
+    }
+
+    /// The fixed six-row sighting set, with the live MEANS prompt.
+    /// `noul_body` is the JSON `decision_http` posts for a noul question.
+    /// Provider `input_tokens` also include Jev's own wrapper, so a live
+    /// count near 300 is this body plus that wrapper.
+    #[test]
+    fn six_row_fixture_decisions_body_is_trimmed() {
+        let model = "typesafe/jev-1.14";
+        let criterion = "a large hairy biped was seen";
+        let rows = [
+            "A tall hairy figure crossed the logging road on two legs and left huge prints.",
+            "We heard wood knocks, then a dark biped stepped over the creek.",
+            "A deer bolted through the ferns at dusk.",
+            "An owl called from the ridge and nothing else moved.",
+            "Something ape-like stood at the tree line and walked upright into the timber.",
+            "Campers reported a black bear turning over a cooler.",
+        ];
+        let expected = [(79, 240), (77, 225), (72, 202), (74, 214), (79, 239), (73, 214)];
+        for (input, (tokens, bytes)) in rows.iter().zip(expected) {
+            let item = demo_item(input, criterion);
+            let body = noul_body(model, &item).unwrap();
+            assert_eq!(body.matches(criterion).count(), 1, "{body}");
+            assert!(!body.contains("criteria"), "{body}");
+            assert!(body.contains(&format!("\"state\":\"{input}\"")), "{body}");
+            assert_eq!(rough_tokens(&body), tokens, "{body}");
+            assert_eq!(body.len(), bytes, "{body}");
+        }
+    }
+
+    #[test]
+    fn scalar_extract_accepts_plain_text_and_json_scalars() {
+        assert_eq!(parse_scalar_value("sasquatch").unwrap(), serde_json::json!("sasquatch"));
+        assert_eq!(parse_scalar_value("  \"sasquatch\"  ").unwrap(), serde_json::json!("sasquatch"));
+        assert_eq!(parse_scalar_value("12").unwrap(), serde_json::json!(12));
+        assert_eq!(parse_scalar_value("true").unwrap(), serde_json::json!(true));
+        assert!(parse_scalar_value("{\"creature\":\"sasquatch\"}").is_err());
+        assert!(parse_json_value("sasquatch").is_err());
+        assert_eq!(
+            parse_json_value("{\"creature\":\"sasquatch\"}").unwrap()["creature"],
+            "sasquatch"
+        );
     }
 
     #[test]

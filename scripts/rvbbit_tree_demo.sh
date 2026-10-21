@@ -26,6 +26,9 @@ PGDATA=${PGDATA:-/tmp/rvbbit-tree-pg}
 RUNDIR=${RUNDIR:-/tmp/rvbbit-tree-demo}
 DECISION=${HUTCH_DECISION_MODEL:-typesafe/jev-1.14}
 export HUTCH_DECISION_MODEL="$DECISION"
+# rvbbit.calls and the bootstrap backend use this URL. Without it,
+# call_log reads the default port 8099 and the query fails.
+export RVBBIT_HUTCH_URL="http://127.0.0.1:${HUTCH_PORT}"
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
 export PATH="$PG_BIN:$PATH"
@@ -148,7 +151,7 @@ cat >"$RUNDIR/setup.sql" <<SQL
 CREATE BACKEND live TYPE hutch URL 'http://127.0.0.1:${HUTCH_PORT}';
 CREATE MODEL jev ON BACKEND live NAME '${DECISION//\'/\'\'}';
 CREATE DECISION TREE bigfoot_triage (notes text) MODEL jev AS
-  ASK 'Is this a credible report of an unknown creature rather than a known animal?'
+  ASK 'Does the report describe an unknown upright hairy figure, tracks, or knocks?'
     YES: CHOOSE 'Which report class fits?'
       WHEN 'class a' MEANING 'a witness saw a large upright figure' THEN
         ASK 'Does this class A report need a follow-up interview?'
@@ -212,6 +215,7 @@ FROM ufo_sample
 ORDER BY id;
 SELECT cache, op, node,
        count(*) AS calls,
+       round(avg(score)::numeric, 3) AS score,
        sum(cost) AS cost,
        avg(provider_latency_ms) AS provider_ms
 FROM rvbbit.calls

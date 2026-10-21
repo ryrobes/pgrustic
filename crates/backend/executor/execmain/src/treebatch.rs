@@ -36,7 +36,7 @@ use crate::noderesult::{lane_result_gate, lane_result_project, ResultState};
 use crate::procnode::exec_proc_node;
 use crate::semantic::{self, SavedTuple};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TreeStats {
     pub batches: u64,
     pub http_calls: u64,
@@ -44,6 +44,9 @@ pub struct TreeStats {
     pub memo_hits: u64,
     pub rows_in: u64,
     pub rows_out: u64,
+    /// Last batch's node scores, `id=0.12` per visit, rows separated by
+    /// spaces. Empty before any batch. Capped for EXPLAIN.
+    pub scores: String,
 }
 
 /// Where `rvbbit.decide` sits in a Result target list.
@@ -67,7 +70,7 @@ pub fn tree_stats(plan_node_id: i32) -> Option<TreeStats> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&plan_node_id)
-        .copied()
+        .cloned()
 }
 
 pub fn decide_shape<'mcx>(mcx: Mcx<'mcx>, tlist: &NodeList<'mcx>) -> PgResult<DecideShape> {
@@ -191,6 +194,7 @@ pub struct TreeState<'mcx> {
     memo_hits: u64,
     rows_in: u64,
     rows_out: u64,
+    scores: String,
 }
 
 impl<'mcx> TreeState<'mcx> {
@@ -202,6 +206,7 @@ impl<'mcx> TreeState<'mcx> {
             memo_hits: self.memo_hits,
             rows_in: self.rows_in,
             rows_out: self.rows_out,
+            scores: self.scores.clone(),
         }
     }
 
@@ -261,6 +266,7 @@ pub fn compile<'mcx>(
         memo_hits: 0,
         rows_in: 0,
         rows_out: 0,
+        scores: String::new(),
     })))
 }
 
@@ -442,6 +448,7 @@ impl<'mcx> TreeState<'mcx> {
             self.http_calls += reply.http_calls as u64;
             self.node_calls += reply.node_calls as u64;
             self.memo_hits += reply.memo_hits as u64;
+            self.scores = format_node_scores(&reply.scores);
             for (input, value) in inputs.iter().zip(reply.values.iter()) {
                 rvbbit_dispatch::remember_decide(name, input, value);
                 forget.0.push((name.clone(), input.clone()));
@@ -464,6 +471,28 @@ impl<'mcx> TreeState<'mcx> {
         drop(forget);
         Ok(())
     }
+}
+
+fn format_node_scores(scores: &[Vec<(String, f64)>]) -> String {
+    let mut out = String::new();
+    for (i, row) in scores.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        for (j, (id, score)) in row.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("{id}={score:.2}"));
+        }
+        if out.chars().count() > 180 {
+            break;
+        }
+    }
+    if out.chars().count() > 180 {
+        out = out.chars().take(180).collect();
+    }
+    out
 }
 
 fn err(message: impl Into<String>) -> Box<PgError> {

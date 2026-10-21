@@ -48,7 +48,13 @@ pub struct ChoiceReq {
 
 pub trait Decisions {
     fn ask(&mut self, req: &AskReq) -> Result<Vec<AskAns>, String>;
-    fn choose(&mut self, req: &ChoiceReq) -> Result<Vec<String>, String>;
+    fn choose(&mut self, req: &ChoiceReq) -> Result<Vec<ChoiceAns>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChoiceAns {
+    pub label: String,
+    pub score: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +67,9 @@ pub struct EvalReport {
     pub memo_hits: u32,
     /// Wavefront rounds. A leaf-only tree is 0.
     pub levels: u32,
+    /// Per row, each node the row visited and that node's score.
+    /// An ask score is the noul. A choose score is the winning probability.
+    pub scores: Vec<Vec<(String, f64)>>,
 }
 
 #[derive(Clone)]
@@ -98,10 +107,11 @@ pub fn eval_batch(
 ) -> Result<EvalReport, String> {
     let built = build(root)?;
     let mut at = vec![built.root; inputs.len()];
-    let mut memo: std::collections::HashMap<(usize, String), Step> = std::collections::HashMap::new();
+    let mut memo: std::collections::HashMap<(usize, String), MemoAns> = std::collections::HashMap::new();
     let mut node_calls = 0u32;
     let mut memo_hits = 0u32;
     let mut levels = 0u32;
+    let mut scores: Vec<Vec<(String, f64)>> = vec![Vec::new(); inputs.len()];
     for _ in 0..32 {
         let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
         for (row, node) in at.iter().enumerate() {
@@ -143,17 +153,18 @@ pub fn eval_batch(
                     memo.insert((node_idx, input), step);
                 }
             }
+            let id = node_name(&built.nodes[node_idx]).to_string();
             for row in rows {
-                let step = memo
+                let hit = memo
                     .get(&(node_idx, inputs[row].clone()))
                     .cloned()
-                    .ok_or_else(|| format!("node {} has no answer", node_name(&built.nodes[node_idx])))?;
-                at[row] = match step {
+                    .ok_or_else(|| format!("node {id} has no answer"))?;
+                if let Some(score) = hit.score {
+                    scores[row].push((id.clone(), score));
+                }
+                at[row] = match hit.step {
                     Step::Go(next) => next,
-                    Step::Done(value) => {
-                        let _ = value;
-                        node_idx
-                    }
+                    Step::Done(_) => node_idx,
                 };
             }
         }
@@ -175,7 +186,14 @@ pub fn eval_batch(
         node_calls,
         memo_hits,
         levels,
+        scores,
     })
+}
+
+#[derive(Clone)]
+struct MemoAns {
+    step: Step,
+    score: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -184,7 +202,7 @@ enum Step {
     Done(String),
 }
 
-fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> Result<Vec<Step>, String> {
+fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> Result<Vec<MemoAns>, String> {
     match node {
         Node::Ask {
             id,
@@ -204,7 +222,12 @@ fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> R
                 threshold: *threshold,
             })?;
             ans.into_iter()
-                .map(|a| Ok(Step::Go(if a.yes { *yes } else { *no })))
+                .map(|a| {
+                    Ok(MemoAns {
+                        step: Step::Go(if a.yes { *yes } else { *no }),
+                        score: Some(a.score),
+                    })
+                })
                 .collect()
         }
         Node::Choose {
@@ -227,15 +250,24 @@ fn ask_node(node: &Node, inputs: &[String], decisions: &mut impl Decisions) -> R
             })?;
             chosen
                 .into_iter()
-                .map(|label| {
+                .map(|choice| {
                     arms.iter()
-                        .find(|(name, _, _)| name == &label)
-                        .map(|(_, _, next)| Step::Go(*next))
-                        .ok_or_else(|| format!("choose {id} has no branch for {label}"))
+                        .find(|(name, _, _)| name == &choice.label)
+                        .map(|(_, _, next)| MemoAns {
+                            step: Step::Go(*next),
+                            score: Some(choice.score),
+                        })
+                        .ok_or_else(|| format!("choose {id} has no branch for {}", choice.label))
                 })
                 .collect()
         }
-        Node::Leaf { value } => Ok(vec![Step::Done(value.clone()); inputs.len()]),
+        Node::Leaf { value } => Ok(vec![
+            MemoAns {
+                step: Step::Done(value.clone()),
+                score: None,
+            };
+            inputs.len()
+        ]),
     }
 }
 
@@ -421,21 +453,24 @@ mod tests {
                 .collect())
         }
 
-        fn choose(&mut self, req: &ChoiceReq) -> Result<Vec<String>, String> {
+        fn choose(&mut self, req: &ChoiceReq) -> Result<Vec<ChoiceAns>, String> {
             self.choose_calls += 1;
             let _ = req.models;
             Ok(req
                 .inputs
                 .iter()
                 .map(|text| {
-                    if text.contains("track") || text.contains("knock") {
+                    let label = if text.contains("track") || text.contains("knock") {
                         "class b"
                     } else if text.contains("told me") {
                         "class c"
                     } else {
                         "class a"
+                    };
+                    ChoiceAns {
+                        label: label.into(),
+                        score: 0.8,
                     }
-                    .into()
                 })
                 .collect())
         }
@@ -503,5 +538,8 @@ mod tests {
         assert_eq!(report.levels, 3);
         assert_eq!(fake.last_models, vec!["typesafe/high".to_string(), "typesafe/low".to_string()]);
         assert_eq!(fake.last_combine, "vote");
+        assert_eq!(report.scores[2], vec![("n1".into(), 0.2)]);
+        assert_eq!(report.scores[0][0], ("n1".into(), 0.9));
+        assert_eq!(report.scores[3][1], ("n2".into(), 0.8));
     }
 }

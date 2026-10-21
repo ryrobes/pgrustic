@@ -160,7 +160,7 @@ remote name still becomes `HUTCH_DECISION_MODEL`.
 
 ```sql
 CREATE DECISION TREE bigfoot_triage (notes text) MODEL jev AS
-  ASK 'Is this a credible report of an unknown creature rather than a known animal?'
+  ASK 'Does the report describe an unknown upright hairy figure, tracks, or knocks?'
     YES: CHOOSE 'Which report class fits?'
       WHEN 'class a' MEANING 'a witness saw a large upright figure' THEN
         ASK 'Does this class A report need a follow-up interview?'
@@ -206,7 +206,50 @@ export OPENROUTER_API_KEY=...    # never commit this; the script does not echo i
 bash scripts/rvbbit_tree_demo.sh
 ```
 
+Each ask records its noul on `rvbbit.calls.score` and on the `hutch_call` line, next to `node`. Each choose records the winning label's probability. `EXPLAIN ANALYZE` prints `Node Scores` as `id=0.12` per visit. The bigfoot root asks whether the report describes an unknown upright figure, tracks, or knocks. A contrastive "credible ... rather than" question scored NO for every row even when CLASSIFY was 0.97–0.99.
+
 Any rvbbit statement in the session creates `rvbbit.decide`. A later
 connection still batches: planning recognizes the function by name, and
 execution loads the tree cache before the first batch. The key stays in
 hutch-lite's environment. Do not put it in `BACKEND AUTH ENV`.
+
+## Cutoff and extract mode
+
+`HUTCH_DECISION_THRESHOLD` (default 0.5) is the noul cutoff when a function
+does not set one. Broad criteria such as "a sound, a dark shape, or any
+unusual event" score about 0.92–0.98, so 0.5 matches them. Set a higher
+cut on the function or the operator:
+
+```sql
+CREATE SEMANTIC FUNCTION means(text text, criterion text) RETURNS boolean
+  MODEL jev PROMPT $$Does the text match the criterion?$$ THRESHOLD 0.97;
+CREATE SEMANTIC OPERATOR means (
+  LEFTARG = text, RIGHTARG = text, FUNCTION = means, THRESHOLD = 0.97
+);
+```
+
+The operator value wins when both are set. An absent operator uses the
+function threshold. Both absent means the server default. The first
+`ensure` also creates `about` as a copy of `means`
+with `THRESHOLD 0.9`. 0.9 still matches a criterion that scores 0.92, so
+raise it when a loose predicate should reject those rows. Replacing
+`means` does not refresh `about`.
+
+Catalog `EXTRACT` still requires JSON. `extract_mode = scalar` on an
+item accepts a JSON scalar or plain text and caches that string. A JSON
+object stays an error in scalar mode.
+
+`rvbbit.calls` reads each distinct hutch URL once. Two backends that
+share a URL do not duplicate the log. The live demo and the tree demo
+export `RVBBIT_HUTCH_URL` so that read is the demo hutch, not port 8099.
+
+Decision calls record `score` (the noul, or the winning choice
+probability) on the call log and in `hutch_call` lines.
+
+The trimmed noul JSON for the fixed six-row fixture, criterion
+`a large hairy biped was seen`, prompt `Does the text match the
+criterion?`, model `typesafe/jev-1.14`, is 72–79 rough tokens and
+202–240 bytes (`rough_tokens` counts words plus punctuation). Row 1 is
+79 tokens and 240 bytes, down from the old 125-token body. Live
+provider `input_tokens` of 291–379 include Jev's own prompt on top of
+this JSON. That wrapper is not in the request we post.
