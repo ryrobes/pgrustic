@@ -1013,6 +1013,36 @@ fn ensure_schema() -> PgResult<()> {
              LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_decide'",
         )?;
     }
+    // Not STRICT: the ON ERROR argument is null when the query omits it.
+    for (name, args, body) in [
+        (
+            "classify",
+            "input text, labels text, fallback text",
+            "rvbbit_classify_labels",
+        ),
+        (
+            "classify_enum",
+            "input text, enum_type text, fallback text",
+            "rvbbit_classify_enum",
+        ),
+        (
+            "extract_typed",
+            "kind text, input text, fallback text",
+            "rvbbit_extract_typed",
+        ),
+    ] {
+        if scalar(&format!(
+            "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'rvbbit' AND p.proname = '{name}' AND p.prosrc = '{body}'",
+        ))?
+        .is_none()
+        {
+            exec(&format!(
+                "CREATE FUNCTION rvbbit.{name}({args}) RETURNS text \
+                 LANGUAGE internal VOLATILE PARALLEL UNSAFE COST 1000000 AS '{body}'",
+            ))?;
+        }
+    }
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'dump_sql'",
@@ -1652,6 +1682,18 @@ fn exec(sql: &str) -> PgResult<()> {
             Ok(())
         }
     })
+}
+
+/// Labels of a PostgreSQL enum type, in sort order. Empty when the type
+/// is missing or is not an enum.
+pub fn enum_labels(type_name: &str) -> PgResult<Vec<String>> {
+    let rows = query(&format!(
+        "SELECT e.enumlabel FROM pg_enum e \
+         JOIN pg_type t ON t.oid = e.enumtypid \
+         WHERE t.typname = {} ORDER BY e.enumsortorder",
+        qlit(type_name)
+    ))?;
+    Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
 }
 
 fn scalar(sql: &str) -> PgResult<Option<String>> {

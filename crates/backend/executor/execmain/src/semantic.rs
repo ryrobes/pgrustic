@@ -34,6 +34,7 @@ static STATS: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, SemanticStats>>>
 pub fn clear_stats() {
     STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     crate::treebatch::clear_stats();
+    crate::projbatch::clear_stats();
 }
 
 pub fn semantic_stats(plan_node_id: i32) -> Option<SemanticStats> {

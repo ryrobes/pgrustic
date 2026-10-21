@@ -14,7 +14,7 @@ for the catalog). Plus dependency lines in the manifests below and
 
 | File | Why |
 | --- | --- |
-| `crates/backend/parser/scan_fgram/src/lex.rs` | After an expression-ending token, identifier `means` is emitted as the existing `Op` token. No new gram.y production, so bison rule numbers stay put. |
+| `crates/backend/parser/scan_fgram/src/lex.rs` | After an expression-ending token, identifier `means` or `about` is emitted as the existing `Op` token. No new gram.y production, so bison rule numbers stay put. |
 | `crates/backend/parser/scan_fgram/src/lib.rs` | `Scanner` remembers the previous token for that decision. |
 | `crates/backend/parser/scan_fgram/src/tests.rs` | Lexer test: infix `means` is `Op`; `SELECT means`, `AS means`, and `t.means` stay identifiers. |
 | `crates/backend/parser/parse_expr/src/lib.rs` | `transformAExprOp` turns operator name `means` into a `FuncExpr`. The oid is the catalog `pg_proc` row when the catalog hook is installed, otherwise 9020. Both sides are coerced to `text`. |
@@ -27,7 +27,7 @@ for the catalog). Plus dependency lines in the manifests below and
 | `crates/backend/executor/execmain/src/semantic.rs` | **New file in an upstream crate.** The batch loop has to call `exec_proc_node`, projection, and slots. Putting it in `execmain` avoids an `execmain` ↔ `rvbbit_exec` cycle. |
 | `crates/backend/commands/explain/src/node.rs` | A MEANS Result prints as `Semantic Filter`. Batch size and concurrency come from the catalog endpoint (32 and 4 after bootstrap). ANALYZE counters are unchanged. |
 | `crates/backend/utils/adt/ruleutils/src/lib.rs` | Deparse of oid 9020 still prints `rvbbit_means(...)` without a `pg_proc` lookup. A catalog oid deparses through the normal `pg_proc` path as `rvbbit.means(...)`. |
-| `crates/_support/seams_init/src/lib.rs` | Registers builtins 9020–9028, installs the catalog ensure/execute hooks, and starts the dispatch pool at server boot. |
+| `crates/_support/seams_init/src/lib.rs` | Registers builtins 9020–9031, installs the catalog ensure/execute hooks, and starts the dispatch pool at server boot. |
 | `crates/_support/types/nodes/src/parsenodes.rs` | `ObjectType::OBJECT_RVBBIT` is appended after `OBJECT_VIEW`. Existing discriminants, including `OBJECT_VIEW`, stay put. It is not a C object type (`objtype_from_i32` still stops at `OBJECT_VIEW`, and the nodes `check_enum` list is unchanged). |
 | `crates/backend/commands/seclabel/src/lib.rs` | Exhaustive `ObjectType` match: `OBJECT_RVBBIT` does not support security labels. |
 | `crates/backend/parser/parser_driver/src/lib.rs` | If a script contains rvbbit DDL, those statements become `DefineStmt` `OBJECT_RVBBIT`. Scripts with no rvbbit DDL are handed to gram.y unchanged. |
@@ -52,7 +52,7 @@ Manifests (dependency lines only):
 
 | Crate | Role |
 | --- | --- |
-| `crates/rvbbit/rvbbit_oids` | Builtin oids 9020–9028, default batch size 32, concurrency 4, pool size 8. |
+| `crates/rvbbit/rvbbit_oids` | Builtin oids 9020–9031, default batch size 32, concurrency 4, pool size 8. |
 | `crates/rvbbit/rvbbit_plan` | Walks the plan and lifts MEANS quals off base scans onto a Result. Cheap quals stay on the scan. |
 | `crates/rvbbit/rvbbit_dispatch` | Fixed OS thread pool, `ureq` (no tokio), bounded queue, cancel-aware wait. Each job carries the catalog backend URL, auth, timeout, and concurrency. |
 | `crates/rvbbit/rvbbit_builtins` | `rvbbit_means`, `rvbbit_means_score`, `rvbbit_extract`, `rvbbit_classify`, `rvbbit_call_log`, `rvbbit_dump_sql`, `rvbbit_restore_sql`, `rvbbit_get_semfn_def`. |
@@ -101,7 +101,9 @@ fallback when the catalog hook is not installed (unit tests).
 ## Deliberately not lifted
 
 Joins, HAVING, target-list `MEANS`, and foreign scans still use the per-row
-builtin. Index-only scans whose MEANS arguments are not in the index can
+builtin. A top-level native `CLASSIFY` or typed `EXTRACT` is a separate
+project batch (see `docs/rvbbit/GRAMMAR.md`); nested calls and a mix with
+MEANS or `rvbbit.decide` stay on the builtin. Index-only scans whose MEANS arguments are not in the index can
 fail at execution; the spike measurement is a sequential scan.
 
 ## Grammar, and why gram.y was not spliced
@@ -165,3 +167,11 @@ Hutch-lite (`crates/rvbbit/rvbbit_hutch_lite`) adds no `gram.y` splice and
 no new upstream file. The only engine edit for it is the `seams_init`
 comment that names builtin oid 9024 (`rvbbit_extract`). `TAKES` / `PICK`
 stay unimplemented in the parser until milestone M5.
+
+Decision trees added one upstream file, `execmain/src/treebatch.rs`.
+Native `CLASSIFY` / typed `EXTRACT` add one more,
+`execmain/src/projbatch.rs`. `gram.y`, `gram.c`, and `actions.rs` are
+still unchanged. The evidence, including the 148 `actions.rs` arms after
+rule 2157, is in `docs/rvbbit/GRAMMAR.md`. The regress overlay is not
+rewritten, so a database that only runs those tests still has no schema
+`rvbbit`.

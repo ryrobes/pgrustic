@@ -41,6 +41,7 @@ mod nodeprojectset;
 mod noderesult;
 mod semantic;
 mod treebatch;
+mod projbatch;
 mod nodesubplan;
 pub mod p8census;
 mod procnode;
@@ -73,6 +74,7 @@ pub use nodeprojectset::ProjectSetState;
 pub use noderesult::ResultState;
 pub use semantic::{semantic_stats, SemanticStats};
 pub use treebatch::{decide_shape, tree_stats, DecideShape, TreeStats};
+pub use projbatch::{project_shape, project_stats, ProjectShape, ProjectStats};
 pub use procnode::{
     exec_end_node, exec_init_node, exec_proc_node, exec_shutdown_node, PlanStateBase, PlanStateNode,
 };

@@ -210,3 +210,32 @@ Any rvbbit statement in the session creates `rvbbit.decide`. A later
 connection still batches: planning recognizes the function by name, and
 execution loads the tree cache before the first batch. The key stays in
 hutch-lite's environment. Do not put it in `BACKEND AUTH ENV`.
+
+## Native MEANS, CLASSIFY, and EXTRACT
+
+`docs/rvbbit/GRAMMAR.md` is the gram.y decision: do not splice. `ABOUT`
+is the same infix operator as `MEANS`. `CLASSIFY(expr INTO 'a', 'b')`
+returns the bare label (the catalog `LABELS` function still returns
+JSON). `CLASSIFY(expr AS enumname)` reads `pg_enum`.
+`EXTRACT(int FROM expr)` and `EXTRACT(creature FROM expr) ON ERROR 'unknown'`
+are the typed form; datetime `EXTRACT`, including `FORTNIGHT`, is unchanged.
+`ON ERROR` is the default when the model or the typed parse fails.
+
+Those project calls batch on a Result named `Semantic Project`: one HTTP
+call per window per `(backend, model, labels-or-kind)`, duplicates
+removed, child order kept. A MEANS filter on the same query keeps the
+filter batcher and the project calls run one row at a time.
+
+```bash
+export OPENROUTER_API_KEY=...    # never commit this; the script does not echo it
+bash scripts/rvbbit_native_demo.sh
+```
+
+The mock count for a 5000-row filter, with no key and no prewarm:
+
+```bash
+bash scripts/rvbbit_means_5k.sh
+```
+
+That uses Postgres `55434` and hutch_mock `8100`. It expects 157 HTTP
+calls (`ceil(5000/32)`). The spike on `55432` / `8099` is left alone.

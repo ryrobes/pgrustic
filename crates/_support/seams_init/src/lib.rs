@@ -473,7 +473,7 @@ pub fn init_all_with_transport(transport: Transport) {
         // whose pg_proc rows janitor::bootstrap backfills into every
         // database on first connection (no install script).
         janitor::JANITOR_BUILTINS,
-        // pgrust-native (reserved-range oids 9020–9028): rvbbit_means,
+        // pgrust-native (reserved-range oids 9020–9031): rvbbit_means,
         // dump/restore, rvbbit_extract, rvbbit_means_score, rvbbit_classify,
         // rvbbit_call_log, and rvbbit_decide. Catalog functions get their
         // own pg_proc oids; 9020 stays the pre-catalog MEANS fallback.
@@ -482,6 +482,7 @@ pub fn init_all_with_transport(transport: Transport) {
     fmgr_core::install_extra_builtins(&EXTRA_BUILTINS);
     rvbbit_resolve::set_ensure(rvbbit_catalog::ensure_and_load);
     rvbbit_resolve::set_execute(rvbbit_catalog::execute);
+    rvbbit_resolve::set_enum_labels(rvbbit_catalog::enum_labels);
     rvbbit_dispatch::start();
 }
 

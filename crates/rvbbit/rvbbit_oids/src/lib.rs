@@ -31,6 +31,15 @@ pub const CALL_LOG_OID: u32 = 9027;
 /// The plan's `pg_proc` oid is different; [`rvbbit_resolve::is_decide_func`]
 /// is that oid.
 pub const DECIDE_OID: u32 = 9028;
+/// `rvbbit_classify_labels(text, text, text) -> text`. Native
+/// `CLASSIFY(x INTO ...)`. `labels` is U+001F-separated. `fallback` may be null.
+pub const CLASSIFY_LABELS_OID: u32 = 9029;
+/// `rvbbit_extract_typed(text, text, text) -> text`. Native
+/// `EXTRACT(type FROM x)` when `type` is not a datetime field.
+pub const EXTRACT_TYPED_OID: u32 = 9030;
+/// `rvbbit_classify_enum(text, text, text) -> text`. Native
+/// `CLASSIFY(x AS enum)`.
+pub const CLASSIFY_ENUM_OID: u32 = 9031;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -40,6 +49,9 @@ pub const MEANS_SCORE_NAME: &str = "rvbbit_means_score";
 pub const CLASSIFY_NAME: &str = "rvbbit_classify";
 pub const CALL_LOG_NAME: &str = "rvbbit_call_log";
 pub const DECIDE_NAME: &str = "rvbbit_decide";
+pub const CLASSIFY_LABELS_NAME: &str = "rvbbit_classify_labels";
+pub const EXTRACT_TYPED_NAME: &str = "rvbbit_extract_typed";
+pub const CLASSIFY_ENUM_NAME: &str = "rvbbit_classify_enum";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

@@ -6,9 +6,11 @@
 
 use datum::Datum;
 use rvbbit_oids::{
-    CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_NAME, CLASSIFY_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME,
+    CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_ENUM_NAME, CLASSIFY_ENUM_OID, CLASSIFY_LABELS_NAME,
+    CLASSIFY_LABELS_OID, CLASSIFY_NAME, CLASSIFY_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME,
     DUMP_OID, EXTRACT_NAME,
-    EXTRACT_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID,
+    EXTRACT_OID, EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME,
+    MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID,
     RESTORE_NAME, RESTORE_OID,
 };
 use types_error::PgResult;
@@ -127,6 +129,133 @@ pub fn rvbbit_decide(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgR
     )?))
 }
 
+/// Native `CLASSIFY(x INTO ...)`. `labels` is U+001F-separated. A null
+/// fallback means a model error is raised. The SQL result is the label.
+pub fn rvbbit_classify_labels(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let Some(input) = arg_text(fcinfo, 0)? else {
+        return Ok(fcinfo.return_null());
+    };
+    let Some(raw) = arg_text(fcinfo, 1)? else {
+        return Err(Box::new(types_error::PgError::error(
+            "CLASSIFY requires a label list".to_string(),
+        )));
+    };
+    let labels: Vec<String> = raw.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    if labels.len() < 2 {
+        return Err(Box::new(types_error::PgError::error(
+            "CLASSIFY needs at least two labels".to_string(),
+        )));
+    }
+    let fallback = arg_text(fcinfo, 2)?;
+    let key = rvbbit_dispatch::scalar_key_classify(&labels);
+    if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &input) {
+        return apply_scalar(fcinfo, fallback, hit);
+    }
+    match rvbbit_dispatch::classify_labels(&input, &labels) {
+        Ok(label) => Ok(text_datum(fcinfo, &label)?),
+        Err(err) => fallback_or(fcinfo, fallback, err),
+    }
+}
+
+/// Native `CLASSIFY(x AS enum)`. Labels come from `pg_enum`.
+pub fn rvbbit_classify_enum(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let Some(input) = arg_text(fcinfo, 0)? else {
+        return Ok(fcinfo.return_null());
+    };
+    let Some(enum_type) = arg_text(fcinfo, 1)? else {
+        return Err(Box::new(types_error::PgError::error(
+            "CLASSIFY AS requires an enum type name".to_string(),
+        )));
+    };
+    let fallback = arg_text(fcinfo, 2)?;
+    let labels = rvbbit_catalog::enum_labels(&enum_type)?;
+    if labels.len() < 2 {
+        let err = Box::new(types_error::PgError::error(format!(
+            "enum \"{enum_type}\" does not have two labels"
+        )));
+        return fallback_or(fcinfo, fallback, err);
+    }
+    let key = rvbbit_dispatch::scalar_key_classify(&labels);
+    if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &input) {
+        return apply_scalar(fcinfo, fallback, hit);
+    }
+    match rvbbit_dispatch::classify_labels(&input, &labels) {
+        Ok(label) => Ok(text_datum(fcinfo, &label)?),
+        Err(err) => fallback_or(fcinfo, fallback, err),
+    }
+}
+
+/// Native `EXTRACT(type FROM x)` for a type that is not a datetime field.
+/// `int`, `float`, and `bool` must parse. Anything else is returned trimmed.
+/// `ON ERROR` supplies the text used when the model or the parse fails.
+pub fn rvbbit_extract_typed(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let Some(kind) = arg_text(fcinfo, 0)? else {
+        return Ok(fcinfo.return_null());
+    };
+    let Some(input) = arg_text(fcinfo, 1)? else {
+        return Ok(fcinfo.return_null());
+    };
+    let fallback = arg_text(fcinfo, 2)?;
+    let key = rvbbit_dispatch::scalar_key_extract(&kind);
+    if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &input) {
+        return apply_scalar(fcinfo, fallback, hit);
+    }
+    let raw = match rvbbit_dispatch::extract_typed(&kind, &input) {
+        Ok(raw) => raw,
+        Err(err) => return fallback_or(fcinfo, fallback, err),
+    };
+    match typed_text(&kind, &raw) {
+        Ok(value) => Ok(text_datum(fcinfo, &value)?),
+        Err(message) => {
+            let err = Box::new(types_error::PgError::error(message));
+            fallback_or(fcinfo, fallback, err)
+        }
+    }
+}
+
+fn arg_text(fcinfo: &Fcinfo, index: usize) -> PgResult<Option<String>> {
+    if fcinfo.argisnull(index) {
+        return Ok(None);
+    }
+    let packed = unsafe { fcinfo.arg_varlena_packed(index)? };
+    Ok(Some(String::from_utf8_lossy(packed.data()).into_owned()))
+}
+
+fn text_datum(fcinfo: &Fcinfo, text: &str) -> PgResult<Datum> {
+    Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), text.as_bytes())?))
+}
+
+fn fallback_or(
+    fcinfo: &mut Fcinfo,
+    fallback: Option<String>,
+    err: Box<types_error::PgError>,
+) -> PgResult<Datum> {
+    match fallback {
+        Some(text) => text_datum(fcinfo, &text),
+        None => Err(err),
+    }
+}
+
+fn apply_scalar(
+    fcinfo: &mut Fcinfo,
+    fallback: Option<String>,
+    hit: rvbbit_dispatch::ScalarHit,
+) -> PgResult<Datum> {
+    match hit {
+        rvbbit_dispatch::ScalarHit::Value(value) => text_datum(fcinfo, &value),
+        rvbbit_dispatch::ScalarHit::Failed(message) => {
+            fallback_or(fcinfo, fallback, Box::new(types_error::PgError::error(message)))
+        }
+    }
+}
+
+fn typed_text(kind: &str, value: &str) -> Result<String, String> {
+    rvbbit_dispatch::coerce_extracted(kind, value)
+}
+
 pub fn rvbbit_call_log(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     rvbbit_resolve::ensure()?;
     let urls = rvbbit_catalog::hutch_urls()?;
@@ -243,5 +372,29 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: true,
         retset: false,
         func: rvbbit_decide as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CLASSIFY_LABELS_OID,
+        name: CLASSIFY_LABELS_NAME,
+        nargs: 3,
+        strict: false,
+        retset: false,
+        func: rvbbit_classify_labels as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CLASSIFY_ENUM_OID,
+        name: CLASSIFY_ENUM_NAME,
+        nargs: 3,
+        strict: false,
+        retset: false,
+        func: rvbbit_classify_enum as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: EXTRACT_TYPED_OID,
+        name: EXTRACT_TYPED_NAME,
+        nargs: 3,
+        strict: false,
+        retset: false,
+        func: rvbbit_extract_typed as PGFunction,
     },
 ];

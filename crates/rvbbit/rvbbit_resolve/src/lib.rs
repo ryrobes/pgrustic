@@ -50,6 +50,7 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
 });
 static TREES: Mutex<Option<HashMap<String, DecisionTree>>> = Mutex::new(None);
 static DECIDE_OID: Mutex<Option<u32>> = Mutex::new(None);
+static ENUM_LABELS: Mutex<Option<fn(&str) -> PgResult<Vec<String>>>> = Mutex::new(None);
 
 /// One `CREATE DECISION TREE` row, joined to its model's backend.
 #[derive(Clone, Debug)]
@@ -74,6 +75,22 @@ pub fn set_ensure(hook: fn() -> PgResult<()>) {
 
 pub fn set_execute(hook: fn(&str) -> PgResult<()>) {
     *lock_hooks(&EXECUTE) = Some(hook);
+}
+
+/// `pg_enum` lookup used by the project batcher. Installed from
+/// `seams_init` so execmain does not depend on the catalog crate.
+pub fn set_enum_labels(hook: fn(&str) -> PgResult<Vec<String>>) {
+    *lock_hooks(&ENUM_LABELS) = Some(hook);
+}
+
+pub fn enum_labels(type_name: &str) -> PgResult<Vec<String>> {
+    let hook = lock_hooks(&ENUM_LABELS).clone();
+    match hook {
+        Some(hook) => hook(type_name),
+        None => Err(Box::new(types_error::PgError::error(
+            "enum label hook is not installed".to_string(),
+        ))),
+    }
 }
 
 /// Create the catalog schema if this statement needs it, then refresh the

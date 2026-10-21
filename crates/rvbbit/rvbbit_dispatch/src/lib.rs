@@ -247,6 +247,183 @@ pub fn cache_lookup(base_url: &str, keys: &[String]) -> PgResult<CacheLookupResp
     serde_json::from_str(&raw.body).map_err(|e| pg(format!("cache lookup decode: {e}")))
 }
 
+/// Native `CLASSIFY(x INTO ...)`. Labels replace the catalog label set.
+/// The backend and decision model are the `means` function's, so a tree
+/// or MEANS model already pointed at hutch is reused. The result is the
+/// winning label, not the JSON pack.
+pub fn classify_labels(input: &str, labels: &[String]) -> PgResult<String> {
+    let reply = classify_many(labels, &[input.to_string()])?;
+    one_item(reply)
+}
+
+/// One HTTP classify for every input. Duplicate inputs are the caller's
+/// job to drop. Item errors stay in the vector; a transport failure is
+/// the `Err`. Order matches `inputs`.
+pub fn classify_many(labels: &[String], inputs: &[String]) -> PgResult<ManyReply> {
+    if inputs.is_empty() {
+        return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
+    }
+    if labels.len() < 2 {
+        return Err(pg("CLASSIFY needs at least two labels"));
+    }
+    let mut ep = decision_endpoint();
+    ep.labels = labels.to_vec();
+    ep.label_descriptions.clear();
+    ep.fn_name = "classify".into();
+    ep.return_type = "text".into();
+    ep.user_prompt.clear();
+    ep.system_prompt.clear();
+    let payload: Vec<serde_json::Value> = inputs
+        .iter()
+        .map(|input| serde_json::json!({ "input": input }))
+        .collect();
+    let body = encode_items(&ep, Operation::Classify, &payload).map_err(pg)?;
+    let raw = post_op(&ep, "classify", body)?;
+    let values = decode_text_items(&raw.body).map_err(pg)?;
+    if values.len() != inputs.len() {
+        return Err(pg(format!(
+            "hutch classify returned {} items for {} inputs",
+            values.len(),
+            inputs.len()
+        )));
+    }
+    Ok(ManyReply { values, http_calls: raw.http_calls })
+}
+
+/// Native `EXTRACT(type FROM x)` for a non-datetime type. Chat, not Jev:
+/// a decision-model slug is replaced with `mock`, which hutch maps to the
+/// chat default. The URL still comes from the means backend.
+pub fn extract_typed(kind: &str, input: &str) -> PgResult<String> {
+    let reply = extract_many(kind, &[input.to_string()])?;
+    one_item(reply)
+}
+
+/// One HTTP extract for every input. The model on the wire is `mock`.
+/// Returned strings are still raw model text; [`coerce_extracted`] parses
+/// `int` / `float` / `bool`.
+pub fn extract_many(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
+    if inputs.is_empty() {
+        return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
+    }
+    let mut ep = decision_endpoint();
+    ep.model = "mock".into();
+    ep.labels.clear();
+    ep.label_descriptions.clear();
+    ep.fn_name = "extract_typed".into();
+    ep.return_type = "text".into();
+    ep.system_prompt = format!(
+        "Return only one {kind} value as plain text. No markdown, no quotes."
+    );
+    ep.user_prompt = format!("Extract the {kind} from: {{{{input}}}}");
+    ep.max_tokens = Some(64);
+    let payload: Vec<serde_json::Value> = inputs
+        .iter()
+        .map(|input| serde_json::json!({ "input": input }))
+        .collect();
+    let body = encode_items(&ep, Operation::Extract, &payload).map_err(pg)?;
+    let raw = post_op(&ep, "extract", body)?;
+    let values = decode_text_items(&raw.body).map_err(pg)?;
+    if values.len() != inputs.len() {
+        return Err(pg(format!(
+            "hutch extract returned {} items for {} inputs",
+            values.len(),
+            inputs.len()
+        )));
+    }
+    Ok(ManyReply { values, http_calls: raw.http_calls })
+}
+
+pub struct ManyReply {
+    pub values: Vec<Result<String, String>>,
+    pub http_calls: u32,
+}
+
+fn one_item(reply: ManyReply) -> PgResult<String> {
+    match reply.values.into_iter().next() {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(message)) => Err(pg(message)),
+        None => Err(pg("hutch returned no items")),
+    }
+}
+
+fn post_op(ep: &Endpoint, op: &str, body: String) -> PgResult<RawReply> {
+    let auth = bearer(ep).map_err(pg)?;
+    let ticket = enqueue(
+        format!("{}/v1/{op}", ep.base_url.trim_end_matches('/')),
+        auth,
+        ep,
+        body,
+        cache_header(cache_mode_of(ep), None, None),
+    )?;
+    wait_raw(ticket)
+}
+
+/// Parse a model string into the SQL text for `kind`. Other kinds are
+/// returned trimmed. Non-finite floats are an error so `ON ERROR` can run.
+pub fn coerce_extracted(kind: &str, value: &str) -> Result<String, String> {
+    let value = value.trim();
+    match kind.to_ascii_lowercase().as_str() {
+        "int" | "integer" | "bigint" | "int2" | "int4" | "int8" | "smallint" => {
+            let n: i64 = value.parse().map_err(|_| format!("EXTRACT {kind} got {value}"))?;
+            Ok(n.to_string())
+        }
+        "float" | "float4" | "float8" | "double" | "real" | "numeric" => {
+            let n: f64 = value.parse().map_err(|_| format!("EXTRACT {kind} got {value}"))?;
+            if !n.is_finite() {
+                return Err(format!("EXTRACT {kind} got {value}"));
+            }
+            Ok(n.to_string())
+        }
+        "bool" | "boolean" => match value.to_ascii_lowercase().as_str() {
+            "true" | "t" | "yes" | "1" => Ok("true".into()),
+            "false" | "f" | "no" | "0" => Ok("false".into()),
+            _ => Err(format!("EXTRACT {kind} got {value}")),
+        },
+        _ => Ok(value.to_string()),
+    }
+}
+
+/// Memo key for a classify batch. Includes the means backend URL and the
+/// decision model, so two label sets or two backends do not share a result.
+pub fn scalar_key_classify(labels: &[String]) -> String {
+    let ep = decision_endpoint();
+    format!(
+        "c\u{1e}{}\u{1e}{}\u{1e}{}",
+        ep.base_url,
+        ep.model,
+        labels.join("\u{1f}")
+    )
+}
+
+/// Memo key for an extract batch. The chat model on the wire is always
+/// `mock`; the URL is still the means backend.
+pub fn scalar_key_extract(kind: &str) -> String {
+    let ep = decision_endpoint();
+    format!("e\u{1e}{}\u{1e}mock\u{1e}{kind}", ep.base_url)
+}
+
+fn decision_endpoint() -> Endpoint {
+    let oid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
+    rvbbit_resolve::endpoint_for(oid)
+}
+
+fn decode_text_items(text: &str) -> Result<Vec<Result<String, String>>, String> {
+    let parsed = parsed_batch(text)?;
+    let mut out = Vec::with_capacity(parsed.outputs.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            out.push(Err(format!("hutch item {i}: {} {}", err.code, err.message)));
+            continue;
+        }
+        match &item.value {
+            Some(serde_json::Value::String(s)) => out.push(Ok(s.clone())),
+            Some(other) => out.push(Ok(other.to_string())),
+            None => out.push(Err(format!("hutch item {i} has no value"))),
+        }
+    }
+    Ok(out)
+}
+
 /// One pair through the pool. Used by the per-row builtin fallback.
 pub fn means_oid(func_oid: u32, input: &str, criterion: &str) -> PgResult<bool> {
     let ticket = submit(func_oid, &[(input.to_string(), criterion.to_string())])?;
@@ -795,6 +972,53 @@ pub fn forget_decide(keys: &[(String, String)]) {
     let mut memo = DECIDE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
     for key in keys {
         memo.remove(key);
+    }
+}
+
+/// A value the project batcher already computed, or the item error the
+/// builtin turns into `ON ERROR`.
+#[derive(Clone, Debug)]
+pub enum ScalarHit {
+    Value(String),
+    Failed(String),
+}
+
+static SCALAR_MEMO: std::sync::LazyLock<Mutex<HashMap<(String, String), ScalarHit>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn remember_scalar(key: &str, input: &str, hit: ScalarHit) {
+    SCALAR_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((key.to_string(), input.to_string()), hit);
+}
+
+pub fn recall_scalar(key: &str, input: &str) -> Option<ScalarHit> {
+    SCALAR_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(key.to_string(), input.to_string()))
+        .cloned()
+}
+
+pub fn forget_scalar(keys: &[(String, String)]) {
+    let mut memo = SCALAR_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    for key in keys {
+        memo.remove(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coerce_extracted;
+
+    #[test]
+    fn coerce_extract_kinds() {
+        assert_eq!(coerce_extracted("int", " 12 ").unwrap(), "12");
+        assert!(coerce_extracted("int", "nope").is_err());
+        assert_eq!(coerce_extracted("bool", "YES").unwrap(), "true");
+        assert_eq!(coerce_extracted("creature", "  sasquatch ").unwrap(), "sasquatch");
+        assert!(coerce_extracted("float", "inf").is_err());
     }
 }
 

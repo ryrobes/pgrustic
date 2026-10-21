@@ -667,6 +667,11 @@ pub fn ExplainNode<'mcx>(
     } else {
         execmain::DecideShape::default()
     };
+    let project = if node.node_tag() == NodeTag::T_Result {
+        execmain::project_shape(es.str.allocator(), &plan.targetlist)?
+    } else {
+        execmain::ProjectShape::default()
+    };
 
     let mut strategy: Option<&str> = None;
     let mut partialmode: Option<&str> = None;
@@ -677,6 +682,8 @@ pub fn ExplainNode<'mcx>(
                 ("Semantic Filter", "Semantic Filter")
             } else if decide.batched {
                 ("Decision Tree", "Decision Tree")
+            } else if project.batched {
+                ("Semantic Project", "Semantic Project")
             } else {
                 ("Result", "Result")
             }
@@ -1354,6 +1361,9 @@ pub fn ExplainNode<'mcx>(
                 if decide.present {
                     ExplainPropertyText("Decide", "per-row", es);
                 }
+                if project.present {
+                    ExplainPropertyText("Project", "per-row", es);
+                }
             } else if decide.batched {
                 ExplainPropertyText("Decision Tree", "decide", es);
                 ExplainPropertyInteger(
@@ -1372,8 +1382,33 @@ pub fn ExplainNode<'mcx>(
                         ExplainPropertyInteger("Tree Rows Out", None, st.rows_out as i64, es);
                     }
                 }
+                if project.present {
+                    ExplainPropertyText("Project", "per-row", es);
+                }
+            } else if project.batched {
+                ExplainPropertyText("Semantic", "project", es);
+                ExplainPropertyInteger(
+                    "Batch Size",
+                    None,
+                    rvbbit_resolve::batch_rows() as i64,
+                    es,
+                );
+                if es.analyze {
+                    if let Some(st) = execmain::project_stats(plan.plan_node_id) {
+                        ExplainPropertyInteger("Batches", None, st.batches as i64, es);
+                        ExplainPropertyInteger("HTTP Calls", None, st.http_calls as i64, es);
+                        ExplainPropertyInteger("Memo Hits", None, st.memo_hits as i64, es);
+                        ExplainPropertyInteger("Semantic Rows In", None, st.rows_in as i64, es);
+                        ExplainPropertyInteger("Semantic Rows Out", None, st.rows_out as i64, es);
+                    }
+                }
             } else if decide.present {
                 ExplainPropertyText("Decide", "per-row", es);
+                if project.present {
+                    ExplainPropertyText("Project", "per-row", es);
+                }
+            } else if project.present {
+                ExplainPropertyText("Project", "per-row", es);
             }
         }
         NodeTag::T_Sort => {

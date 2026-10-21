@@ -301,7 +301,7 @@ fn transformAExprOp<'mcx>(
 fn is_means_op(name: &types_nodes::list::NodeList<'_>) -> bool {
     name.len() == 1
         && name.first().and_then(|n| n.as_string()).is_some_and(|s| {
-            s.sval.eq_ignore_ascii_case("means")
+            s.sval.eq_ignore_ascii_case("means") || s.sval.eq_ignore_ascii_case("about")
         })
 }
 

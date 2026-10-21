@@ -36,6 +36,9 @@ pub struct ResultState<'mcx> {
     /// Batch executor for top-level `rvbbit.decide`. None when MEANS owns
     /// the node, or when the target list has no top-level decide.
     pub tree: Option<Box<crate::treebatch::TreeState<'mcx>>>,
+    /// Batch executor for top-level native CLASSIFY / EXTRACT. None when
+    /// MEANS or a decision tree owns the node.
+    pub proj: Option<Box<crate::projbatch::ProjectState<'mcx>>>,
 }
 
 /// `ExecInitResult` (nodeResult.c).
@@ -95,6 +98,11 @@ pub fn exec_init_result<'mcx>(
     } else {
         None
     };
+    let project = if rvbbit.is_none() && tree.is_none() {
+        crate::projbatch::compile(estate, node)?
+    } else {
+        None
+    };
     Ok(ResultState {
         ps: PlanStateBase {
             plan: &node.plan,
@@ -111,6 +119,7 @@ pub fn exec_init_result<'mcx>(
         outer_chg: ::types_nodes::bitmapset::Bitmapset::empty(),
         rvbbit,
         tree,
+        proj: project,
     })
 }
 
@@ -124,6 +133,9 @@ pub fn exec_result<'mcx>(
     }
     if node.tree.is_some() {
         return crate::treebatch::exec(node, estate);
+    }
+    if node.proj.is_some() {
+        return crate::projbatch::exec(node, estate);
     }
     crate::cfi()?;
     let ecxt = node
@@ -286,6 +298,7 @@ pub fn exec_end_result<'mcx>(
     // runs after this and clears the field if end was skipped.
     node.rvbbit.take();
     node.tree.take();
+    node.proj.take();
     match node.outer.as_deref_mut() {
         Some(outer) => exec_end_node(outer, estate),
         None => Ok(()),
@@ -296,5 +309,5 @@ pub fn exec_end_result<'mcx>(
 // rvbbit / tree exempt: the batch state owns heap (memo, saved tuples);
 // exec_end_result and release_owned take() it before the node is forgotten.
 ::mcx::forget_safe_struct!(
-    ResultState<'_> { ps, outer, rs_done, rs_checkqual, outer_chg; resconstantqual, rvbbit, tree },
+    ResultState<'_> { ps, outer, rs_done, rs_checkqual, outer_chg; resconstantqual, rvbbit, tree, proj },
 );

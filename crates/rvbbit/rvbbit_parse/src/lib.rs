@@ -8,6 +8,9 @@
 
 use serde_json::{json, Value};
 
+mod native;
+pub use native::rewrite_native_semantic;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Piece<'a> {
     pub sql: &'a str,

@@ -432,7 +432,9 @@ impl<'mcx> Scanner<'mcx> {
                 // `SELECT means`, `AS means`, and quoted "MEANS" still work.
                 // A bare alias (`SELECT expr means FROM t`) is the one form
                 // this cannot accept; `AS means` covers it.
-                if ident == b"means" && token_ends_expr(self.prev_token) {
+                // `about` is the same predicate as `means`. Both reuse the
+                // existing Op production. No gram.y keyword.
+                if (ident == b"means" || ident == b"about") && token_ends_expr(self.prev_token) {
                     return Ok(self.make(tokens::Op, CoreYYSTYPE::Str(ident)));
                 }
                 Ok(self.make(tokens::IDENT, CoreYYSTYPE::Str(ident)))

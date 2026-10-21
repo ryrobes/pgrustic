@@ -24,10 +24,16 @@ pub fn raw_parser<'mcx>(
     query_string: &str,
     mode: RawParseMode,
 ) -> PgResult<PgVec<'mcx, RawStmt<'mcx>>> {
-    // Only rvbbit DDL is peeled off. Everything else, including a script
-    // that merely mentions the words, goes through gram.y unchanged so
-    // regression locations stay byte-identical.
+    // Only rvbbit DDL is peeled off. A native CLASSIFY or typed EXTRACT
+    // is rewritten into an ordinary function call first; datetime EXTRACT
+    // and every other statement are not copied, so regression locations
+    // stay byte-identical.
     if matches!(mode, RawParseMode::RAW_PARSE_DEFAULT) {
+        // Native CLASSIFY / typed EXTRACT become ordinary function calls.
+        // Datetime EXTRACT and every other statement are not copied.
+        if let Some(rewritten) = rvbbit_parse::rewrite_native_semantic(query_string) {
+            return raw_parser(mcx, &rewritten, mode);
+        }
         if let Some(pieces) = rvbbit_parse::split_if_rvbbit(query_string) {
             return parse_pieces(mcx, &pieces);
         }

@@ -1,10 +1,13 @@
-//! Lift `rvbbit_means` filters off base scans onto a Result node.
+//! Lift semantic calls off base scans onto a Result node.
 //!
-//! The Result is the semantic batch node: its qual is only the MEANS
-//! predicates, and the scan underneath keeps the cheap quals so they run
-//! first. Columns the MEANS arguments read are added to the scan target
-//! list (junk) when the parent did not already need them, so setrefs can
-//! retarget the Result qual onto the scan output.
+//! A MEANS or ABOUT qual becomes the filter variant: the Result qual is
+//! only those predicates, and the scan underneath keeps the cheap quals.
+//! A top-level native `CLASSIFY` or typed `EXTRACT` becomes the project
+//! variant when the scan has no MEANS qual and no `rvbbit.decide`. Columns
+//! the call reads are added to the scan target list (junk) when the parent
+//! did not already need them, so setrefs can retarget the Result onto the
+//! scan output. Nested calls and a mix with MEANS or a decision tree stay
+//! on the row-at-a-time builtin.
 
 use mcx::Mcx;
 use types_error::PgResult;
@@ -65,10 +68,13 @@ pub fn lift_semantic_filters<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult
         wrap_scan(mcx, plan)?
     } else if is_base_scan(plan) && tlist_contains_decide(&plan.as_plan().expect("plan").targetlist) {
         wrap_decide(mcx, plan)?
+    } else if is_base_scan(plan) && tlist_contains_project(&plan.as_plan().expect("plan").targetlist) {
+        wrap_project(mcx, plan)?
     } else {
         plan
     };
     strip_child_decide(mcx, plan)?;
+    strip_child_project(mcx, plan)?;
     Ok(plan)
 }
 
@@ -335,6 +341,127 @@ fn wrap_decide<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {
     result.plan.parallel_safe = false;
     result.resconstantqual = None;
     Ok(result.seal())
+}
+
+fn func_is_native_project(func: &FuncExpr<'_>) -> bool {
+    if func.args.len() != 3 {
+        return false;
+    }
+    if !syscache_seams::pg_proc_proname::is_installed()
+        || !syscache_seams::lookup_pg_proc_shape::is_installed()
+        || !syscache_seams::pg_namespace_nspname::is_installed()
+    {
+        return false;
+    }
+    let Ok(Some(name)) = syscache_seams::pg_proc_proname::call(func.funcid) else {
+        return false;
+    };
+    let native = matches!(
+        name.name_str(),
+        b"classify" | b"classify_enum" | b"extract_typed"
+    );
+    if !native {
+        return false;
+    }
+    let Ok(Some(shape)) = syscache_seams::lookup_pg_proc_shape::call(func.funcid) else {
+        return false;
+    };
+    let Ok(Some(ns)) = syscache_seams::pg_namespace_nspname::call(shape.pronamespace) else {
+        return false;
+    };
+    ns.name_str() == b"rvbbit"
+}
+
+fn expr_is_top_project(node: Node<'_>) -> bool {
+    match node.node_tag() {
+        NodeTag::T_RelabelType => expr_is_top_project(node.as_relabel_type().expect("Relabel").arg),
+        NodeTag::T_CoerceViaIO => expr_is_top_project(node.as_coerce_via_io().expect("CoerceViaIO").arg),
+        NodeTag::T_FuncExpr => func_is_native_project(node.as_func_expr().expect("FuncExpr")),
+        _ => false,
+    }
+}
+
+fn tlist_contains_project(tlist: &NodeList<'_>) -> bool {
+    tlist.iter().any(|tle| {
+        tle.as_target_entry()
+            .is_some_and(|te| expr_is_top_project(te.expr))
+    })
+}
+
+fn tlist_without_project<'mcx>(
+    mcx: Mcx<'mcx>,
+    tlist: &NodeList<'mcx>,
+) -> PgResult<NodeList<'mcx>> {
+    let cloned = tlist.clone_in(mcx)?;
+    let mut kept = NodeList::nil();
+    let mut project_exprs = NodeList::nil();
+    for tle_node in cloned.iter() {
+        let tle = tle_node.as_target_entry().expect("TargetEntry");
+        if expr_is_top_project(tle.expr) {
+            project_exprs.lappend(mcx, tle.expr)?;
+        } else {
+            kept.lappend(mcx, tle_node)?;
+        }
+    }
+    let mut resno = 1i16;
+    for tle_node in kept.iter() {
+        unsafe { tle_node.with_mut::<TargetEntry, _>(|te| te.resno = resno) }.expect("TargetEntry");
+        resno = resno.saturating_add(1);
+    }
+    add_junk_inputs(mcx, &project_exprs, &mut kept)?;
+    Ok(kept)
+}
+
+fn wrap_project<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {
+    let base = scan.as_plan().expect("scan plan");
+    let result_tlist = base.targetlist.clone_in(mcx)?;
+    let scan_tlist = tlist_without_project(mcx, &base.targetlist)?;
+    let startup_cost = base.startup_cost;
+    let total_cost = base.total_cost;
+    let plan_rows = base.plan_rows;
+    let plan_width = base.plan_width;
+    unsafe {
+        scan.with_plan_mut(|p| {
+            p.targetlist = scan_tlist;
+            p.parallel_safe = false;
+        })
+    }
+    .expect("scan plan");
+    let mut result = Node::build::<ResultPlan<'mcx>>(mcx)?;
+    result.plan.targetlist = result_tlist;
+    result.plan.qual = NodeList::nil();
+    result.plan.lefttree = Some(scan);
+    result.plan.startup_cost = startup_cost;
+    result.plan.total_cost = total_cost;
+    result.plan.plan_rows = plan_rows;
+    result.plan.plan_width = plan_width;
+    result.plan.parallel_aware = false;
+    result.plan.parallel_safe = false;
+    result.resconstantqual = None;
+    Ok(result.seal())
+}
+
+/// A MEANS or decide Result was wrapped around a scan that still projects
+/// a native CLASSIFY or EXTRACT. Drop that call from the scan so setrefs
+/// leaves it on the Result. The filter or tree batcher then evaluates it
+/// one row at a time. A project-only scan is wrapped by [`wrap_project`].
+fn strip_child_project<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<()> {
+    if plan.node_tag() != NodeTag::T_Result {
+        return Ok(());
+    }
+    let Some(child) = plan.as_plan().and_then(|p| p.lefttree) else {
+        return Ok(());
+    };
+    if !is_base_scan(child) {
+        return Ok(());
+    }
+    let tlist = &child.as_plan().expect("scan").targetlist;
+    if !tlist_contains_project(tlist) {
+        return Ok(());
+    }
+    let new_tlist = tlist_without_project(mcx, tlist)?;
+    unsafe { child.with_plan_mut(|p| p.targetlist = new_tlist) }.expect("scan");
+    Ok(())
 }
 
 /// A MEANS Result was wrapped around a scan that still projects `decide`.
