@@ -202,6 +202,25 @@ pub fn CreateCommandTag(parsetree: Node<'_>) -> CommandTag {
                 OBJECT_TSCONFIGURATION => CMDTAG_CREATE_TEXT_SEARCH_CONFIGURATION,
                 OBJECT_COLLATION => CMDTAG_CREATE_COLLATION,
                 OBJECT_ACCESS_METHOD => CMDTAG_CREATE_ACCESS_METHOD,
+                // cmdtaglist.h is pinned to PG 18.3, so rvbbit DDL reuses
+                // the closest existing tags. psql prints CREATE FUNCTION
+                // for CREATE BACKEND; the catalog row is still a backend.
+                OBJECT_RVBBIT => {
+                    let verb = stmt
+                        .defnames
+                        .first()
+                        .and_then(|n| n.as_string())
+                        .map(|s| s.sval)
+                        .unwrap_or("");
+                    match verb {
+                        "alter" => CMDTAG_ALTER_FUNCTION,
+                        "drop" => CMDTAG_DROP_FUNCTION,
+                        "grant" => CMDTAG_GRANT,
+                        "revoke" => CMDTAG_REVOKE,
+                        "comment" => CMDTAG_COMMENT,
+                        _ => CMDTAG_CREATE_FUNCTION,
+                    }
+                }
                 _ => CMDTAG_UNKNOWN,
             }
         }

@@ -10,10 +10,10 @@ use std::time::Duration;
 fn batch_match_and_rate_limit() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
-    let url = format!("http://127.0.0.1:{port}/v1/means");
-    // The pool is process-global and latches the URL on first start.
-    // set_var is unsafe because it races other threads; this test is the
-    // only thread that reads the variables, and it does so inside start().
+    let url = format!("http://127.0.0.1:{port}");
+    // The pool reads the URL when a job is submitted. set_var is unsafe
+    // because it races other threads; this test is the only thread that
+    // reads the variable.
     unsafe {
         std::env::set_var("RVBBIT_HUTCH_URL", &url);
         std::env::set_var("RVBBIT_HUTCH_TIMEOUT_MS", "2000");
@@ -23,15 +23,20 @@ fn batch_match_and_rate_limit() {
             latency: Duration::from_millis(5),
             fail_every: 2,
             timeout_every: 0,
+            expect_auth: None,
         };
         let _ = hutch_mock::serve_listener(listener, cfg);
     });
 
     rvbbit_dispatch::start();
-    let yes = rvbbit_dispatch::means_pair("Hello World", "hello").expect("match");
+    let yes = rvbbit_dispatch::means_oid(rvbbit_oids::MEANS_OID, "Hello World", "hello").expect("match");
     assert!(yes, "substring match");
-    let no = rvbbit_dispatch::means_pair("abc", "zzz").expect("miss");
+    let no = rvbbit_dispatch::means_oid(rvbbit_oids::MEANS_OID, "abc", "zzz").expect("miss");
     assert!(!no, "non-match");
+
+    let looked = rvbbit_dispatch::cache_lookup(&url, &["abc".into()]).expect("lookup");
+    assert!(looked.hits.is_empty(), "lookup does not hit");
+    assert_eq!(looked.misses, vec!["abc".to_string()]);
 
     let stats = http_get(&format!("http://127.0.0.1:{port}/stats"));
     // fail_every=2 rejects every other call, counted before the increment.

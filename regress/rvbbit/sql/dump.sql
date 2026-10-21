@@ -1,0 +1,25 @@
+-- Stock pg_dump does not know these objects. The round trip is
+-- rvbbit.dump_sql() / rvbbit.restore_sql(text).
+CREATE ROLE rvbbit_dump_role;
+CREATE BACKEND dump_b TYPE hutch URL 'http://127.0.0.1:9' AUTH SECRET 'DUMP_TOKEN' WITH (batch_size = 16, max_concurrent = 2, timeout = '2s', retries = 4) VERSION 3;
+CREATE MODEL dump_m ON BACKEND dump_b NAME 'remote' VERSION 2;
+CREATE EMBEDDING MODEL dump_e ON BACKEND dump_b NAME 'emb' DIMENSIONS 4 VERSION 1;
+CREATE SEMANTIC FUNCTION dump_f(body text, criterion text) RETURNS boolean MODEL dump_m SYSTEM 'be brief' PROMPT 'judge' MAX TOKENS 8 TEMPERATURE 0 CACHE memoize VERSION 4;
+CREATE SEMANTIC OPERATOR dump_op (LEFTARG = text, RIGHTARG = text, FUNCTION = dump_f, NEGATOR = NOT dump_op) VERSION 2;
+CREATE DECISION TREE dump_t (ticket text) MODEL dump_m AS ASK 'urgent?' THRESHOLD 0.5 YES: 'page' NO: 'queue' VERSION 2;
+CREATE WORKFLOW dump_w (ticket text) RETURNS text VERSION 7 AS $$SELECT ticket$$;
+COMMENT ON BACKEND dump_b IS 'kept';
+GRANT USAGE ON BACKEND dump_b TO rvbbit_dump_role;
+REVOKE EXECUTE ON SEMANTIC FUNCTION dump_f(body text, criterion text) FROM public;
+GRANT EXECUTE ON SEMANTIC FUNCTION dump_f(body text, criterion text) TO rvbbit_dump_role;
+
+CREATE TEMP TABLE rvbbit_dump_save AS SELECT rvbbit.dump_sql() AS sql;
+DROP BACKEND dump_b CASCADE;
+DROP WORKFLOW dump_w VERSION 7;
+SELECT count(*) FROM rvbbit.backend WHERE name = 'dump_b';
+SELECT rvbbit.restore_sql(sql) FROM rvbbit_dump_save;
+SELECT rvbbit.dump_sql() = (SELECT sql FROM rvbbit_dump_save);
+
+DROP BACKEND dump_b CASCADE;
+DROP WORKFLOW dump_w VERSION 7;
+DROP ROLE rvbbit_dump_role;

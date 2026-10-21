@@ -5,7 +5,9 @@ extern crate alloc;
 use mcx::{Mcx, PgVec};
 use parser_seams::RawParseMode;
 use types_error::{PgError, PgResult};
+use types_nodes::parsenodes::{DefineStmt, ObjectType};
 use types_nodes::rawnodes::RawStmt;
+use types_nodes::Node;
 
 pub use parser_small1::udeescape::{
     check_uescapechar, str_udeescape, UdeescapeError, UdeescapeFailure,
@@ -18,6 +20,22 @@ pub use parser_small1::udeescape::{
 // directly. Any other node shape here is the C `elog(ERROR, "unexpected node
 // type")` idiom: a catchable XX000, never a process panic.
 pub fn raw_parser<'mcx>(
+    mcx: Mcx<'mcx>,
+    query_string: &str,
+    mode: RawParseMode,
+) -> PgResult<PgVec<'mcx, RawStmt<'mcx>>> {
+    // Only rvbbit DDL is peeled off. Everything else, including a script
+    // that merely mentions the words, goes through gram.y unchanged so
+    // regression locations stay byte-identical.
+    if matches!(mode, RawParseMode::RAW_PARSE_DEFAULT) {
+        if let Some(pieces) = rvbbit_parse::split_if_rvbbit(query_string) {
+            return parse_pieces(mcx, &pieces);
+        }
+    }
+    copy_gram(mcx, query_string, mode)
+}
+
+fn copy_gram<'mcx>(
     mcx: Mcx<'mcx>,
     query_string: &str,
     mode: RawParseMode,
@@ -35,6 +53,61 @@ pub fn raw_parser<'mcx>(
         v.push(RawStmt { stmt: rs.stmt, stmt_location: rs.stmt_location, stmt_len: rs.stmt_len });
     }
     Ok(v)
+}
+
+fn parse_pieces<'mcx>(
+    mcx: Mcx<'mcx>,
+    pieces: &[rvbbit_parse::Piece<'_>],
+) -> PgResult<PgVec<'mcx, RawStmt<'mcx>>> {
+    let mut v = PgVec::new_in(mcx);
+    for piece in pieces {
+        if piece.rvbbit {
+            v.push(rvbbit_stmt(mcx, piece.sql, piece.offset)?);
+            continue;
+        }
+        let list = gram_core::raw_parser(mcx, piece.sql, RawParseMode::RAW_PARSE_DEFAULT)?;
+        for n in list.iter() {
+            let Some(rs) = n.as_raw_stmt() else {
+                return Err(Box::new(PgError::error(format!(
+                    "unexpected node type: {:?}",
+                    n.node_tag()
+                ))));
+            };
+            let stmt_location = if rs.stmt_location >= 0 {
+                rs.stmt_location.saturating_add(piece.offset as i32)
+            } else {
+                rs.stmt_location
+            };
+            v.push(RawStmt { stmt: rs.stmt, stmt_location, stmt_len: rs.stmt_len });
+        }
+    }
+    Ok(v)
+}
+
+fn rvbbit_stmt<'mcx>(mcx: Mcx<'mcx>, sql: &str, offset: usize) -> PgResult<RawStmt<'mcx>> {
+    let verb = rvbbit_parse::verb(sql);
+    let sql_bytes = mcx::slice_borrow_in(mcx, sql.as_bytes())?;
+    let sql_s = std::str::from_utf8(sql_bytes).map_err(|_| {
+        Box::new(PgError::error("rvbbit statement is not utf-8".to_string()))
+    })?;
+    let defnames = types_nodes::NodeList::make2(
+        mcx,
+        Node::mk_string(mcx, verb)?,
+        Node::mk_string(mcx, sql_s)?,
+    )?;
+    let stmt = Node::mk(
+        mcx,
+        DefineStmt {
+            kind: ObjectType::OBJECT_RVBBIT,
+            defnames,
+            ..DefineStmt::default()
+        },
+    )?;
+    Ok(RawStmt {
+        stmt: Some(stmt),
+        stmt_location: offset as i32,
+        stmt_len: sql.len() as i32,
+    })
 }
 
 pub fn init_seams() {

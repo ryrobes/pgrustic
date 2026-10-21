@@ -5,10 +5,21 @@
 //! claimed by the sqe census (9010/9011), the p8 census (9012), and the
 //! janitor builtins (9001/9002/9005).
 
-/// `rvbbit_means(text, text) -> bool`.
+/// `rvbbit_means(text, text) -> bool`. Fallback oid when the catalog has
+/// not been created yet. Catalog `MEANS` gets a real `pg_proc` oid.
 pub const MEANS_OID: u32 = 9020;
 
 pub const MEANS_NAME: &str = "rvbbit_means";
+
+/// Internal bodies for dump/restore. Not `pg_proc` oids; `CREATE FUNCTION
+/// ... AS 'name' LANGUAGE internal` resolves them by name.
+pub const DUMP_OID: u32 = 9021;
+pub const RESTORE_OID: u32 = 9022;
+pub const GETDEF_OID: u32 = 9023;
+
+pub const DUMP_NAME: &str = "rvbbit_dump_sql";
+pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
+pub const GETDEF_NAME: &str = "rvbbit_get_semfn_def";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

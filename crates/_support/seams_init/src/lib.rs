@@ -473,11 +473,14 @@ pub fn init_all_with_transport(transport: Transport) {
         // whose pg_proc rows janitor::bootstrap backfills into every
         // database on first connection (no install script).
         janitor::JANITOR_BUILTINS,
-        // pgrust-native (reserved-range oid 9020): rvbbit_means. No pg_proc
-        // row; cache_syscache synthesizes the planner projections.
+        // pgrust-native (reserved-range oids 9020–9023): rvbbit_means plus
+        // the dump/restore bodies. Catalog MEANS gets its own pg_proc oid;
+        // 9020 stays the pre-catalog fallback.
         rvbbit_builtins::MEANS_BUILTINS,
     ];
     fmgr_core::install_extra_builtins(&EXTRA_BUILTINS);
+    rvbbit_resolve::set_ensure(rvbbit_catalog::ensure_and_load);
+    rvbbit_resolve::set_execute(rvbbit_catalog::execute);
     rvbbit_dispatch::start();
 }
 

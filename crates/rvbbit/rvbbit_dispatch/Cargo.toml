@@ -10,8 +10,9 @@ path = "src/lib.rs"
 [dependencies]
 init_small = { path = "../../backend/utils/init/init_small" }
 postgres_seams = { path = "../../backend/tcop/postgres_seams" }
+rvbbit_contract = { path = "../rvbbit_contract" }
 rvbbit_oids = { path = "../rvbbit_oids" }
-serde = { version = "1", features = ["derive"] }
+rvbbit_resolve = { path = "../rvbbit_resolve" }
 serde_json = "1"
 types_error = { path = "../../_support/types/types_error" }
 ureq = "2.12"

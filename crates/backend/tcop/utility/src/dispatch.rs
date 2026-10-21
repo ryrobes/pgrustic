@@ -1399,6 +1399,17 @@ fn slow_switch<'mcx>(
                     // C: address = DefineTSConfiguration (tsearchcmds.c).
                     tsearchcmds::DefineTSConfiguration(mcx, stmt)?
                 }
+                types_nodes::parsenodes::ObjectType::OBJECT_RVBBIT => {
+                    let sql = stmt
+                        .defnames
+                        .iter()
+                        .nth(1)
+                        .and_then(|n| n.as_string())
+                        .map(|s| s.sval)
+                        .unwrap_or("");
+                    rvbbit_resolve::execute(sql)?;
+                    INVALID_OBJECT_ADDRESS
+                }
                 // unported: DefineStmt kinds without a define lane — 0A000.
                 other => {
                     return Err(handler_unsupported(&format!(

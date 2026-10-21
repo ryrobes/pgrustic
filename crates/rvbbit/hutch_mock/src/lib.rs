@@ -1,17 +1,16 @@
 //! Deterministic stand-in for the hutch semantic service.
 //!
-//! `POST /v1/means` accepts a JSON array of `{key, input, criterion}` and
-//! returns a JSON array of bools, one per item, in order. A match is a
-//! case-insensitive substring test (`input` contains `criterion`). Empty
-//! criteria are false.
+//! Speaks `rvbbit-hutch-v1` (`rvbbit_contract`):
+//! `POST /v1/{predict,classify,extract,embed,rerank,decide}` and
+//! `POST /v1/cache/lookup`. Predict is a case-insensitive substring
+//! (`inputs.input` contains `inputs.criterion` or the item's `criterion`).
+//! `/stats` counts operation posts only, not cache lookups.
 //!
 //! Environment:
-//! - `HUTCH_LATENCY_MS` — sleep before each response (default 0)
-//! - `HUTCH_FAIL_EVERY` — return HTTP 429 every Nth call (0 disables)
-//! - `HUTCH_TIMEOUT_EVERY` — sleep 60s every Nth call so the client times out
-//!
-//! `GET /stats` reports calls, rows, max batch, and per-call batch sizes.
-//! `POST /reset` zeroes those counters.
+//! - `HUTCH_LATENCY_MS` — sleep before each operation response (default 0)
+//! - `HUTCH_FAIL_EVERY` — HTTP 429 with `Retry-After: 0` every Nth operation
+//! - `HUTCH_TIMEOUT_EVERY` — sleep 60s every Nth operation
+//! - `HUTCH_EXPECT_AUTH` — if set, require `Authorization: Bearer <value>`
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -20,13 +19,17 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use serde::Deserialize;
+use rvbbit_contract::{
+    BatchRequest, BatchResponse, CacheLookupRequest, CacheLookupResponse, ItemError, ItemResponse,
+    Operation, CONTRACT_VERSION,
+};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub latency: Duration,
     pub fail_every: u64,
     pub timeout_every: u64,
+    pub expect_auth: Option<String>,
 }
 
 impl Config {
@@ -43,20 +46,14 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        let expect_auth = std::env::var("HUTCH_EXPECT_AUTH").ok().filter(|s| !s.is_empty());
         Self {
             latency: Duration::from_millis(latency_ms),
             fail_every,
             timeout_every,
+            expect_auth,
         }
     }
-}
-
-#[derive(Deserialize)]
-struct Item {
-    #[allow(dead_code)]
-    key: Option<String>,
-    input: String,
-    criterion: String,
 }
 
 pub struct Stats {
@@ -155,6 +152,7 @@ fn handle(mut stream: TcpStream, cfg: &Config, stats: &Stats) {
     let mut content_length = 0usize;
     let mut is_post = false;
     let mut path = String::new();
+    let mut auth = String::new();
     for (i, line) in header.lines().enumerate() {
         if i == 0 {
             let mut parts = line.split_whitespace();
@@ -164,6 +162,8 @@ fn handle(mut stream: TcpStream, cfg: &Config, stats: &Stats) {
         } else if let Some(v) = line.split_once(':') {
             if v.0.eq_ignore_ascii_case("content-length") {
                 content_length = v.1.trim().parse().unwrap_or(0);
+            } else if v.0.eq_ignore_ascii_case("authorization") {
+                auth = v.1.trim().to_string();
             }
         }
     }
@@ -176,47 +176,160 @@ fn handle(mut stream: TcpStream, cfg: &Config, stats: &Stats) {
     }
     body.truncate(content_length);
 
-    if !cfg.latency.is_zero() && path.starts_with("/v1/means") {
+    let operation = is_operation(&path);
+    if !cfg.latency.is_zero() && operation {
         thread::sleep(cfg.latency);
     }
 
-    let (status, payload) = route(is_post, &path, &body, cfg, stats);
+    let (status, extra, payload) = route(is_post, &path, &auth, &body, cfg, stats);
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
         payload
     );
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn route(is_post: bool, path: &str, body: &[u8], cfg: &Config, stats: &Stats) -> (u16, String) {
+fn is_operation(path: &str) -> bool {
+    matches!(
+        path_only(path),
+        "/v1/predict" | "/v1/classify" | "/v1/extract" | "/v1/embed" | "/v1/rerank" | "/v1/decide"
+            | "/v1/means"
+    )
+}
+
+fn path_only(path: &str) -> &str {
+    path.split('?').next().unwrap_or(path)
+}
+
+fn route(
+    is_post: bool,
+    path: &str,
+    auth: &str,
+    body: &[u8],
+    cfg: &Config,
+    stats: &Stats,
+) -> (u16, String, String) {
+    let path = path_only(path);
     if path.starts_with("/stats") {
-        return (200, stats.json());
+        return (200, String::new(), stats.json());
     }
     if path.starts_with("/reset") {
         stats.reset();
-        return (200, "{\"ok\":true}".to_string());
+        return (200, String::new(), "{\"ok\":true}".to_string());
     }
-    if is_post && path.starts_with("/v1/means") {
+    if let Some(expect) = &cfg.expect_auth {
+        let want = format!("Bearer {expect}");
+        if auth != want {
+            return (401, String::new(), "{\"error\":\"unauthorized\"}".to_string());
+        }
+    }
+    if is_post && path == "/v1/cache/lookup" {
+        let req: CacheLookupRequest = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return (400, String::new(), format!("{{\"error\":\"{e}\"}}")),
+        };
+        let resp = CacheLookupResponse {
+            hits: Vec::new(),
+            misses: req.keys,
+        };
+        return (
+            200,
+            String::new(),
+            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+        );
+    }
+    if is_post && is_operation(path) {
         let seen = stats.calls.load(Ordering::Relaxed);
         if cfg.timeout_every > 0 && seen % cfg.timeout_every == 0 {
             stats.record(0);
             thread::sleep(Duration::from_secs(60));
-            return (504, "{\"error\":\"injected timeout\"}".to_string());
+            return (504, String::new(), "{\"error\":\"injected timeout\"}".to_string());
         }
         if cfg.fail_every > 0 && seen % cfg.fail_every == 0 {
             stats.record(0);
-            return (429, "{\"error\":\"injected rate limit\"}".to_string());
+            return (
+                429,
+                "Retry-After: 0\r\n".to_string(),
+                "{\"error\":\"injected rate limit\"}".to_string(),
+            );
         }
-        let items: Vec<Item> = match serde_json::from_slice(body) {
+        let req: BatchRequest = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(e) => return (400, format!("{{\"error\":\"{e}\"}}")),
+            Err(e) => return (400, String::new(), format!("{{\"error\":\"{e}\"}}")),
         };
-        stats.record(items.len());
-        let results: Vec<bool> = items.iter().map(|it| matches(&it.input, &it.criterion)).collect();
-        return (200, serde_json::to_string(&results).unwrap_or_else(|_| "[]".into()));
+        stats.record(req.items.len());
+        let op = operation_of(path).unwrap_or(req.operation);
+        let outputs = req
+            .items
+            .iter()
+            .map(|item| {
+                let value = mock_value(op, item);
+                ItemResponse {
+                    key: item.key.clone(),
+                    value: Some(value),
+                    error: None,
+                }
+            })
+            .collect();
+        let resp = BatchResponse {
+            contract: CONTRACT_VERSION.to_string(),
+            outputs,
+        };
+        return (
+            200,
+            String::new(),
+            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+        );
     }
-    (404, "{\"error\":\"not found\"}".to_string())
+    (404, String::new(), "{\"error\":\"not found\"}".to_string())
+}
+
+fn operation_of(path: &str) -> Option<Operation> {
+    Some(match path {
+        "/v1/predict" | "/v1/means" => Operation::Predict,
+        "/v1/classify" => Operation::Classify,
+        "/v1/extract" => Operation::Extract,
+        "/v1/embed" => Operation::Embed,
+        "/v1/rerank" => Operation::Rerank,
+        "/v1/decide" => Operation::Decide,
+        _ => return None,
+    })
+}
+
+fn mock_value(op: Operation, item: &rvbbit_contract::ItemRequest) -> serde_json::Value {
+    let input = item
+        .inputs
+        .get("input")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let criterion = item
+        .criterion
+        .clone()
+        .or_else(|| item.inputs.get("criterion").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    match op {
+        Operation::Predict => serde_json::Value::Bool(matches(&input, &criterion)),
+        Operation::Classify => serde_json::Value::String(criterion),
+        Operation::Extract => serde_json::json!({}),
+        Operation::Embed => serde_json::json!([0.0]),
+        Operation::Rerank => serde_json::json!(0.0),
+        Operation::Decide => serde_json::json!({"label": "yes", "status": "ok"}),
+    }
+}
+
+/// Kept so a test can force a positional item error without a new server.
+#[allow(dead_code)]
+pub fn item_error(key: &str, message: &str) -> ItemResponse {
+    ItemResponse {
+        key: key.to_string(),
+        value: None,
+        error: Some(ItemError {
+            code: "mock".into(),
+            message: message.into(),
+        }),
+    }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {

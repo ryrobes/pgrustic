@@ -4,7 +4,8 @@
 # Expects:
 #   PGHOST (default /tmp), PGPORT (default 55432), PGUSER (default postgres)
 #   HUTCH (default http://127.0.0.1:8099) — the mock's base URL
-# The server must have been started with RVBBIT_HUTCH_URL=$HUTCH/v1/means.
+# The server reads RVBBIT_HUTCH_URL (default http://127.0.0.1:8099). A
+# trailing /v1/means or /v1/predict is stripped. MEANS posts {base}/v1/predict.
 set -euo pipefail
 
 PGHOST=${PGHOST:-/tmp}

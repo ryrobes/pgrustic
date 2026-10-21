@@ -81,7 +81,9 @@ execexpr = { path = "../../backend/executor/execexpr" }
 execjunk = { path = "../../backend/executor/execjunk" }
 execmain = { path = "../../backend/executor/execmain" }
 rvbbit_builtins = { path = "../../rvbbit/rvbbit_builtins" }
+rvbbit_catalog = { path = "../../rvbbit/rvbbit_catalog" }
 rvbbit_dispatch = { path = "../../rvbbit/rvbbit_dispatch" }
+rvbbit_resolve = { path = "../../rvbbit/rvbbit_resolve" }
 execscan = { path = "../../backend/executor/execscan" }
 nodeseqscan = { path = "../../backend/executor/nodeseqscan" }
 nodesamplescan = { path = "../../backend/executor/nodesamplescan" }

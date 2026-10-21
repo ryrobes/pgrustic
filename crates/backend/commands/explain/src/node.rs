@@ -1316,13 +1316,13 @@ pub fn ExplainNode<'mcx>(
                 ExplainPropertyInteger(
                     "Batch Size",
                     None,
-                    rvbbit_oids::BATCH_ROWS as i64,
+                    rvbbit_resolve::batch_rows() as i64,
                     es,
                 );
                 ExplainPropertyInteger(
                     "Concurrency",
                     None,
-                    rvbbit_oids::CONCURRENCY as i64,
+                    rvbbit_resolve::max_concurrent() as i64,
                     es,
                 );
                 if es.analyze {

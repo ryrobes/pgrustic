@@ -827,6 +827,10 @@ pub enum ObjectType {
     OBJECT_TYPE,
     OBJECT_USER_MAPPING,
     OBJECT_VIEW,
+    // Fork-only. Appended so every PG 18.3 discriminant stays put
+    // (nodes tests compare those values to parsenodes.h). Not a gram.y
+    // object type: rvbbit DDL arrives as DefineStmt { kind: OBJECT_RVBBIT }.
+    OBJECT_RVBBIT,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

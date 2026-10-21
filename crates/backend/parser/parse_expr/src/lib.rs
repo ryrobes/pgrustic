@@ -332,10 +332,14 @@ fn transform_means<'mcx>(
         types_core::TEXTOID,
         "MEANS",
     )?;
+    // Catalog chain: operator word -> semantic function -> model -> backend.
+    // The oid-9020 builtin remains the fallback before the first MEANS.
+    rvbbit_resolve::ensure()?;
+    let funcid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
     Node::mk(
         mcx,
         types_nodes::primnodes::FuncExpr {
-            funcid: rvbbit_oids::MEANS_OID,
+            funcid,
             funcresulttype: types_core::BOOLOID,
             funcretset: false,
             funcvariadic: false,

@@ -7,7 +7,6 @@
 //! retarget the Result qual onto the scan output.
 
 use mcx::Mcx;
-use rvbbit_oids::MEANS_OID;
 use types_error::PgResult;
 use types_nodes::list::NodeList;
 use types_nodes::plannodes::{Append, MergeAppend, Result as ResultPlan, SubqueryScan};
@@ -22,7 +21,7 @@ pub fn expr_contains_means(node: Node<'_>) -> bool {
     match node.node_tag() {
         NodeTag::T_FuncExpr => {
             let f = node.as_func_expr().expect("FuncExpr");
-            f.funcid == MEANS_OID || f.args.iter().any(expr_contains_means)
+            rvbbit_resolve::is_semantic_func(f.funcid) || f.args.iter().any(expr_contains_means)
         }
         NodeTag::T_BoolExpr => node
             .as_bool_expr()

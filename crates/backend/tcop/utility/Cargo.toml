@@ -97,6 +97,7 @@ opclasscmds = { path = "../../commands/opclasscmds" }
 extension = { path = "../../commands/extension" }
 catalog_dependency = { path = "../../catalog/catalog_dependency" }
 pg_depend = { path = "../../catalog/pg_depend" }
+rvbbit_resolve = { path = "../../../rvbbit/rvbbit_resolve" }
 tsearchcmds = { path = "../../commands/tsearchcmds" }
 
 [dev-dependencies]

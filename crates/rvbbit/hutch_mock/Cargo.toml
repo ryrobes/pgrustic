@@ -12,5 +12,5 @@ name = "hutch_mock"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+rvbbit_contract = { path = "../rvbbit_contract" }
 serde_json = "1"

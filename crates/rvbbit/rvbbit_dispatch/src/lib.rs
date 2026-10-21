@@ -1,26 +1,48 @@
-//! Blocking HTTP dispatch from backend threads to the hutch service.
+//! Blocking HTTP dispatch from backend threads to a hutch service.
 //!
 //! A fixed OS thread pool is started at server boot. Backend threads hand
 //! work over a bounded queue and wait on a reply channel, polling
 //! `InterruptPending` so query cancel and `statement_timeout` abort the
-//! wait. Workers use `ureq` (no tokio). A semaphore caps in-flight calls
-//! per model; the spike has one model, so the cap is [`CONCURRENCY`].
+//! wait. Workers use `ureq` (no tokio). Each backend URL has its own
+//! concurrency cap, taken from the catalog row (4 for the default mock).
+//!
+//! The wire format is `rvbbit-hutch-v1` (`rvbbit_contract`). MEANS posts
+//! `/v1/predict` with `X-Rvbbit-Cache: mode=off` and does not call
+//! `/v1/cache/lookup`, so a 10k batch stays one HTTP call per 32 rows.
+//! In-flight HTTP is not aborted; the wait returns at the next 20ms poll.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use rvbbit_oids::{CONCURRENCY, POOL_THREADS};
-use serde::Serialize;
+use rvbbit_contract::{
+    cache_header, client_cache_key_hex, BatchRequest, BatchResponse, CacheKeyParts,
+    CacheLookupRequest, CacheLookupResponse, CacheMode, ItemRequest, Operation,
+    CONTRACT_VERSION, HEADER_AUTHORIZATION, HEADER_CACHE, HEADER_CONTRACT,
+};
+use rvbbit_oids::POOL_THREADS;
+use rvbbit_resolve::Endpoint;
 use types_error::{PgError, PgResult};
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
+const RETRY_CAP: Duration = Duration::from_millis(2_000);
 
 struct Job {
+    url: String,
+    auth: Option<String>,
+    timeout_ms: u64,
+    retries: u32,
+    limiter: Arc<Limiter>,
     body: String,
-    expect: usize,
-    reply: mpsc::Sender<Result<BatchReply, String>>,
+    cache_header: String,
+    reply: mpsc::Sender<Result<RawReply, String>>,
+}
+
+struct RawReply {
+    body: String,
+    http_calls: u32,
 }
 
 struct Limiter {
@@ -31,7 +53,7 @@ struct Limiter {
 impl Limiter {
     fn new(n: usize) -> Self {
         Self {
-            free: Mutex::new(n),
+            free: Mutex::new(n.max(1)),
             cv: Condvar::new(),
         }
     }
@@ -60,31 +82,33 @@ fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<Job>(64);
         let rx = Arc::new(Mutex::new(rx));
-        let limiter = Arc::new(Limiter::new(CONCURRENCY));
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(timeout_ms()))
-            .build();
-        let url = hutch_url();
+        let agent = ureq::AgentBuilder::new().build();
         for i in 0..POOL_THREADS {
             let rx = Arc::clone(&rx);
-            let limiter = Arc::clone(&limiter);
             let agent = agent.clone();
-            let url = url.clone();
             thread::Builder::new()
                 .name(format!("rvbbit-hutch-{i}"))
-                .spawn(move || worker(rx, limiter, agent, url))
+                .spawn(move || worker(rx, agent))
                 .expect("spawn rvbbit dispatch worker");
         }
         Pool { tx }
     })
 }
 
-fn worker(
-    rx: Arc<Mutex<Receiver<Job>>>,
-    limiter: Arc<Limiter>,
-    agent: ureq::Agent,
-    url: String,
-) {
+fn limiters() -> &'static Mutex<HashMap<String, Arc<Limiter>>> {
+    static LIMITERS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Limiter>>>> =
+        std::sync::OnceLock::new();
+    LIMITERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn limiter_for(url: &str, n: usize) -> Arc<Limiter> {
+    let mut map = limiters().lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(format!("{url}#{n}"))
+        .or_insert_with(|| Arc::new(Limiter::new(n)))
+        .clone()
+}
+
+fn worker(rx: Arc<Mutex<Receiver<Job>>>, agent: ureq::Agent) {
     loop {
         let job = {
             let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -93,32 +117,20 @@ fn worker(
         let Ok(job) = job else {
             break;
         };
-        limiter.acquire();
-        let result = post_with_retry(&agent, &url, &job.body, job.expect);
-        limiter.release();
+        job.limiter.acquire();
+        let result = post_with_retry(&agent, &job);
+        job.limiter.release();
         let _ = job.reply.send(result);
     }
 }
 
-fn hutch_url() -> String {
-    std::env::var("RVBBIT_HUTCH_URL").unwrap_or_else(|_| "http://127.0.0.1:8099/v1/means".to_string())
-}
-
-fn timeout_ms() -> u64 {
-    std::env::var("RVBBIT_HUTCH_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000)
-}
-
 /// Start the pool. Safe to call more than once; later calls are no-ops.
-/// Reads `RVBBIT_HUTCH_URL` and `RVBBIT_HUTCH_TIMEOUT_MS` on the first call.
 pub fn start() {
     let _ = pool();
 }
 
 pub struct Ticket {
-    rx: Receiver<Result<BatchReply, String>>,
+    rx: Receiver<Result<RawReply, String>>,
 }
 
 /// One hutch round-trip's worth of answers. `http_calls` counts attempts,
@@ -128,37 +140,75 @@ pub struct BatchReply {
     pub http_calls: u32,
 }
 
-#[derive(Serialize)]
-struct ReqItem<'a> {
-    key: String,
-    input: &'a str,
-    criterion: &'a str,
-}
-
-/// Queue one batch. The caller waits with [`wait`], which honors query cancel.
-pub fn submit(items: &[(String, String)]) -> PgResult<Ticket> {
+/// Queue one predict batch. The caller waits with [`wait`], which honors
+/// query cancel. `func_oid` selects the catalog backend (URL, auth, model).
+pub fn submit(func_oid: u32, items: &[(String, String)]) -> PgResult<Ticket> {
+    let ep = rvbbit_resolve::endpoint_for(func_oid);
     if items.is_empty() {
         let (tx, rx) = mpsc::channel();
-        let _ = tx.send(Ok(BatchReply {
-            matched: Vec::new(),
+        let _ = tx.send(Ok(RawReply {
+            body: empty_predict(&ep),
             http_calls: 0,
         }));
         return Ok(Ticket { rx });
     }
-    let body_items: Vec<ReqItem<'_>> = items
-        .iter()
-        .enumerate()
-        .map(|(i, (input, criterion))| ReqItem {
-            key: i.to_string(),
-            input,
-            criterion,
-        })
-        .collect();
-    let body = serde_json::to_string(&body_items).map_err(|e| pg(format!("hutch encode: {e}")))?;
+    let body = encode_predict(&ep, items).map_err(pg)?;
+    let auth = bearer(&ep).map_err(pg)?;
+    enqueue(
+        format!("{}/v1/predict", ep.base_url.trim_end_matches('/')),
+        auth,
+        &ep,
+        body,
+        cache_header(CacheMode::Off, None, None),
+    )
+}
+
+/// `POST /v1/cache/lookup`. Not used by MEANS; the hot path sends `mode=off`
+/// and lets hutch skip the cache. Exposed so the pool speaks the contract.
+pub fn cache_lookup(base_url: &str, keys: &[String]) -> PgResult<CacheLookupResponse> {
+    let ep = rvbbit_resolve::default_endpoint();
+    let body = serde_json::to_string(&CacheLookupRequest { keys: keys.to_vec() })
+        .map_err(|e| pg(format!("cache lookup encode: {e}")))?;
+    let ticket = enqueue(
+        format!("{}/v1/cache/lookup", base_url.trim_end_matches('/')),
+        None,
+        &ep,
+        body,
+        cache_header(CacheMode::ReadWrite, None, None),
+    )?;
+    let raw = wait_raw(ticket)?;
+    serde_json::from_str(&raw.body).map_err(|e| pg(format!("cache lookup decode: {e}")))
+}
+
+/// One pair through the pool. Used by the per-row builtin fallback.
+pub fn means_oid(func_oid: u32, input: &str, criterion: &str) -> PgResult<bool> {
+    let ticket = submit(func_oid, &[(input.to_string(), criterion.to_string())])?;
+    let got = wait(ticket)?;
+    Ok(got.matched.first().copied().unwrap_or(false))
+}
+
+/// Block until the batch returns, or the backend is canceled.
+pub fn wait(ticket: Ticket) -> PgResult<BatchReply> {
+    let raw = wait_raw(ticket)?;
+    decode_predict(&raw.body, raw.http_calls).map_err(pg)
+}
+
+fn enqueue(
+    url: String,
+    auth: Option<String>,
+    ep: &Endpoint,
+    body: String,
+    cache_header: String,
+) -> PgResult<Ticket> {
     let (reply, rx) = mpsc::channel();
     let job = Job {
+        limiter: limiter_for(&url, ep.max_concurrent),
+        url,
+        auth,
+        timeout_ms: ep.timeout_ms,
+        retries: ep.retries.max(1),
         body,
-        expect: items.len(),
+        cache_header,
         reply,
     };
     let tx = &pool().tx;
@@ -179,8 +229,7 @@ pub fn submit(items: &[(String, String)]) -> PgResult<Ticket> {
     Ok(Ticket { rx })
 }
 
-/// Block until the batch returns, or the backend is canceled.
-pub fn wait(ticket: Ticket) -> PgResult<BatchReply> {
+fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
     loop {
         check_cancel()?;
         match ticket.rx.recv_timeout(WAIT_SLICE) {
@@ -194,11 +243,77 @@ pub fn wait(ticket: Ticket) -> PgResult<BatchReply> {
     }
 }
 
-/// One pair through the pool. Used by the per-row builtin fallback.
-pub fn means_pair(input: &str, criterion: &str) -> PgResult<bool> {
-    let ticket = submit(&[(input.to_string(), criterion.to_string())])?;
-    let got = wait(ticket)?;
-    Ok(got.matched.first().copied().unwrap_or(false))
+fn encode_predict(ep: &Endpoint, items: &[(String, String)]) -> Result<String, String> {
+    let mut req_items = Vec::with_capacity(items.len());
+    for (i, (input, criterion)) in items.iter().enumerate() {
+        let inputs = serde_json::json!({ "criterion": criterion, "input": input });
+        let cache_key = client_cache_key_hex(&CacheKeyParts {
+            fn_name: &ep.fn_name,
+            fn_version: ep.fn_version,
+            system_prompt: &ep.system_prompt,
+            user_prompt: &ep.user_prompt,
+            return_schema: &ep.return_type,
+            model: &ep.model,
+            temperature: ep.temperature,
+            max_tokens: ep.max_tokens,
+            take_index: 0,
+            seed: "",
+            inputs: &inputs,
+        });
+        req_items.push(ItemRequest {
+            key: i.to_string(),
+            cache_key,
+            inputs,
+            criterion: Some(criterion.clone()),
+            system: None,
+            prompt: None,
+        });
+    }
+    let req = BatchRequest {
+        contract: CONTRACT_VERSION.to_string(),
+        operation: Operation::Predict,
+        model: ep.model.clone(),
+        temperature: ep.temperature,
+        max_tokens: ep.max_tokens,
+        items: req_items,
+    };
+    serde_json::to_string(&req).map_err(|e| format!("hutch encode: {e}"))
+}
+
+fn empty_predict(ep: &Endpoint) -> String {
+    serde_json::json!({
+        "contract": CONTRACT_VERSION,
+        "outputs": [],
+        "model": ep.model,
+    })
+    .to_string()
+}
+
+fn decode_predict(text: &str, http_calls: u32) -> Result<BatchReply, String> {
+    let parsed: BatchResponse = serde_json::from_str(text)
+        .map_err(|e| format!("hutch decode: {e}: {text}"))?;
+    let mut matched = Vec::with_capacity(parsed.outputs.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            return Err(format!("hutch item {i}: {} {}", err.code, err.message));
+        }
+        let Some(value) = &item.value else {
+            return Err(format!("hutch item {i} has no value"));
+        };
+        let flag = value.as_bool().ok_or_else(|| format!("hutch item {i} is not a bool"))?;
+        matched.push(flag);
+    }
+    Ok(BatchReply { matched, http_calls })
+}
+
+fn bearer(ep: &Endpoint) -> Result<Option<String>, String> {
+    let Some(name) = &ep.auth_env else {
+        return Ok(None);
+    };
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => Ok(Some(v)),
+        _ => Err(format!("backend auth env {name} is not set")),
+    }
 }
 
 fn check_cancel() -> PgResult<()> {
@@ -208,57 +323,65 @@ fn check_cancel() -> PgResult<()> {
     Ok(())
 }
 
-fn post_with_retry(
-    agent: &ureq::Agent,
-    url: &str,
-    body: &str,
-    expect: usize,
-) -> Result<BatchReply, String> {
+fn post_with_retry(agent: &ureq::Agent, job: &Job) -> Result<RawReply, String> {
     let mut last = String::from("hutch: no attempt");
-    for attempt in 1..=5 {
-        match post_once(agent, url, body, expect) {
-            Ok(matched) => {
-                return Ok(BatchReply {
-                    matched,
+    let attempts = job.retries.max(1);
+    for attempt in 1..=attempts {
+        match post_once(agent, job) {
+            Ok(body) => {
+                return Ok(RawReply {
+                    body,
                     http_calls: attempt,
                 })
             }
-            Err(e) if e.starts_with("429") && attempt < 5 => {
-                last = e;
-                thread::sleep(Duration::from_millis(50));
+            Err(PostErr::Retry { after, detail }) if attempt < attempts => {
+                last = detail;
+                thread::sleep(after.min(RETRY_CAP));
             }
-            Err(e) => return Err(e),
+            Err(PostErr::Retry { detail, .. }) => return Err(detail),
+            Err(PostErr::Fatal(e)) => return Err(e),
         }
     }
     Err(last)
 }
 
-fn post_once(agent: &ureq::Agent, url: &str, body: &str, expect: usize) -> Result<Vec<bool>, String> {
-    let response = agent
-        .post(url)
+enum PostErr {
+    Retry { after: Duration, detail: String },
+    Fatal(String),
+}
+
+fn post_once(agent: &ureq::Agent, job: &Job) -> Result<String, PostErr> {
+    let mut req = agent
+        .post(&job.url)
+        .timeout(Duration::from_millis(job.timeout_ms.max(1)))
         .set("Content-Type", "application/json")
-        .send_string(body);
-    let text = match response {
-        Ok(resp) => resp.into_string().map_err(|e| e.to_string())?,
+        .set(HEADER_CONTRACT, CONTRACT_VERSION)
+        .set(HEADER_CACHE, &job.cache_header);
+    if let Some(token) = &job.auth {
+        req = req.set(HEADER_AUTHORIZATION, &format!("Bearer {token}"));
+    }
+    match req.send_string(&job.body) {
+        Ok(resp) => resp.into_string().map_err(|e| PostErr::Fatal(e.to_string())),
         Err(ureq::Error::Status(code, resp)) => {
+            let after = resp
+                .header("retry-after")
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|secs| Duration::from_secs(secs))
+                .unwrap_or(Duration::from_millis(50));
             let detail = resp.into_string().unwrap_or_default();
             if code == 429 {
-                return Err(format!("429 {detail}"));
+                Err(PostErr::Retry {
+                    after,
+                    detail: format!("429 {detail}"),
+                })
+            } else {
+                Err(PostErr::Fatal(format!("hutch HTTP {code}: {detail}")))
             }
-            return Err(format!("hutch HTTP {code}: {detail}"));
         }
-        Err(e) => return Err(format!("hutch transport: {e}")),
-    };
-    let values: Vec<bool> = serde_json::from_str(&text).map_err(|e| format!("hutch decode: {e}: {text}"))?;
-    if values.len() != expect {
-        return Err(format!(
-            "hutch returned {} results for {expect} items",
-            values.len()
-        ));
+        Err(e) => Err(PostErr::Fatal(format!("hutch transport: {e}"))),
     }
-    Ok(values)
 }
 
 fn pg(message: impl Into<String>) -> Box<PgError> {
-    Box::new(PgError::error(message))
+    Box::new(PgError::error(message.into()))
 }

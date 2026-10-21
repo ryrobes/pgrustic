@@ -1,0 +1,8 @@
+# Serial. Each test cleans up after itself. Database is rvbbit_regress,
+# never the upstream `regression` database.
+test: unreserved
+test: ddl
+test: deps
+test: grants
+test: dump
+test: means

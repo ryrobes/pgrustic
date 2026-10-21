@@ -55,8 +55,8 @@ xact = { path = "../../access/transam/xact" }
 parser_small1 = { path = "../../parser/parser_small1" }
 mbutils = { path = "../../utils/mb/mbutils" }
 execmain = { path = "../../executor/execmain" }
-rvbbit_oids = { path = "../../../rvbbit/rvbbit_oids" }
 rvbbit_plan = { path = "../../../rvbbit/rvbbit_plan" }
+rvbbit_resolve = { path = "../../../rvbbit/rvbbit_resolve" }
 
 [dev-dependencies]
 namespace_seams = { path = "../../catalog/namespace_seams" }

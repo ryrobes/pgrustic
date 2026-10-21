@@ -1,0 +1,17 @@
+[package]
+name = "rvbbit_catalog"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mcx = { path = "../../_support/mcx" }
+rvbbit_oids = { path = "../rvbbit_oids" }
+rvbbit_parse = { path = "../rvbbit_parse" }
+rvbbit_resolve = { path = "../rvbbit_resolve" }
+serde_json = "1"
+spi = { path = "../../backend/executor/spi" }
+types_error = { path = "../../_support/types/types_error" }

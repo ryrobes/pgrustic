@@ -1,9 +1,10 @@
 //! Semantic batch execution for a Result node whose qual is `rvbbit_means`.
 //!
 //! Rows are pulled from the child (which already applied the cheap quals),
-//! projected, and grouped into batches of [`BATCH_ROWS`]. Up to
-//! [`CONCURRENCY`] batches are in flight. Identical `(input, criterion)`
-//! pairs in the same query are memoized and not sent again.
+//! projected, and grouped into batches (32 by default, from the backend
+//! row). Up to that backend's concurrency (4 by default) are in flight.
+//! Identical `(input, criterion)` pairs in the same query are memoized
+//! and not sent again.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -11,7 +12,6 @@ use execexpr::{exec_eval_expr, exec_init_expr_subplans, ExprState};
 use executils::{EStateData, ExecSlotId};
 use mcx::{Mcx, PgBox};
 use rvbbit_dispatch::{self, BatchReply};
-use rvbbit_oids::{BATCH_ROWS, CONCURRENCY, MEANS_OID};
 use types_error::{PgError, PgResult};
 use types_nodes::plannodes::Result as ResultPlan;
 use types_nodes::Node;
@@ -75,6 +75,9 @@ struct Inflight {
 
 pub struct SemanticState<'mcx> {
     args: Vec<MeansArgs<'mcx>>,
+    func_oid: u32,
+    batch_rows: usize,
+    concurrency: usize,
     memo: HashMap<(String, String), bool>,
     emit: VecDeque<SavedTuple>,
     inflight: VecDeque<Inflight>,
@@ -126,6 +129,7 @@ pub fn compile<'mcx>(
     if funcs.is_empty() {
         return Ok(None);
     }
+    let func_oid = funcs[0].as_func_expr().expect("FuncExpr").funcid;
     let mcx = estate.es_query_cxt;
     let params = estate.param_bind();
     let mut args = Vec::with_capacity(funcs.len());
@@ -140,6 +144,9 @@ pub fn compile<'mcx>(
     }
     Ok(Some(Box::new(SemanticState {
         args,
+        func_oid,
+        batch_rows: rvbbit_resolve::batch_rows().max(1),
+        concurrency: rvbbit_resolve::max_concurrent().max(1),
         memo: HashMap::new(),
         emit: VecDeque::new(),
         inflight: VecDeque::new(),
@@ -167,7 +174,9 @@ fn compile_expr<'mcx>(
 
 fn clause_is_pure_means(node: Node<'_>) -> bool {
     match node.node_tag() {
-        NodeTag::T_FuncExpr => node.as_func_expr().expect("FuncExpr").funcid == MEANS_OID,
+        NodeTag::T_FuncExpr => {
+            rvbbit_resolve::is_semantic_func(node.as_func_expr().expect("FuncExpr").funcid)
+        }
         NodeTag::T_RelabelType => {
             clause_is_pure_means(node.as_relabel_type().expect("Relabel").arg)
         }
@@ -187,7 +196,7 @@ fn collect_means<'mcx>(node: Node<'mcx>, out: &mut Vec<Node<'mcx>>) {
     match node.node_tag() {
         NodeTag::T_FuncExpr => {
             let f = node.as_func_expr().expect("FuncExpr");
-            if f.funcid == MEANS_OID {
+            if rvbbit_resolve::is_semantic_func(f.funcid) {
                 out.push(node);
             } else {
                 for arg in f.args.iter() {
@@ -296,7 +305,7 @@ impl<'mcx> SemanticState<'mcx> {
         node: &mut ResultState<'mcx>,
         estate: &mut EStateData<'mcx>,
     ) -> PgResult<()> {
-        while self.inflight.len() < CONCURRENCY && !self.child_done {
+        while self.inflight.len() < self.concurrency && !self.child_done {
             let rows = self.pull_batch(node, estate)?;
             if rows.is_empty() {
                 self.child_done = true;
@@ -312,9 +321,9 @@ impl<'mcx> SemanticState<'mcx> {
         node: &mut ResultState<'mcx>,
         estate: &mut EStateData<'mcx>,
     ) -> PgResult<Vec<RowWork>> {
-        let mut rows = Vec::with_capacity(BATCH_ROWS);
+        let mut rows = Vec::with_capacity(self.batch_rows);
         let ecxt = node.ps.ps_ExprContext.expect("Result ExprContext");
-        while rows.len() < BATCH_ROWS && !self.child_done {
+        while rows.len() < self.batch_rows && !self.child_done {
             crate::cfi()?;
             estate.reset_expr_context(ecxt);
             let outer = node.outer.as_deref_mut().expect("semantic Result has a child");
@@ -358,7 +367,7 @@ impl<'mcx> SemanticState<'mcx> {
             self.enqueue_ready(rows, &BatchReply { matched: Vec::new(), http_calls: 0 });
             return Ok(());
         }
-        let ticket = rvbbit_dispatch::submit(&sent)?;
+        let ticket = rvbbit_dispatch::submit(self.func_oid, &sent)?;
         self.inflight.push_back(Inflight {
             rows,
             ticket: Some(ticket),
