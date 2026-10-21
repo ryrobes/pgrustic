@@ -48,10 +48,34 @@ fn ensure_m6_ops() -> PgResult<()> {
         ),
         ("rerank", "document text, query text", "float8", "rvbbit_rerank"),
         (
+            "rerank_for",
+            "document text, query text, model text",
+            "float8",
+            "rvbbit_rerank_for",
+        ),
+        (
             "extract_many",
             "kind text, input text, clauses text",
             "text",
             "rvbbit_extract_many",
+        ),
+        (
+            "clause_bool",
+            "kind text, input text, extra text, clauses text",
+            "boolean",
+            "rvbbit_clause_bool",
+        ),
+        (
+            "clause_score",
+            "kind text, input text, extra text, clauses text",
+            "float8",
+            "rvbbit_clause_score",
+        ),
+        (
+            "clause_text",
+            "kind text, input text, extra text, clauses text",
+            "text",
+            "rvbbit_clause_text",
         ),
     ] {
         if scalar(&format!(

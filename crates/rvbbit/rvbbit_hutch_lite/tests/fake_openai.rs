@@ -21,6 +21,10 @@ struct Harness {
 }
 
 fn harness(api_key: Option<&str>) -> Harness {
+    harness_rerank(api_key, "")
+}
+
+fn harness_rerank(api_key: Option<&str>, rerank_model: &str) -> Harness {
     let fake = TcpListener::bind("127.0.0.1:0").unwrap();
     let fake_port = fake.local_addr().unwrap().port();
     let hits = Arc::new(AtomicU64::new(0));
@@ -36,6 +40,7 @@ fn harness(api_key: Option<&str>) -> Harness {
         api_key: api_key.map(|s| s.to_string()),
         default_model: "openai/gpt-4o-mini".into(),
         decision_model: "typesafe/jev-1.14".into(),
+        rerank_model: rerank_model.to_string(),
         decision_takes: 1,
         decision_combine: "mean".into(),
         decision_threshold: 0.5,
@@ -166,6 +171,32 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
     }
 }
 
+fn openrouter_rerank_payload(text: &str) -> (u16, String) {
+    if text.contains("LEAK") {
+        return (500, format!(r#"{{"error":{{"message":"echo leaked"}}}}"#));
+    }
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (400, r#"{"error":{"message":"rerank json"}}"#.into());
+    };
+    let Some(docs) = body.get("documents").and_then(|d| d.as_array()) else {
+        return (400, r#"{"error":{"message":"rerank documents"}}"#.into());
+    };
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("rerank");
+    let mut results = Vec::new();
+    for (index, doc) in docs.iter().enumerate() {
+        let text = doc.as_str().unwrap_or("");
+        let relevance_score = if text.to_ascii_lowercase().contains("logging") { 0.91 } else { 0.12 };
+        results.push(serde_json::json!({ "index": index, "relevance_score": relevance_score }));
+    }
+    let payload = serde_json::json!({
+        "id": "gen-rerank-batch",
+        "model": model,
+        "results": results,
+        "usage": { "total_tokens": 40, "cost": 0.000002 }
+    });
+    (200, payload.to_string())
+}
+
 fn post(url: &str, mode: &str, req: &BatchRequest) -> BatchResponse {
     let body = serde_json::to_string(req).unwrap();
     let resp = ureq::post(url)
@@ -177,6 +208,10 @@ fn post(url: &str, mode: &str, req: &BatchRequest) -> BatchResponse {
 }
 
 fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
+    let request = header.lines().next().unwrap_or("");
+    if request.contains("/rerank") {
+        return openrouter_rerank_payload(text);
+    }
     if text.contains("LEAK") {
         return (500, format!("{{\"error\":{{\"message\":\"echo {auth}\"}}}}"));
     }
@@ -708,6 +743,103 @@ fn rerank_summary_and_extract_many() {
 }
 
 #[test]
+fn takes_and_summary_misses_match_provider_calls() {
+    let h = harness(Some("test-key"));
+    let mut predict_req = predict("LOGGING road at dusk", "logging road");
+    predict_req.decision = Some(DecisionStack {
+        models: vec!["mock".into()],
+        takes: Some(3),
+        combine: Some("mean".into()),
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let got = post(&format!("{}/v1/predict", h.hutch), "read-write", &predict_req);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+
+    let mut summary = predict("two notes about a road", "ignored");
+    summary.operation = Operation::Extract;
+    summary.items[0].extract_mode = Some("summary".into());
+    summary.items[0].cache_key = format!("{}sumtakes", summary.items[0].cache_key);
+    summary.decision = Some(DecisionStack {
+        models: vec!["mock".into()],
+        takes: Some(2),
+        combine: None,
+        threshold: None,
+        phrasings: Vec::new(),
+        pick: None,
+    });
+    let summed = post(&format!("{}/v1/extract", h.hutch), "read-write", &summary);
+    assert!(summed.outputs[0].error.is_none(), "{:?}", summed.outputs[0].error);
+    assert_eq!(
+        summed.outputs[0].value,
+        Some(serde_json::json!("a short summary of the notes"))
+    );
+
+    let stats = stats_of(&h.hutch);
+    assert_eq!(stats["provider_calls"], 5, "{stats}");
+    assert_eq!(stats["misses"], stats["provider_calls"], "{stats}");
+}
+
+#[test]
+fn openrouter_rerank_batches_one_query() {
+    let h = harness(Some("test-key"));
+    let mut req = predict("LOGGING road at dusk", "logging road");
+    req.operation = Operation::Rerank;
+    req.model = "voyageai/rerank-3".into();
+    req.items.push(item("lights over the lake", Some("logging road")));
+    req.items[1].key = "1".into();
+    req.items[1].cache_key = format!("{}b", req.items[0].cache_key);
+    let got = post(&format!("{}/v1/rerank", h.hutch), "off", &req);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    assert!(got.outputs[1].error.is_none(), "{:?}", got.outputs[1].error);
+    assert!(near(got.outputs[0].score, 0.91), "{:?}", got.outputs[0].score);
+    assert!(near(got.outputs[1].score, 0.12), "{:?}", got.outputs[1].score);
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), 1, "one /rerank call for the query");
+    let call = &got.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(call.op, "rerank");
+    assert_eq!(call.model, "voyageai/rerank-3");
+    assert!(near(call.cost_usd, 0.000001), "cost is split across the batch: {call:?}");
+    let stats = stats_of(&h.hutch);
+    assert_eq!(stats["provider_calls"], 1, "{stats}");
+    assert_eq!(stats["misses"], 1, "{stats}");
+    assert!(near(stats["total_cost_usd"].as_f64(), 0.000002), "{stats}");
+}
+
+#[test]
+fn rerank_env_model_is_one_openrouter_call() {
+    let h = harness_rerank(Some("test-key"), "nvidia/nemotron-3.5-rerank-8b:free");
+    let mut req = predict("LOGGING road at dusk", "logging road");
+    req.operation = Operation::Rerank;
+    req.model = "mock".into();
+    req.items.push(item("lights over the lake", Some("logging road")));
+    req.items[1].key = "1".into();
+    req.items[1].cache_key = format!("{}c", req.items[0].cache_key);
+    let got = post(&format!("{}/v1/rerank", h.hutch), "off", &req);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    assert!(near(got.outputs[0].score, 0.91), "{:?}", got.outputs[0].score);
+    assert!(near(got.outputs[1].score, 0.12), "{:?}", got.outputs[1].score);
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        got.outputs[0].calls.as_ref().unwrap()[0].model,
+        "nvidia/nemotron-3.5-rerank-8b:free"
+    );
+}
+
+#[test]
+fn explicit_jev_rerank_stays_on_noul() {
+    let h = harness_rerank(Some("test-key"), "voyageai/rerank-3");
+    let mut req = predict("LOGGING road at dusk", "logging road");
+    req.operation = Operation::Rerank;
+    req.model = "jev".into();
+    req.items[0].system = Some("Is this document relevant to the query?".into());
+    let got = post(&format!("{}/v1/rerank", h.hutch), "off", &req);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    assert!(near(got.outputs[0].score, 0.82), "{:?}", got.outputs[0].score);
+    assert_eq!(got.outputs[0].calls.as_ref().unwrap()[0].model, "typesafe/jev-1.14");
+}
+
+#[test]
 fn stacked_mock_model_is_sent_as_jev() {
     let h = harness(Some("test-key"));
     let mut req = predict("MOCKMODEL", "biped");
@@ -801,6 +933,7 @@ fn spawn_hutch(store: &str, dir: &std::path::Path) -> Spawned {
         api_key: Some("test-key".into()),
         default_model: "openai/gpt-4o-mini".into(),
         decision_model: "typesafe/jev-1.14".into(),
+        rerank_model: String::new(),
         decision_takes: 1,
         decision_combine: "mean".into(),
         decision_threshold: 0.5,

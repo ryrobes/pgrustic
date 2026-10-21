@@ -8,12 +8,14 @@ use datum::Datum;
 use rvbbit_oids::{
     APPLY_CLAUSES_NAME, APPLY_CLAUSES_OID, CALL_LOG_NAME, CALL_LOG_OID, CLASSIFY_ENUM_NAME,
     CLASSIFY_ENUM_OID, CLASSIFY_LABELS_NAME, CLASSIFY_LABELS_OID, CLASSIFY_NAME, CLASSIFY_OID,
-    CONSENSUS_FINAL_NAME, CONSENSUS_FINAL_OID, CONSENSUS_TRANS_NAME, CONSENSUS_TRANS_OID, DECIDE_NAME,
-    DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_MANY_NAME, EXTRACT_MANY_OID, EXTRACT_NAME, EXTRACT_OID,
-    EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, GETDEF_NAME, GETDEF_OID, MEANS_NAME, MEANS_OID,
-    MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID,
-    SUMMARIZE_FINAL_NAME, SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID,
-    SUMMARIZE_TRANS_NAME, SUMMARIZE_TRANS_OID,
+    CLAUSE_BOOL_NAME, CLAUSE_BOOL_OID, CLAUSE_SCORE_NAME, CLAUSE_SCORE_OID, CLAUSE_TEXT_NAME,
+    CLAUSE_TEXT_OID, CONSENSUS_FINAL_NAME, CONSENSUS_FINAL_OID, CONSENSUS_TRANS_NAME,
+    CONSENSUS_TRANS_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_MANY_NAME,
+    EXTRACT_MANY_OID, EXTRACT_NAME, EXTRACT_OID, EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, GETDEF_NAME,
+    GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_FOR_NAME,
+    RERANK_FOR_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID, SUMMARIZE_FINAL_NAME,
+    SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID, SUMMARIZE_TRANS_NAME,
+    SUMMARIZE_TRANS_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -262,11 +264,48 @@ pub fn rvbbit_consensus_final(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinf
 }
 
 pub fn rvbbit_rerank(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rerank_datum(fcinfo, "")
+}
+
+pub fn rvbbit_rerank_for(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let model = arg_text(fcinfo, 2)?.unwrap_or_default();
+    rerank_datum(fcinfo, &model)
+}
+
+fn rerank_datum(fcinfo: &mut Fcinfo, model: &str) -> PgResult<Datum> {
     rvbbit_resolve::ensure()?;
     let document = arg_text(fcinfo, 0)?.unwrap_or_default();
     let query = arg_text(fcinfo, 1)?.unwrap_or_default();
-    let score = rvbbit_dispatch::rerank_score(&document, &query)?;
+    let key = rvbbit_dispatch::scalar_key_rerank(model, &query);
+    if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &document) {
+        return score_hit(hit);
+    }
+    let score = if model.is_empty() {
+        rvbbit_dispatch::rerank_score(&document, &query)?
+    } else {
+        let reply = rvbbit_dispatch::rerank_many(model, &query, &[document])?;
+        let text = reply
+            .values
+            .into_iter()
+            .next()
+            .ok_or_else(|| Box::new(types_error::PgError::error("rerank returned no score")) as Box<types_error::PgError>)?
+            .map_err(|message| Box::new(types_error::PgError::error(message)) as Box<types_error::PgError>)?;
+        text.parse::<f64>().map_err(|_| {
+            Box::new(types_error::PgError::error("rerank returned no score")) as Box<types_error::PgError>
+        })?
+    };
     Ok(Datum::from_f64(score))
+}
+
+fn score_hit(hit: rvbbit_dispatch::ScalarHit) -> PgResult<Datum> {
+    match hit {
+        rvbbit_dispatch::ScalarHit::Value(value) => value.parse::<f64>().map(Datum::from_f64).map_err(|_| {
+            Box::new(types_error::PgError::error(format!("rerank memo {value}"))) as Box<types_error::PgError>
+        }),
+        rvbbit_dispatch::ScalarHit::Failed(message) => {
+            Err(Box::new(types_error::PgError::error(message)) as Box<types_error::PgError>)
+        }
+    }
 }
 
 pub fn rvbbit_extract_many(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
@@ -274,8 +313,69 @@ pub fn rvbbit_extract_many(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) 
     let kind = arg_text(fcinfo, 0)?.unwrap_or_default();
     let input = arg_text(fcinfo, 1)?.unwrap_or_default();
     let clauses = arg_text(fcinfo, 2)?.unwrap_or_default();
+    if clauses.trim().is_empty() {
+        let key = rvbbit_dispatch::scalar_key_extract_many(&kind);
+        if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &input) {
+            return apply_scalar(fcinfo, None, hit);
+        }
+    }
     let text = rvbbit_dispatch::extract_many_json(&kind, &input, &clauses)?;
     text_datum(fcinfo, &text)
+}
+
+/// Bool from a clause tail. The JSON report is `rvbbit.apply_clauses`.
+pub fn rvbbit_clause_bool(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let report = clause_report(fcinfo)?;
+    Ok(Datum::from_bool(clause_winner_bool(&report)?))
+}
+
+/// Score from a clause tail. RERANK's natural type.
+pub fn rvbbit_clause_score(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let report = clause_report(fcinfo)?;
+    Ok(Datum::from_f64(clause_report_score(&report)?))
+}
+
+/// Text winner from a clause tail. CLASSIFY, EXTRACT, and EXTRACT MANY.
+pub fn rvbbit_clause_text(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let report = clause_report(fcinfo)?;
+    text_datum(fcinfo, &clause_winner_text(&report)?)
+}
+
+fn clause_report(fcinfo: &mut Fcinfo) -> PgResult<String> {
+    rvbbit_resolve::ensure()?;
+    let kind = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let input = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let extra = arg_text(fcinfo, 2)?.unwrap_or_default();
+    let tail = arg_text(fcinfo, 3)?.unwrap_or_default();
+    rvbbit_dispatch::apply_clauses_text(&kind, &input, &extra, &tail)
+}
+
+fn clause_winner_text(report: &str) -> PgResult<String> {
+    let v: serde_json::Value = serde_json::from_str(report).map_err(|e| {
+        Box::new(types_error::PgError::error(format!("clause report: {e}"))) as Box<types_error::PgError>
+    })?;
+    Ok(match v.get("winner") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    })
+}
+
+fn clause_winner_bool(report: &str) -> PgResult<bool> {
+    let text = clause_winner_text(report)?;
+    Ok(matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "t" | "1"
+    ))
+}
+
+fn clause_report_score(report: &str) -> PgResult<f64> {
+    let v: serde_json::Value = serde_json::from_str(report).map_err(|e| {
+        Box::new(types_error::PgError::error(format!("clause report: {e}"))) as Box<types_error::PgError>
+    })?;
+    v.get("score")
+        .and_then(|s| s.as_f64())
+        .ok_or_else(|| Box::new(types_error::PgError::error("clause score missing")) as Box<types_error::PgError>)
 }
 
 /// Clause tail. `clauses` is the postfix text (`WITH TAKES 3 PICK BY VOTE`).
@@ -528,11 +628,43 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         func: rvbbit_rerank as PGFunction,
     },
     FmgrBuiltin {
+        foid: RERANK_FOR_OID,
+        name: RERANK_FOR_NAME,
+        nargs: 3,
+        strict: false,
+        retset: false,
+        func: rvbbit_rerank_for as PGFunction,
+    },
+    FmgrBuiltin {
         foid: EXTRACT_MANY_OID,
         name: EXTRACT_MANY_NAME,
         nargs: 3,
         strict: false,
         retset: false,
         func: rvbbit_extract_many as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CLAUSE_BOOL_OID,
+        name: CLAUSE_BOOL_NAME,
+        nargs: 4,
+        strict: false,
+        retset: false,
+        func: rvbbit_clause_bool as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CLAUSE_SCORE_OID,
+        name: CLAUSE_SCORE_NAME,
+        nargs: 4,
+        strict: false,
+        retset: false,
+        func: rvbbit_clause_score as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: CLAUSE_TEXT_OID,
+        name: CLAUSE_TEXT_NAME,
+        nargs: 4,
+        strict: false,
+        retset: false,
+        func: rvbbit_clause_text as PGFunction,
     },
 ];

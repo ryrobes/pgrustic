@@ -17,7 +17,16 @@ cargo test -p rvbbit_parse -p rvbbit_dispatch -p rvbbit_hutch_lite --profile fas
   m6_aggregate_rerank_extract_many_and_pipe \
   agg_state_appends_parts_and_keeps_the_first_clause \
   rerank_summary_and_extract_many \
-  regress_sql_is_not_rewritten
+  regress_sql_is_not_rewritten \
+  pipe_means_stops_the_clause_tail_at_as \
+  report_keeps_the_json_clause_report \
+  extract_many_asks_only_for_the_requested_kind \
+  extract_many_keeps_only_strings_and_allows_an_empty_list \
+  takes_and_summary_misses_match_provider_calls \
+  clause_tail_stops_at_as_and_other_terminators \
+  openrouter_rerank_batches_one_query \
+  rerank_env_model_is_one_openrouter_call \
+  explicit_jev_rerank_stays_on_noul
 echo "m6 demo: rewrite, aggregate state, rerank, summary, and extract-many passed"
 
 if [[ "${RVBBIT_M6_LIVE:-}" != "1" ]]; then
@@ -124,6 +133,14 @@ echo "=== RERANK via pipe, then EXTRACT MANY ==="
 "${PSQL[@]}" -d rvbbit_m6 -c \
   "SELECT EXTRACT MANY creature FROM body FROM notes"
 
+echo "=== RERANK comparison: default jev, then OpenRouter rerankers ==="
+"${PSQL[@]}" -d rvbbit_m6 -c \
+  "SELECT kind, body |> RERANK 'logging road' AS jev FROM notes ORDER BY jev DESC"
+"${PSQL[@]}" -d rvbbit_m6 -c \
+  "SELECT kind, body |> RERANK 'logging road' USING MODEL 'nvidia/nemotron-3.5-rerank-8b:free' AS nemotron FROM notes ORDER BY nemotron DESC"
+"${PSQL[@]}" -d rvbbit_m6 -c \
+  "SELECT kind, body |> RERANK 'logging road' USING MODEL 'voyageai/rerank-3' AS voyage FROM notes ORDER BY voyage DESC"
+
 echo "=== clause tail on a piped MEANS ==="
 "${PSQL[@]}" -d rvbbit_m6 -c \
   "SELECT body |> MEANS 'a large biped was seen' WITH TAKES 2 FROM notes WHERE kind = 'road' LIMIT 1"
@@ -131,4 +148,7 @@ echo "=== clause tail on a piped MEANS ==="
 echo "=== rvbbit.calls ==="
 "${PSQL[@]}" -d rvbbit_m6 -c \
   "SELECT op, count(*) AS calls, sum(cost) AS cost FROM rvbbit.calls GROUP BY op ORDER BY op"
+echo "=== rvbbit.calls by model ==="
+"${PSQL[@]}" -d rvbbit_m6 -c \
+  "SELECT op, model, count(*) AS calls, sum(cost) AS cost FROM rvbbit.calls GROUP BY op, model ORDER BY op, model"
 echo "=== done. RVBBIT_HUTCH_URL=$RVBBIT_HUTCH_URL ==="

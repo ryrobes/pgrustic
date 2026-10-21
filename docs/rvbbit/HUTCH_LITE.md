@@ -84,14 +84,25 @@ aborts the session when
 `SUMMARIZE(expr)` and `CONSENSUS(expr, criterion)` are aggregates. The
 transition concatenates the group; the final calls hutch once.
 `SUMMARIZE` is a chat summary. `CONSENSUS` is one Jev yes/no over the
-joined text. `EXTRACT MANY kind FROM expr` rewrites to
-`jsonb_array_elements_text` of a JSON array, so it explodes into rows.
-`RERANK(document, query)` is a Jev noul relevance score (`float8`).
+joined text. `EXTRACT MANY kind FROM expr` asks for a JSON array of
+that kind only (`[]` when the text has none). The array is one batched
+extract, the same Semantic Project shape as `CLASSIFY` and typed
+`EXTRACT`, then a `LEFT JOIN LATERAL` explodes each value onto its
+source row. An empty array keeps the row with a NULL value.
+`RERANK(document, query)` is a Jev noul relevance score (`float8`)
+unless `USING MODEL`, the `semantic.rerank_model` GUC, or
+`HUTCH_RERANK_MODEL` names a dedicated slug
+(`nvidia/nemotron-3.5-rerank-8b:free`, `voyageai/rerank-3`). That path
+is one OpenRouter `POST /rerank` for every document that shares a query.
+The default stays jev. An explicit `jev` still uses noul. Cost and
+timing land in `rvbbit.calls`.
 `expr |> OP` is the same call with `expr` as the input: `|> MEANS`,
 `|> EXTRACT`, `|> EXTRACT MANY`, `|> CLASSIFY`, `|> RERANK`,
-`|> SUMMARIZE`, `|> CONSENSUS`. A clause tail on those ops is
-`rvbbit.apply_clauses`, including `WITH TAKES` on a summary or a rerank.
-`|>>` stays the geometric operator.
+`|> SUMMARIZE`, `|> CONSENSUS`. A clause tail returns the op's natural
+type (`clause_bool`, `clause_score`, or `clause_text`) and names the
+column after the op, unless the query already wrote `AS`. `REPORT`, or
+an explicit `rvbbit.apply_clauses`, still returns the JSON report.
+`rvbbit.calls` keeps score, identical, and cost. `|>>` stays geometric.
 
 ## Fresh Ubuntu
 
@@ -315,6 +326,9 @@ files.
 `latency_by_op_model`. A miss is only a missing key: it is not a cache
 miss counter. The follow-up batch counts the miss when it calls the
 provider, so a lookup-then-batch of 32 keys is 32 misses, not 64.
+`/stats` `misses` counts each provider call, including each take and
+each summary chunk, and matches `provider_calls`. A cache hit, a
+decision-memo hit, a single-flight waiter, and a generation GET do not.
 
 `bash scripts/rvbbit_cache_demo.sh` runs the fake provider. It does not
 call OpenRouter when `OPENROUTER_API_KEY` happens to be set.

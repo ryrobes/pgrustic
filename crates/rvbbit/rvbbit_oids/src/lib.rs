@@ -57,6 +57,20 @@ pub const RERANK_OID: u32 = 9037;
 pub const EXTRACT_MANY_OID: u32 = 9038;
 /// `rvbbit_summarize_text(text, text) -> text`. Per-row summary (the pipe).
 pub const SUMMARIZE_TEXT_OID: u32 = 9039;
+/// `rvbbit_clause_bool(text, text, text, text) -> bool`. Natural type of a
+/// clause tail on MEANS or CONSENSUS. The JSON report stays on
+/// `rvbbit_apply_clauses` and on `rvbbit.calls`.
+pub const CLAUSE_BOOL_OID: u32 = 9040;
+/// `rvbbit_clause_score(text, text, text, text) -> float8`. Natural type of
+/// a clause tail on RERANK.
+pub const CLAUSE_SCORE_OID: u32 = 9041;
+/// `rvbbit_clause_text(text, text, text, text) -> text`. Natural type of a
+/// clause tail on CLASSIFY, EXTRACT, EXTRACT MANY, or a text summary.
+pub const CLAUSE_TEXT_OID: u32 = 9042;
+/// `rvbbit_rerank_for(text, text, text) -> float8`. Same score as
+/// `rvbbit_rerank`, with the model slug in the third argument. Empty
+/// slug keeps the jev default.
+pub const RERANK_FOR_OID: u32 = 9043;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -77,6 +91,10 @@ pub const CONSENSUS_FINAL_NAME: &str = "rvbbit_consensus_final";
 pub const RERANK_NAME: &str = "rvbbit_rerank";
 pub const EXTRACT_MANY_NAME: &str = "rvbbit_extract_many";
 pub const SUMMARIZE_TEXT_NAME: &str = "rvbbit_summarize_text";
+pub const CLAUSE_BOOL_NAME: &str = "rvbbit_clause_bool";
+pub const CLAUSE_SCORE_NAME: &str = "rvbbit_clause_score";
+pub const CLAUSE_TEXT_NAME: &str = "rvbbit_clause_text";
+pub const RERANK_FOR_NAME: &str = "rvbbit_rerank_for";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

@@ -5,7 +5,9 @@
 //! one `choice` question on that same API and returns the winning label,
 //! its probability, and the per-label map. Extract, and classify with no
 //! label set, still call an OpenAI-compatible chat endpoint. Rerank is a
-//! noul relevance score on the decision model. Embed is rejected per item.
+//! noul relevance score on the decision model unless the request or
+//! `HUTCH_RERANK_MODEL` names a dedicated OpenRouter reranker.
+//! Embed is rejected per item.
 //! `TAKES` / `PICK` are not parsed in SQL; a request may still send
 //! `decision` to stack models or repeats.
 //!
@@ -19,7 +21,7 @@
 mod cost;
 mod persist;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
@@ -63,7 +65,12 @@ pub struct Config {
     pub default_model: String,
     /// Decision default (`HUTCH_DECISION_MODEL`). Predict, decide, and
     /// fixed-label classify when the request model is empty or `mock`.
+    /// Also the Jev noul fallback for `RERANK`.
     pub decision_model: String,
+    /// Dedicated rerank slug (`HUTCH_RERANK_MODEL`). Empty or `jev` keeps
+    /// the noul fallback. `nvidia/nemotron-3.5-rerank-8b:free` and
+    /// `voyageai/rerank-3` call OpenRouter `POST /rerank`.
+    pub rerank_model: String,
     pub decision_takes: u32,
     /// `mean` or `vote`.
     pub decision_combine: String,
@@ -135,6 +142,7 @@ impl Config {
             default_model: std::env::var("HUTCH_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
             decision_model: std::env::var("HUTCH_DECISION_MODEL")
                 .unwrap_or_else(|_| DEFAULT_DECISION_MODEL.to_string()),
+            rerank_model: std::env::var("HUTCH_RERANK_MODEL").unwrap_or_default(),
             decision_takes,
             decision_combine: if combine == "vote" { "vote".into() } else { "mean".into() },
             decision_threshold,
@@ -468,6 +476,235 @@ fn route(
     (404, "{\"error\":\"not found\"}".into())
 }
 
+/// A dedicated rerank slug, or `None` when this batch stays on jev noul.
+/// `mock`, empty, and `default` mean "the server default". `jev` and the
+/// decision model always stay on noul, even if `HUTCH_RERANK_MODEL` is set.
+fn dedicated_rerank_model(cfg: &Config, requested: &str) -> Option<String> {
+    dedicated_rerank_slug(&cfg.decision_model, &cfg.rerank_model, requested)
+}
+
+fn dedicated_rerank_slug(decision_model: &str, env_model: &str, requested: &str) -> Option<String> {
+    let requested = requested.trim();
+    if requested.eq_ignore_ascii_case("jev") || requested == decision_model {
+        return None;
+    }
+    let chosen = if requested.is_empty() || requested == "mock" || requested == "default" {
+        env_model.trim()
+    } else {
+        requested
+    };
+    if chosen.is_empty() || chosen.eq_ignore_ascii_case("jev") || chosen == decision_model {
+        None
+    } else {
+        Some(chosen.to_string())
+    }
+}
+
+/// One OpenRouter `POST /rerank` for every document that shares a query.
+/// Jev noul does not come through here.
+fn rerank_via_openrouter(
+    server: &Server,
+    tenant: &str,
+    mode: ParsedCache,
+    req: &BatchRequest,
+    model: &str,
+) -> BatchResponse {
+    let ttl = mode.ttl.unwrap_or(server.cfg.default_ttl);
+    let mut outputs = Vec::with_capacity(req.items.len());
+    let mut pending: Vec<RerankPending> = Vec::new();
+    for (index, item) in req.items.iter().enumerate() {
+        let doc = json_str(&item.inputs, "input").unwrap_or_else(|| item.inputs.to_string());
+        let query = item
+            .criterion
+            .clone()
+            .or_else(|| json_str(&item.inputs, "criterion"))
+            .unwrap_or_default();
+        let storage = storage_for(&item.cache_key, tenant, None, &[], &[]);
+        if mode.mode == CacheMode::ReadWrite {
+            let started = Instant::now();
+            let hit = {
+                let mut cache = lock(&server.cache);
+                fresh(server, &mut cache, &storage).map(|hit| {
+                    cache.hits += 1;
+                    hit
+                })
+            };
+            if let Some(hit) = hit {
+                let scored = meter_cached(server, Operation::Rerank, tenant, &hit, "hit", started, item.node.clone());
+                outputs.push(scored_item(item, scored));
+                continue;
+            }
+        }
+        pending.push(RerankPending { index, storage, doc, query, node: item.node.clone() });
+        outputs.push(ItemResponse {
+            key: item.key.clone(),
+            value: None,
+            score: None,
+            scores: None,
+            calls: None,
+            error: Some(item_err("provider", "rerank pending")),
+            identical_takes: None,
+        });
+    }
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (slot, row) in pending.iter().enumerate() {
+        groups.entry(row.query.clone()).or_default().push(slot);
+    }
+    for (query, slots) in groups {
+        let docs: Vec<String> = slots.iter().map(|slot| pending[*slot].doc.clone()).collect();
+        let node = slots.iter().find_map(|slot| pending[*slot].node.clone());
+        match post_openrouter_rerank(server, tenant, model, &query, &docs, node) {
+            Ok((scores, meter)) => {
+                for (offset, slot) in slots.iter().enumerate() {
+                    let row = &pending[*slot];
+                    let score = scores[offset];
+                    let mut call = meter.clone();
+                    call.score = Some(score);
+                    if docs.len() > 1 {
+                        if let Some(cost) = call.cost_usd {
+                            call.cost_usd = Some(cost / docs.len() as f64);
+                        }
+                    }
+                    let scored = Scored::from_calls(serde_json::json!(score), Some(score), None, vec![call]);
+                    if mode.mode != CacheMode::Off {
+                        store(server, &row.storage, &scored, ttl);
+                    }
+                    outputs[row.index] = scored_item(&req.items[row.index], scored);
+                }
+            }
+            Err(err) => {
+                for slot in slots {
+                    let row = &pending[slot];
+                    outputs[row.index].error = Some(err.clone());
+                }
+            }
+        }
+    }
+    BatchResponse {
+        contract: CONTRACT_VERSION.to_string(),
+        outputs,
+    }
+}
+
+struct RerankPending {
+    index: usize,
+    storage: String,
+    doc: String,
+    query: String,
+    node: Option<String>,
+}
+
+fn scored_item(item: &ItemRequest, scored: Scored) -> ItemResponse {
+    ItemResponse {
+        key: item.key.clone(),
+        value: Some(scored.value),
+        score: scored.score,
+        scores: scored.scores,
+        calls: if scored.calls.is_empty() { None } else { Some(scored.calls) },
+        error: None,
+        identical_takes: scored.identical_takes,
+    }
+}
+
+fn post_openrouter_rerank(
+    server: &Server,
+    tenant: &str,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    node: Option<String>,
+) -> Result<(Vec<f64>, CallMeter), ItemError> {
+    if documents.is_empty() {
+        return Err(item_err("invalid", "rerank needs a document"));
+    }
+    let url = format!("{}/rerank", server.cfg.openai_base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "query": query,
+        "documents": documents,
+        "top_n": documents.len(),
+    });
+    let payload = serde_json::to_string(&body).map_err(|e| item_err("provider", &e.to_string()))?;
+    {
+        let mut cache = lock(&server.cache);
+        cache.provider_calls += 1;
+        cache.misses += 1;
+    }
+    let started = Instant::now();
+    let text = match post_json(&server.cfg, &server.agent, &url, &payload) {
+        Ok(text) => text,
+        Err(message) => {
+            let ms = elapsed_ms(started);
+            let meter = miss_meter(
+                Operation::Rerank,
+                tenant,
+                model,
+                &ProviderUsage::default(),
+                ms,
+                ms,
+                node,
+                None,
+            );
+            record_call(server, &meter);
+            return Err(item_err("provider", &message));
+        }
+    };
+    let provider_ms = elapsed_ms(started);
+    let mut usage = usage_from_body(&text);
+    if usage.model.is_none() {
+        usage.model = Some(model.to_string());
+    }
+    if usage.cost_usd.is_none() {
+        fill_generation(server, &mut usage);
+    }
+    let latency_ms = elapsed_ms(started);
+    let mut meter = miss_meter(
+        Operation::Rerank,
+        tenant,
+        model,
+        &usage,
+        provider_ms,
+        latency_ms,
+        node,
+        None,
+    );
+    meter.items = u32::try_from(documents.len()).unwrap_or(u32::MAX);
+    record_call(server, &meter);
+    let scores = parse_rerank_scores(&text, documents.len()).map_err(|message| item_err("parse", &message))?;
+    Ok((scores, meter))
+}
+
+fn parse_rerank_scores(body: &str, n: usize) -> Result<Vec<f64>, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("rerank json: {e}"))?;
+    if let Some(msg) = v.pointer("/error/message").and_then(|m| m.as_str()) {
+        return Err(format!("upstream error: {msg}"));
+    }
+    let results = v
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or("rerank response has no results")?;
+    let mut scores = vec![None; n];
+    for result in results {
+        let index = result
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .ok_or("rerank result missing index")? as usize;
+        let score = result
+            .get("relevance_score")
+            .and_then(|s| s.as_f64())
+            .ok_or("rerank result missing relevance_score")?;
+        if index >= n {
+            return Err(format!("rerank index {index} is outside {n} documents"));
+        }
+        scores[index] = Some(score);
+    }
+    scores
+        .into_iter()
+        .enumerate()
+        .map(|(i, score)| score.ok_or_else(|| format!("rerank missing score for document {i}")))
+        .collect()
+}
+
 fn run_batch(
     server: &Server,
     tenant: &str,
@@ -476,6 +713,11 @@ fn run_batch(
     req: &BatchRequest,
     audit: bool,
 ) -> BatchResponse {
+    if operation == Operation::Rerank {
+        if let Some(model) = dedicated_rerank_model(&server.cfg, &req.model) {
+            return rerank_via_openrouter(server, tenant, mode, req, &model);
+        }
+    }
     let outputs = Arc::new(Mutex::new(vec![
         ItemResponse {
             key: String::new(),
@@ -616,7 +858,6 @@ fn get_or_compute(
             cv: Condvar::new(),
         });
         cache.inflight.insert(storage.to_string(), Arc::clone(&flight));
-        cache.misses += 1;
         drop(cache);
         let result = compute();
         if let Ok(scored) = &result {
@@ -720,7 +961,12 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                     "Return one short noun or literal, at most three words. No sentence, no description, no markdown, no quotes.".into()
                 }
                 Some("summary") => "Summarize the notes in one or two sentences. No markdown.".into(),
-                Some("many") => "Return a JSON array of short nouns. No markdown.".into(),
+                Some("many") => {
+                    "Return only a JSON array of strings of the requested kind. \
+                     Include no other nouns, places, people, objects, or adjectives. \
+                     If there are none, return []. No markdown."
+                        .into()
+                }
                 _ => "Return only JSON. No markdown.".into(),
             },
             Operation::Classify => "Reply with only the label.".into(),
@@ -741,7 +987,7 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
             if item.extract_mode.as_deref() == Some("summary") {
                 input
             } else if item.extract_mode.as_deref() == Some("many") {
-                format!("List every value in this text.\n{input}")
+                format!("List only values of the requested kind. Return [] when there are none.\n{input}")
             } else if item.extract_mode.as_deref() == Some("scalar") {
                 format!("Extract one short value from this text:\n{input}")
             } else {
@@ -816,7 +1062,8 @@ fn decision_plan(cfg: &Config, req: &BatchRequest) -> DecisionPlan {
 
 fn choose_decision_model(cfg: &Config, requested: &str) -> String {
     let requested = requested.trim();
-    if requested.is_empty() || requested == "mock" {
+    // `jev` is the noul fallback name, not an OpenRouter slug.
+    if requested.is_empty() || requested == "mock" || requested.eq_ignore_ascii_case("jev") {
         cfg.decision_model.clone()
     } else {
         requested.to_string()
@@ -1133,7 +1380,11 @@ fn fetch_decision(
 ) -> Result<(String, CallMeter), ItemError> {
     {
         let mut cache = lock(&server.cache);
+        // One miss per provider call. Takes and summary chunks each call
+        // the provider, so this stays equal to provider_calls. A decision
+        // memo hit never reaches here.
         cache.provider_calls += 1;
+        cache.misses += 1;
     }
     let started = Instant::now();
     let text = match post_json(&server.cfg, &server.agent, &server.cfg.decisions_url, body) {
@@ -1429,7 +1680,9 @@ fn chat(
     };
     {
         let mut cache = lock(&server.cache);
+        // Chat takes and summary chunks each increment both counters.
         cache.provider_calls += 1;
+        cache.misses += 1;
     }
     let started = Instant::now();
     let text = match post_json(cfg, &server.agent, &url, &payload) {
@@ -1729,11 +1982,22 @@ fn parse_extract(text: &str, mode: Option<&str>) -> Result<serde_json::Value, St
         }
         "many" => {
             let value = parse_json_value(text)?;
-            if value.is_array() {
-                Ok(value)
-            } else {
-                Err("extract many expected a JSON array".into())
+            let Some(arr) = value.as_array() else {
+                return Err("extract many expected a JSON array".into());
+            };
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    serde_json::Value::String(s) => {
+                        let s = s.trim();
+                        if !s.is_empty() {
+                            out.push(serde_json::Value::String(s.to_string()));
+                        }
+                    }
+                    _ => return Err("extract many items must be strings".into()),
+                }
             }
+            Ok(serde_json::Value::Array(out))
         }
         other => Err(format!("extract mode {other} is not json, scalar, summary, or many")),
     }
@@ -2321,6 +2585,18 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_many_keeps_only_strings_and_allows_an_empty_list() {
+        assert_eq!(parse_extract("[]", Some("many")).unwrap(), serde_json::json!([]));
+        assert_eq!(
+            parse_extract("[\"sasquatch\", \"\", \"  \"]", Some("many")).unwrap(),
+            serde_json::json!(["sasquatch"])
+        );
+        assert!(parse_extract("[\"sasquatch\", 1]", Some("many")).is_err());
+        assert!(parse_extract("{\"creature\":\"sasquatch\"}", Some("many")).is_err());
+        assert!(parse_extract("a truck in the woods", Some("many")).is_err());
+    }
 
     #[test]
     fn bool_and_json_parsers() {

@@ -32,7 +32,7 @@ pub fn usage_from_body(body: &str) -> ProviderUsage {
         cost_usd: None,
     };
     if let Some(u) = v.get("usage") {
-        usage.tokens_in = field_u64(u, &["prompt_tokens", "input_tokens"]);
+        usage.tokens_in = field_u64(u, &["prompt_tokens", "input_tokens", "total_tokens"]);
         usage.tokens_out = field_u64(u, &["completion_tokens", "output_tokens"]);
         usage.cost_usd = u.get("cost").and_then(json_f64);
     }

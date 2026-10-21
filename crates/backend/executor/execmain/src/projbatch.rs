@@ -1,4 +1,4 @@
-//! Project batcher for native `CLASSIFY` and typed `EXTRACT`.
+//! Project batcher for native `CLASSIFY`, typed `EXTRACT`, and `EXTRACT MANY`.
 //!
 //! A window of child rows is grouped by the scalar memo key, which is the
 //! means backend URL, the model (`typesafe/jev-1.14` for classify, `mock`
@@ -83,10 +83,12 @@ fn walk<'mcx>(mcx: Mcx<'mcx>, node: Node<'mcx>, top: bool, shape: &mut ProjectSh
         }
         NodeTag::T_FuncExpr => {
             let func = node.as_func_expr().expect("FuncExpr");
-            if func.args.len() == 3 && project_kind(mcx, func.funcid)?.is_some() {
-                shape.present = true;
-                if top {
-                    shape.batched = true;
+            if let Some(kind) = project_kind(mcx, func.funcid)? {
+                if accepts_project(kind, func.args.len()) {
+                    shape.present = true;
+                    if top {
+                        shape.batched = true;
+                    }
                 }
             }
             for arg in func.args.iter() {
@@ -115,6 +117,15 @@ enum Kind {
     Classify,
     Enum,
     Extract,
+    ExtractMany,
+    Rerank,
+}
+
+fn accepts_project(kind: Kind, nargs: usize) -> bool {
+    match kind {
+        Kind::Rerank => nargs == 2 || nargs == 3,
+        _ => nargs == 3,
+    }
 }
 
 fn project_kind<'mcx>(mcx: Mcx<'mcx>, funcid: Oid) -> PgResult<Option<Kind>> {
@@ -125,6 +136,8 @@ fn project_kind<'mcx>(mcx: Mcx<'mcx>, funcid: Oid) -> PgResult<Option<Kind>> {
         "classify" => Kind::Classify,
         "classify_enum" => Kind::Enum,
         "extract_typed" => Kind::Extract,
+        "extract_many" => Kind::ExtractMany,
+        "rerank" | "rerank_for" => Kind::Rerank,
         _ => return Ok(None),
     };
     let nsp = get_func_namespace(funcid)?;
@@ -141,11 +154,14 @@ struct Site<'mcx> {
     kind: Kind,
     first: PgBox<'mcx, ExprState<'mcx>>,
     second: PgBox<'mcx, ExprState<'mcx>>,
+    third: Option<PgBox<'mcx, ExprState<'mcx>>>,
 }
 
 enum PendingCall {
     Classify { key: String, labels: Vec<String>, input: String },
     Extract { key: String, kind: String, input: String },
+    ExtractMany { key: String, kind: String, input: String },
+    Rerank { key: String, model: String, query: String, input: String },
 }
 
 struct Pending {
@@ -223,12 +239,18 @@ pub fn compile<'mcx>(
     for func in funcs {
         let f = func.as_func_expr().expect("FuncExpr");
         let kind = project_kind(mcx, f.funcid)?.ok_or_else(|| err("project function lost its name"))?;
-        if f.args.len() != 3 {
-            return Err(err("native CLASSIFY and EXTRACT expect 3 arguments"));
+        if !accepts_project(kind, f.args.len()) {
+            return Err(err("native CLASSIFY, EXTRACT, and RERANK have the wrong arity"));
         }
         let first = semantic::compile_expr(estate, mcx, params, f.args.nth(0))?;
         let second = semantic::compile_expr(estate, mcx, params, f.args.nth(1))?;
-        sites.push(Site { kind, first, second });
+        let third = if matches!(kind, Kind::ExtractMany) || (matches!(kind, Kind::Rerank) && f.args.len() == 3)
+        {
+            Some(semantic::compile_expr(estate, mcx, params, f.args.nth(2))?)
+        } else {
+            None
+        };
+        sites.push(Site { kind, first, second, third });
     }
     Ok(Some(Box::new(ProjectState {
         sites,
@@ -250,7 +272,7 @@ fn top_project<'mcx>(mcx: Mcx<'mcx>, node: Node<'mcx>) -> PgResult<Option<Node<'
         NodeTag::T_CoerceViaIO => top_project(mcx, node.as_coerce_via_io().expect("CoerceViaIO").arg),
         NodeTag::T_FuncExpr => {
             let func = node.as_func_expr().expect("FuncExpr");
-            if func.args.len() == 3 && project_kind(mcx, func.funcid)?.is_some() {
+            if project_kind(mcx, func.funcid)?.is_some_and(|kind| accepts_project(kind, func.args.len())) {
                 Ok(Some(node))
             } else {
                 Ok(None)
@@ -388,6 +410,10 @@ impl<'mcx> ProjectState<'mcx> {
         for site in &mut self.sites {
             let first = semantic::eval_text(estate, ecxt, &mut site.first)?;
             let second = semantic::eval_text(estate, ecxt, &mut site.second)?;
+            let extra = match site.third.as_mut() {
+                Some(expr) => semantic::eval_text(estate, ecxt, expr)?.unwrap_or_default(),
+                None => String::new(),
+            };
             let call = match (site.kind, first, second) {
                 (Kind::Classify, Some(input), Some(raw)) => {
                     let labels: Vec<String> = raw
@@ -414,6 +440,18 @@ impl<'mcx> ProjectState<'mcx> {
                     let key = rvbbit_dispatch::scalar_key_extract(&kind);
                     Some(PendingCall::Extract { key, kind, input })
                 }
+                // A clause tail is a different call (takes, phrasings) and
+                // stays on the per-row builtin. An empty tail is one batch
+                // POST of JSON arrays, remembered for the builtin.
+                (Kind::ExtractMany, Some(kind), Some(input)) if extra.trim().is_empty() => {
+                    let key = rvbbit_dispatch::scalar_key_extract_many(&kind);
+                    Some(PendingCall::ExtractMany { key, kind, input })
+                }
+                (Kind::Rerank, Some(document), Some(query)) => {
+                    let model = extra.clone();
+                    let key = rvbbit_dispatch::scalar_key_rerank(&model, &query);
+                    Some(PendingCall::Rerank { key, model, query, input: document })
+                }
                 _ => None,
             };
             calls.push(call);
@@ -437,6 +475,8 @@ impl<'mcx> ProjectState<'mcx> {
                         let group = grouped.entry(key.clone()).or_insert_with(|| Group {
                             labels: Some(labels.clone()),
                             kind: None,
+                            lists: false,
+                            rerank: None,
                             inputs: Vec::new(),
                         });
                         group.inputs.push(input.clone());
@@ -445,6 +485,28 @@ impl<'mcx> ProjectState<'mcx> {
                         let group = grouped.entry(key.clone()).or_insert_with(|| Group {
                             labels: None,
                             kind: Some(kind.clone()),
+                            lists: false,
+                            rerank: None,
+                            inputs: Vec::new(),
+                        });
+                        group.inputs.push(input.clone());
+                    }
+                    PendingCall::ExtractMany { key, kind, input } => {
+                        let group = grouped.entry(key.clone()).or_insert_with(|| Group {
+                            labels: None,
+                            kind: Some(kind.clone()),
+                            lists: true,
+                            rerank: None,
+                            inputs: Vec::new(),
+                        });
+                        group.inputs.push(input.clone());
+                    }
+                    PendingCall::Rerank { key, model, query, input } => {
+                        let group = grouped.entry(key.clone()).or_insert_with(|| Group {
+                            labels: None,
+                            kind: None,
+                            lists: false,
+                            rerank: Some((model.clone(), query.clone())),
                             inputs: Vec::new(),
                         });
                         group.inputs.push(input.clone());
@@ -462,7 +524,12 @@ impl<'mcx> ProjectState<'mcx> {
                 }
             }
             self.memo_hits += (group.inputs.len() - unique.len()) as u64;
-            let reply = if let Some(labels) = &group.labels {
+            let reply = if group.lists {
+                let kind = group.kind.as_deref().unwrap_or("");
+                rvbbit_dispatch::extract_lists(kind, &unique)?
+            } else if let Some((model, query)) = &group.rerank {
+                rvbbit_dispatch::rerank_many(model, query, &unique)?
+            } else if let Some(labels) = &group.labels {
                 rvbbit_dispatch::classify_many(labels, &unique)?
             } else {
                 let kind = group.kind.as_deref().unwrap_or("");
@@ -479,6 +546,7 @@ impl<'mcx> ProjectState<'mcx> {
             for (input, value) in unique.iter().zip(reply.values.into_iter()) {
                 let hit = match value {
                     Ok(raw) => match &group.kind {
+                        Some(_) if group.lists => rvbbit_dispatch::ScalarHit::Value(raw),
                         Some(kind) => match rvbbit_dispatch::coerce_extracted(kind, &raw) {
                             Ok(text) => rvbbit_dispatch::ScalarHit::Value(text),
                             Err(message) => rvbbit_dispatch::ScalarHit::Failed(message),
@@ -513,6 +581,9 @@ impl<'mcx> ProjectState<'mcx> {
 struct Group {
     labels: Option<Vec<String>>,
     kind: Option<String>,
+    lists: bool,
+    /// `(model, query)` for a rerank batch. Documents are `inputs`.
+    rerank: Option<(String, String)>,
     inputs: Vec<String>,
 }
 

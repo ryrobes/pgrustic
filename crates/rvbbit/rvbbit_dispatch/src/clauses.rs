@@ -145,6 +145,11 @@ pub fn guc_clauses() -> Clauses {
     c
 }
 
+/// `semantic.rerank_model`. Empty means the caller should keep jev noul.
+pub fn guc_rerank_model() -> Option<String> {
+    guc_str("semantic.rerank_model")
+}
+
 pub fn reset_budget() {
     *SPENT.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
 }
@@ -191,7 +196,7 @@ pub fn parse_tail(input: &str) -> Result<Clauses, String> {
     p.skip();
     while p.i < p.s.len() {
         let word = p.word();
-        if word.is_empty() {
+        if word.is_empty() || is_clause_terminator(&word) {
             break;
         }
         match word.as_str() {
@@ -279,11 +284,22 @@ pub fn parse_tail(input: &str) -> Result<Clauses, String> {
             "timeout" => c.timeout_ms = Some((p.number()? * 1000.0) as u64),
             "budget" => c.budget = Some(p.number()?),
             "threshold" => c.threshold = Some(p.number()?),
+            // `REPORT` asks the rewriter for the JSON report. It is not a
+            // hutch knob, so the parser accepts it and ignores it.
+            "report" => {}
             other => return Err(format!("unknown clause {other}")),
         }
         p.skip();
     }
     Ok(c)
+}
+
+fn is_clause_terminator(word: &str) -> bool {
+    matches!(
+        word,
+        "as" | "from" | "where" | "group" | "order" | "limit" | "offset" | "union" | "having"
+            | "window" | "join" | "and" | "or" | "select" | "intersect" | "except"
+    )
 }
 
 struct Parser<'a> {
@@ -719,6 +735,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clause_tail_stops_at_as_and_other_terminators() {
+        let aliased = parse_tail("WITH TAKES 3 AS r").unwrap();
+        assert_eq!(aliased.takes, Some(3));
+        let comma = parse_tail("WITH TAKES 3, other").unwrap();
+        assert_eq!(comma.takes, Some(3));
+        let from = parse_tail("WITH TAKES 2 FROM t").unwrap();
+        assert_eq!(from.takes, Some(2));
+        let paren = parse_tail("WITH TAKES 4)").unwrap();
+        assert_eq!(paren.takes, Some(4));
+        let report = parse_tail("WITH TAKES 3 REPORT").unwrap();
+        assert_eq!(report.takes, Some(3));
+    }
 
     #[test]
     fn call_beats_function_beats_guc() {

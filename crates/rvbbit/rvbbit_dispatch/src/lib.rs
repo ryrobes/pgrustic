@@ -185,6 +185,10 @@ pub fn define_gucs() {
         ("semantic.budget", "Session USD cap. A wave that would pass it aborts."),
         ("semantic.retry", "Default RETRY count."),
         ("semantic.threshold", "Default noul cutoff."),
+        (
+            "semantic.rerank_model",
+            "Default RERANK model. Empty keeps jev noul. A slug such as voyageai/rerank-3 calls OpenRouter /rerank.",
+        ),
     ] {
         let _ = guc::DefineCustomStringVariable(name, Some(desc), None, Some(""), PGC_USERSET, 0);
     }
@@ -407,6 +411,31 @@ pub fn extract_many(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
     Ok(ManyReply { values, http_calls: raw.http_calls })
 }
 
+/// One HTTP extract for every input. Each value is a JSON array of strings
+/// of `kind` only, or `[]`. The array is stored as text; the SQL lateral
+/// join explodes it. Unlike [`extract_many`], the strings are not coerced.
+pub fn extract_lists(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
+    if inputs.is_empty() {
+        return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
+    }
+    let ep = many_endpoint(kind);
+    let payload: Vec<serde_json::Value> = inputs
+        .iter()
+        .map(|input| serde_json::json!({ "input": input }))
+        .collect();
+    let body = encode_items(&ep, Operation::Extract, &payload).map_err(pg)?;
+    let raw = post_op(&ep, "extract", body)?;
+    let values = decode_text_items(&raw.body).map_err(pg)?;
+    if values.len() != inputs.len() {
+        return Err(pg(format!(
+            "hutch extract many returned {} items for {} inputs",
+            values.len(),
+            inputs.len()
+        )));
+    }
+    Ok(ManyReply { values, http_calls: raw.http_calls })
+}
+
 pub struct ManyReply {
     pub values: Vec<Result<String, String>>,
     pub http_calls: u32,
@@ -476,6 +505,13 @@ pub fn scalar_key_extract(kind: &str) -> String {
     format!("e\u{1e}{}\u{1e}mock\u{1e}{kind}", ep.base_url)
 }
 
+/// Memo key for an EXTRACT MANY list. Distinct from [`scalar_key_extract`]
+/// so a one-noun extract and a JSON array of the same kind do not collide.
+pub fn scalar_key_extract_many(kind: &str) -> String {
+    let ep = decision_endpoint();
+    format!("m\u{1e}{}\u{1e}mock\u{1e}{kind}", ep.base_url)
+}
+
 fn typed_extract_endpoint(kind: &str) -> Endpoint {
     let mut ep = decision_endpoint();
     ep.model = "mock".into();
@@ -515,12 +551,20 @@ fn many_endpoint(kind: &str) -> Endpoint {
     ep.labels.clear();
     ep.label_descriptions.clear();
     ep.fn_name = "extract_many".into();
-    ep.return_type = "text".into();
+    let schema = format!(
+        "{{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"description\":\"one {kind}\"}}}}"
+    );
+    ep.return_type = schema.clone();
     ep.extract_mode = Some("many".into());
     ep.system_prompt = format!(
-        "Return a JSON array of short {kind} nouns. No markdown, no explanation."
+        "Return only values that are a {kind}. Each array item is one {kind} and nothing else. \
+         Do not include other nouns, places, people, objects, or adjectives. \
+         If the text names no {kind}, return []. \
+         Reply with a JSON array of strings and no markdown. Schema: {schema}"
     );
-    ep.user_prompt = format!("List every {kind} in this text.\n{{{{input}}}}");
+    ep.user_prompt = format!(
+        "List only the {kind} values in this text. Return [] if there are none.\n{{{{input}}}}"
+    );
     ep.max_tokens = Some(128);
     ep
 }
@@ -602,23 +646,61 @@ pub fn consensus_state(state: &str) -> PgResult<Option<bool>> {
 }
 
 pub fn rerank_score(document: &str, query: &str) -> PgResult<f64> {
+    let reply = rerank_many("", query, &[document.to_string()])?;
+    let text = one_item(reply)?;
+    text.parse::<f64>().map_err(|_| pg("rerank returned no score"))
+}
+
+/// One hutch POST for every document. Hutch turns a dedicated model into
+/// one OpenRouter `/rerank` call and leaves `mock` / `jev` on noul.
+/// Scores come back as decimal text, in `documents` order.
+pub fn rerank_many(model: &str, query: &str, documents: &[String]) -> PgResult<ManyReply> {
+    if documents.is_empty() {
+        return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
+    }
     let mut ep = decision_endpoint();
     ep.fn_name = "rerank".into();
-    ep.model = "mock".into();
+    ep.model = rerank_model_for(model);
     ep.system_prompt = "Is this document relevant to the query?".into();
     ep.user_prompt.clear();
-    let body = encode_items(
-        &ep,
-        Operation::Rerank,
-        &[serde_json::json!({ "input": document, "criterion": query })],
-    )
-    .map_err(pg)?;
+    let payload: Vec<serde_json::Value> = documents
+        .iter()
+        .map(|document| serde_json::json!({ "input": document, "criterion": query }))
+        .collect();
+    let body = encode_items(&ep, Operation::Rerank, &payload).map_err(pg)?;
     let raw = post_op(&ep, "rerank", body)?;
-    let hit = decode_clause(&raw.body).map_err(pg)?;
-    if let Some(err) = hit.error {
-        return Err(pg(err));
+    let values = decode_score_items(&raw.body).map_err(pg)?;
+    if values.len() != documents.len() {
+        return Err(pg(format!(
+            "hutch rerank returned {} scores for {} documents",
+            values.len(),
+            documents.len()
+        )));
     }
-    hit.score.ok_or_else(|| pg("rerank returned no score"))
+    Ok(ManyReply { values, http_calls: raw.http_calls })
+}
+
+/// `USING MODEL` wins. An explicit `jev` stays on noul. Otherwise the
+/// `semantic.rerank_model` GUC, then `mock` so hutch can apply
+/// `HUTCH_RERANK_MODEL` or the jev fallback.
+pub fn rerank_model_for(explicit: &str) -> String {
+    let explicit = explicit.trim();
+    if explicit.eq_ignore_ascii_case("jev") {
+        return "jev".into();
+    }
+    if !explicit.is_empty() && explicit != "mock" && explicit != "default" {
+        return explicit.to_string();
+    }
+    clauses::guc_rerank_model().unwrap_or_else(|| "mock".into())
+}
+
+pub fn scalar_key_rerank(model: &str, query: &str) -> String {
+    let ep = decision_endpoint();
+    format!(
+        "r\u{1e}{}\u{1e}{}\u{1e}{query}",
+        ep.base_url,
+        rerank_model_for(model)
+    )
 }
 
 pub fn extract_many_json(kind: &str, input: &str, clauses: &str) -> PgResult<String> {
@@ -648,6 +730,22 @@ fn winner_of(report: &str) -> PgResult<String> {
 fn decision_endpoint() -> Endpoint {
     let oid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
     rvbbit_resolve::endpoint_for(oid)
+}
+
+fn decode_score_items(text: &str) -> Result<Vec<Result<String, String>>, String> {
+    let parsed = parsed_batch(text)?;
+    let mut out = Vec::with_capacity(parsed.outputs.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            out.push(Err(format!("hutch item {i}: {} {}", err.code, err.message)));
+            continue;
+        }
+        match item.score {
+            Some(score) => out.push(Ok(score.to_string())),
+            None => out.push(Err(format!("hutch item {i} has no rerank score"))),
+        }
+    }
+    Ok(out)
 }
 
 fn decode_text_items(text: &str) -> Result<Vec<Result<String, String>>, String> {
@@ -1475,13 +1573,19 @@ pub fn forget_decide(keys: &[(String, String)]) {
 /// would pass the cap. The text is a JSON report.
 pub fn apply_clauses_text(kind: &str, input: &str, extra: &str, tail: &str) -> PgResult<String> {
     let call = clauses::parse_tail(tail).map_err(pg)?;
+    let call_model = call.model.clone();
     let ep = decision_endpoint();
     let function = ep
         .default_clauses
         .as_deref()
         .map(|s| clauses::parse_tail(s).unwrap_or_default())
         .unwrap_or_default();
-    let merged = clauses::merge(call, &function, &clauses::guc_clauses());
+    let mut merged = clauses::merge(call, &function, &clauses::guc_clauses());
+    if kind == "rerank" {
+        // `semantic.model` is the decision slug. RERANK uses its own GUC
+        // unless the call wrote USING MODEL.
+        merged.model = call_model.or_else(clauses::guc_rerank_model);
+    }
     if let Some(cond) = &merged.check_input {
         let ok = match cond {
             clauses::Cond::LenGte(n) => input.chars().count() >= *n,
@@ -1771,6 +1875,39 @@ mod tests {
         assert_eq!(clauses, "WITH TAKES 2");
         assert_eq!(extra, "a large biped");
         assert_eq!(parts, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn extract_many_asks_only_for_the_requested_kind() {
+        let ep = super::many_endpoint("creature");
+        assert_eq!(ep.extract_mode.as_deref(), Some("many"));
+        assert!(ep.system_prompt.contains("one creature"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("nothing else"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("return []"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("\"type\":\"array\""), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("Do not include other nouns"), "{}", ep.system_prompt);
+        assert!(ep.user_prompt.contains("Return [] if there are none"));
+        assert!(ep.return_type.contains("one creature"));
+        let body = encode_items(
+            &ep,
+            Operation::Extract,
+            &[
+                serde_json::json!({ "input": "a tall hairy figure" }),
+                serde_json::json!({ "input": "lights over the lake" }),
+            ],
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["items"][0]["extract_mode"], "many");
+        let system = parsed["items"][0]["system"].as_str().unwrap();
+        assert!(system.contains("one creature"));
+        assert!(system.contains("return []"));
+        assert_ne!(
+            super::scalar_key_extract("creature"),
+            super::scalar_key_extract_many("creature")
+        );
+        assert!(super::scalar_key_extract_many("creature").starts_with("m\u{1e}"));
     }
 
     #[test]

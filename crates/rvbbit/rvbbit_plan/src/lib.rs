@@ -344,7 +344,8 @@ fn wrap_decide<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {
 }
 
 fn func_is_native_project(func: &FuncExpr<'_>) -> bool {
-    if func.args.len() != 3 {
+    let nargs = func.args.len();
+    if nargs != 2 && nargs != 3 {
         return false;
     }
     if !syscache_seams::pg_proc_proname::is_installed()
@@ -356,10 +357,11 @@ fn func_is_native_project(func: &FuncExpr<'_>) -> bool {
     let Ok(Some(name)) = syscache_seams::pg_proc_proname::call(func.funcid) else {
         return false;
     };
-    let native = matches!(
-        name.name_str(),
-        b"classify" | b"classify_enum" | b"extract_typed"
-    );
+    let native = match (name.name_str(), nargs) {
+        (b"classify" | b"classify_enum" | b"extract_typed" | b"extract_many", 3) => true,
+        (b"rerank" | b"rerank_for", 2 | 3) => true,
+        _ => false,
+    };
     if !native {
         return false;
     }

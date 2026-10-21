@@ -93,7 +93,7 @@ order, and fall back to the builtin.
 | Variant | What is lifted | Group key | HTTP |
 | --- | --- | --- | --- |
 | Filter | `WHERE ... MEANS` / `ABOUT` on a base scan. Cheap quals stay on the scan. | `(input, criterion)` | one POST per 32 rows, up to 4 in flight |
-| Project | top-level `rvbbit.classify`, `rvbbit.classify_enum`, or `rvbbit.extract_typed` (3 args) | means backend URL, model, and the label set or extract kind | one POST per group per window of 32 rows |
+| Project | top-level `rvbbit.classify`, `rvbbit.classify_enum`, `rvbbit.extract_typed`, or `rvbbit.extract_many` (3 args, empty clause tail), or `rvbbit.rerank` / `rvbbit.rerank_for` (2 or 3 args) | means backend URL, model, and the label set, extract kind, or rerank query | one POST per group per window of 32 rows. A dedicated rerank model collapses one query's documents into one OpenRouter `/rerank` |
 
 `EXPLAIN` names the filter `Semantic Filter` and the project
 `Semantic Project`, and prints `Batch Size`. Under `ANALYZE` it prints
