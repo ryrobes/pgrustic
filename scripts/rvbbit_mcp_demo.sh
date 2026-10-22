@@ -267,6 +267,94 @@ echo "slow count=$SLOW_N elapsed_ms=$ELAPSED_MS"
 test "$SLOW_N" = "8"
 test "$ELAPSED_MS" -lt 1200
 
+echo "=== named-arg import under count / FILTER is still one batch ==="
+# IMPORT creates mcp_demo.slow(text text) RETURNS jsonb. These shapes
+# reference the result, so the call sits inside the aggregate instead of
+# as resjunk. A serial plan is Aggregate -> Seq Scan and 8*200ms.
+"${PSQL[@]}" -c "EXPLAIN SELECT count(*) FILTER (WHERE r IS NOT NULL) FROM (SELECT mcp_demo.slow(text => x) AS r FROM mcp_agg) s;" | tee "$RUNDIR/namedfilter.out"
+grep -q 'Aggregate' "$RUNDIR/namedfilter.out"
+grep -q 'Result' "$RUNDIR/namedfilter.out"
+grep -q 'MCP' "$RUNDIR/namedfilter.out"
+"${PSQL[@]}" -c "EXPLAIN SELECT count(r) FROM (SELECT mcp_demo.slow(text => x) AS r FROM mcp_agg) s;" | tee "$RUNDIR/namedcount.out"
+grep -q 'Result' "$RUNDIR/namedcount.out"
+grep -q 'MCP' "$RUNDIR/namedcount.out"
+"${PSQL[@]}" -c "EXPLAIN SELECT count(mcp_demo.slow(text => x)) FROM mcp_agg;" | tee "$RUNDIR/nameddirect.out"
+grep -q 'Result' "$RUNDIR/nameddirect.out"
+grep -q 'MCP' "$RUNDIR/nameddirect.out"
+for label in filter count direct; do
+  case "$label" in
+    filter) SQL="SELECT count(*) FILTER (WHERE r IS NOT NULL) FROM (SELECT mcp_demo.slow(text => x) AS r FROM mcp_agg) s;" ;;
+    count) SQL="SELECT count(r) FROM (SELECT mcp_demo.slow(text => x) AS r FROM mcp_agg) s;" ;;
+    direct) SQL="SELECT count(mcp_demo.slow(text => x)) FROM mcp_agg;" ;;
+  esac
+  START=$(date +%s%N)
+  GOT=$("${PSQL[@]}" -tA -c "$SQL")
+  END=$(date +%s%N)
+  MS=$(( (END - START) / 1000000 ))
+  echo "named $label count=$GOT elapsed_ms=$MS"
+  test "$GOT" = "8"
+  test "$MS" -lt 1200
+done
+
+echo "=== uvx mcp-server-time: STABLE jsonb named args under an aggregate ==="
+# convert_time is imported STABLE (readOnlyHint) and returns jsonb. One
+# argument is named "time", a column-name keyword, so the call quotes it.
+# 10 zones serially are about 8s. One batch stays under 4s, and the plan
+# is Aggregate -> Result -> Seq Scan.
+UVX=$(command -v uvx || true)
+if [[ -z "$UVX" && -x "${HOME}/.local/bin/uvx" ]]; then
+  UVX="${HOME}/.local/bin/uvx"
+fi
+if [[ -z "$UVX" ]]; then
+  echo "uvx is required to import mcp-server-time" >&2
+  exit 1
+fi
+"${PSQL[@]}" <<SQL
+CREATE SERVER time FOREIGN DATA WRAPPER mcp OPTIONS (
+  transport 'stdio',
+  command '${UVX}',
+  args '["mcp-server-time"]'
+);
+IMPORT FOREIGN TOOLS FROM SERVER time INTO mcp_time;
+CREATE TABLE mcp_tz (tz text);
+INSERT INTO mcp_tz VALUES
+  ('America/New_York'), ('America/Chicago'), ('America/Denver'), ('America/Los_Angeles'),
+  ('Europe/London'), ('Europe/Paris'), ('Europe/Berlin'), ('UTC'),
+  ('Australia/Sydney'), ('Pacific/Auckland');
+ANALYZE mcp_tz;
+SQL
+VOL=$("${PSQL[@]}" -tA -c "SELECT p.provolatile FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'mcp_time' AND p.proname = 'convert_time';")
+echo "convert_time volatility=$VOL"
+test "$VOL" = "s"
+TIME_CALL="mcp_time.convert_time(source_timezone => tz, \"time\" => '14:30', target_timezone => 'Asia/Tokyo')"
+"${PSQL[@]}" -c "EXPLAIN SELECT count(*) FILTER (WHERE r IS NOT NULL) FROM (SELECT ${TIME_CALL} AS r FROM mcp_tz) s;" | tee "$RUNDIR/timefilter.out"
+grep -q 'Aggregate' "$RUNDIR/timefilter.out"
+grep -q 'Result' "$RUNDIR/timefilter.out"
+grep -q 'MCP' "$RUNDIR/timefilter.out"
+"${PSQL[@]}" -c "EXPLAIN SELECT count(r) FROM (SELECT ${TIME_CALL} AS r FROM mcp_tz) s;" | tee "$RUNDIR/timecount.out"
+grep -q 'Result' "$RUNDIR/timecount.out"
+grep -q 'MCP' "$RUNDIR/timecount.out"
+"${PSQL[@]}" -c "EXPLAIN SELECT count(${TIME_CALL}) FROM mcp_tz;" | tee "$RUNDIR/timedirect.out"
+grep -q 'Result' "$RUNDIR/timedirect.out"
+grep -q 'MCP' "$RUNDIR/timedirect.out"
+"${PSQL[@]}" -c "EXPLAIN (ANALYZE) SELECT count(${TIME_CALL}) FROM mcp_tz;" | tee "$RUNDIR/timeanalyze.out"
+grep -q 'Result' "$RUNDIR/timeanalyze.out"
+grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/timeanalyze.out"
+for label in filter count direct; do
+  case "$label" in
+    filter) SQL="SELECT count(*) FILTER (WHERE r IS NOT NULL) FROM (SELECT ${TIME_CALL} AS r FROM mcp_tz) s;" ;;
+    count) SQL="SELECT count(r) FROM (SELECT ${TIME_CALL} AS r FROM mcp_tz) s;" ;;
+    direct) SQL="SELECT count(${TIME_CALL}) FROM mcp_tz;" ;;
+  esac
+  START=$(date +%s%N)
+  GOT=$("${PSQL[@]}" -tA -c "$SQL")
+  END=$(date +%s%N)
+  MS=$(( (END - START) / 1000000 ))
+  echo "time $label count=$GOT elapsed_ms=$MS"
+  test "$GOT" = "10"
+  test "$MS" -lt 4000
+done
+
 echo "=== same plan without USAGE on schema mcp ==="
 "${PSQL[@]}" <<'SQL' | tee "$RUNDIR/norole.out"
 CREATE ROLE mcp_blind NOLOGIN;
