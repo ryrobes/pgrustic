@@ -449,6 +449,20 @@ fn func_is_native_project(func: &FuncExpr<'_>) -> bool {
     ns.name_str() == b"rvbbit"
 }
 
+/// A catalog function whose body is `rvbbit_user`. The Result batcher
+/// prefetches it. Pipe workflows stay out: the planner inlines those.
+fn func_is_user_project(func: &FuncExpr<'_>) -> bool {
+    let nargs = func.args.len();
+    if !(1..=8).contains(&nargs) {
+        return false;
+    }
+    if !rvbbit_resolve::is_semantic_func(func.funcid) {
+        return false;
+    }
+    let ep = rvbbit_resolve::endpoint_for(func.funcid);
+    ep.user_fn && ep.system_prompt != rvbbit_resolve::PIPE_BODY
+}
+
 /// True when the expression is a native project call or contains one.
 /// `round(rvbbit.rerank(...))` and a cast of that call are included, so
 /// the scan target moves onto the Result and the batcher sees the call.
@@ -458,7 +472,9 @@ fn expr_contains_project(node: Node<'_>) -> bool {
         NodeTag::T_CoerceViaIO => expr_contains_project(node.as_coerce_via_io().expect("CoerceViaIO").arg),
         NodeTag::T_FuncExpr => {
             let func = node.as_func_expr().expect("FuncExpr");
-            func_is_native_project(func) || func.args.iter().any(expr_contains_project)
+            func_is_native_project(func)
+                || func_is_user_project(func)
+                || func.args.iter().any(expr_contains_project)
         }
         NodeTag::T_OpExpr => node
             .as_op_expr()

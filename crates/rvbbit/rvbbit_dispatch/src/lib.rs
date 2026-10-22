@@ -1493,14 +1493,216 @@ fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
 fn encode_predict(ep: &Endpoint, items: &[(String, String)]) -> Result<String, String> {
     let inputs: Vec<serde_json::Value> = items
         .iter()
-        .map(|(input, criterion)| serde_json::json!({ "criterion": criterion, "input": input }))
+        .map(|(input, criterion)| predict_inputs(ep, input, criterion))
         .collect();
     encode_items(ep, Operation::Predict, &inputs)
 }
 
+/// `{{arg}}` values for one predict item. `input` and `criterion` stay so
+/// the mock and the means operator keep their old shape. Named arguments
+/// are added beside them.
+pub fn predict_inputs(ep: &Endpoint, input: &str, criterion: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("input".into(), serde_json::Value::String(input.to_string()));
+    map.insert("criterion".into(), serde_json::Value::String(criterion.to_string()));
+    if let Some(name) = ep.arg_names.first() {
+        if !name.is_empty() && name != "input" && name != "criterion" {
+            map.insert(name.clone(), serde_json::Value::String(input.to_string()));
+        }
+    }
+    if ep.arg_names.len() >= 2 {
+        let name = &ep.arg_names[1];
+        if !name.is_empty() && name != "input" && name != "criterion" {
+            map.insert(name.clone(), serde_json::Value::String(criterion.to_string()));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Criterion for a 1-argument template. A template with no `{{arg}}` is
+/// the criterion itself, so the mock's substring check still works. A
+/// template that embeds the argument is rendered before the call.
+pub fn derive_criterion(ep: &Endpoint, input: &str) -> String {
+    let prompt = ep.user_prompt.trim();
+    if prompt.is_empty() || prompt.starts_with('\u{1e}') {
+        return String::new();
+    }
+    if !prompt.contains("{{") {
+        return prompt.to_string();
+    }
+    let mut rendered = prompt.replace("{{input}}", input);
+    if let Some(name) = ep.arg_names.first() {
+        rendered = rendered.replace(&format!("{{{{{name}}}}}"), input);
+    }
+    rendered
+}
+
+pub fn user_memo_key(oid: u32) -> String {
+    format!("u\u{1e}{oid}")
+}
+
+pub struct UserReply {
+    pub values: Vec<String>,
+    pub http_calls: u32,
+}
+
+/// One batch for a `rvbbit_user` function. Bool and score are predict.
+/// Labels are classify. Text is extract. `AS DECISION TREE` walks the tree.
+pub fn user_eval_many(oid: u32, rows: &[Vec<String>]) -> PgResult<UserReply> {
+    if rows.is_empty() {
+        return Ok(UserReply { values: Vec::new(), http_calls: 0 });
+    }
+    let ep = rvbbit_resolve::endpoint_for(oid);
+    if let Some(name) = ep.user_prompt.strip_prefix(rvbbit_resolve::TREE_PREFIX) {
+        let tree = rvbbit_resolve::tree(name).ok_or_else(|| {
+            pg(format!("decision tree \"{name}\" does not exist"))
+        })?;
+        let inputs: Vec<String> = rows.iter().map(|row| row.join("\n")).collect();
+        let reply = decide_texts(&tree.endpoint, &tree.nodes, &inputs)?;
+        return Ok(UserReply { values: reply.values, http_calls: reply.http_calls });
+    }
+    if ep.labels.len() >= 2 {
+        return classify_user(&ep, rows);
+    }
+    let ret = ep.return_type.to_ascii_lowercase();
+    if ret == "text" {
+        return extract_user(&ep, rows);
+    }
+    if ret.contains("double") || ret == "float8" || ret == "float" {
+        return score_user(&ep, rows);
+    }
+    predict_user(oid, &ep, rows)
+}
+
+fn row_input(row: &[String]) -> String {
+    row.join("\n")
+}
+
+fn named_row(ep: &Endpoint, row: &[String]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("input".into(), serde_json::Value::String(row_input(row)));
+    for (i, name) in ep.arg_names.iter().enumerate() {
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(value) = row.get(i) {
+            map.insert(name.clone(), serde_json::Value::String(value.clone()));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn predict_user(oid: u32, ep: &Endpoint, rows: &[Vec<String>]) -> PgResult<UserReply> {
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            let input = row.first().cloned().unwrap_or_default();
+            let criterion = if row.len() >= 2 {
+                row[1].clone()
+            } else {
+                derive_criterion(ep, &input)
+            };
+            (input, criterion)
+        })
+        .collect();
+    let ticket = submit(oid, &pairs)?;
+    let got = wait(ticket)?;
+    let values = got.matched.into_iter().map(|bit| bit.to_string()).collect();
+    Ok(UserReply { values, http_calls: got.http_calls })
+}
+
+fn score_user(ep: &Endpoint, rows: &[Vec<String>]) -> PgResult<UserReply> {
+    let inputs: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let input = row.first().cloned().unwrap_or_default();
+            let criterion = if row.len() >= 2 {
+                row[1].clone()
+            } else {
+                derive_criterion(ep, &input)
+            };
+            predict_inputs(ep, &input, &criterion)
+        })
+        .collect();
+    let body = encode_items(ep, Operation::Predict, &inputs).map_err(pg)?;
+    let raw = post_op(ep, "predict", body)?;
+    let scores = decode_scores(&raw.body).map_err(pg)?;
+    Ok(UserReply {
+        values: scores.into_iter().map(|n| n.to_string()).collect(),
+        http_calls: raw.http_calls,
+    })
+}
+
+fn extract_user(ep: &Endpoint, rows: &[Vec<String>]) -> PgResult<UserReply> {
+    let inputs: Vec<serde_json::Value> = rows.iter().map(|row| named_row(ep, row)).collect();
+    let body = encode_items(ep, Operation::Extract, &inputs).map_err(pg)?;
+    let raw = post_op(ep, "extract", body)?;
+    let values = decode_text_items(&raw.body).map_err(pg)?;
+    let mut out = Vec::with_capacity(values.len());
+    for item in values {
+        out.push(item.map_err(pg)?);
+    }
+    Ok(UserReply { values: out, http_calls: raw.http_calls })
+}
+
+fn classify_user(ep: &Endpoint, rows: &[Vec<String>]) -> PgResult<UserReply> {
+    let inputs: Vec<serde_json::Value> = rows.iter().map(|row| named_row(ep, row)).collect();
+    let body = encode_items(ep, Operation::Classify, &inputs).map_err(pg)?;
+    let raw = post_op(ep, "classify", body)?;
+    let parsed = parsed_batch(&raw.body).map_err(pg)?;
+    let mut values = Vec::with_capacity(parsed.outputs.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            return Err(pg(format!("hutch item {i}: {} {}", err.code, err.message)));
+        }
+        let label = item
+            .value
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| pg(format!("hutch classify item {i} has no label")))?;
+        values.push(
+            serde_json::json!({
+                "label": label,
+                "score": item.score,
+                "scores": item.scores,
+            })
+            .to_string(),
+        );
+    }
+    Ok(UserReply { values, http_calls: raw.http_calls })
+}
+
+fn decode_scores(text: &str) -> Result<Vec<f64>, String> {
+    let parsed = parsed_batch(text)?;
+    let mut out = Vec::with_capacity(parsed.outputs.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            return Err(format!("hutch item {i}: {} {}", err.code, err.message));
+        }
+        let score = item.score.ok_or_else(|| format!("hutch item {i} has no score"))?;
+        out.push(score);
+    }
+    Ok(out)
+}
+
 fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value]) -> Result<String, String> {
-    let system = if ep.system_prompt.is_empty() { None } else { Some(ep.system_prompt.clone()) };
-    let prompt = if ep.user_prompt.is_empty() { None } else { Some(ep.user_prompt.clone()) };
+    let system = if ep.system_prompt.is_empty() || ep.system_prompt.starts_with('\u{1e}') {
+        None
+    } else {
+        Some(ep.system_prompt.clone())
+    };
+    let defaults = ep
+        .default_clauses
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| clauses::parse_tail(s).ok());
+    let prompt = if let Some(first) = defaults.as_ref().and_then(|c| c.phrasings.first()) {
+        Some(first.clone())
+    } else if ep.user_prompt.is_empty() || ep.user_prompt.starts_with('\u{1e}') {
+        None
+    } else {
+        Some(ep.user_prompt.clone())
+    };
     let opts = cache_opts(ep);
     let mut req_items = Vec::with_capacity(inputs.len());
     for (i, inputs) in inputs.iter().enumerate() {
@@ -1575,16 +1777,39 @@ fn cache_opts(ep: &Endpoint) -> serde_json::Value {
 }
 
 fn noul_stack(ep: &Endpoint, operation: Operation) -> Option<DecisionStack> {
-    if !matches!(operation, Operation::Predict | Operation::Decide) {
+    let parsed = ep
+        .default_clauses
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| clauses::parse_tail(s).ok())
+        .unwrap_or_default();
+    let threshold = parsed.threshold.or(ep.threshold);
+    let takes = parsed.takes;
+    let phrasings = parsed.phrasings.clone();
+    let models = parsed.across.clone();
+    let combine = match parsed.pick {
+        Some(clauses::Pick::Vote) => Some("vote".to_string()),
+        Some(_) => Some("mean".to_string()),
+        None => None,
+    };
+    let decision_op = matches!(operation, Operation::Predict | Operation::Decide);
+    let has_tail = takes.is_some()
+        || !phrasings.is_empty()
+        || !models.is_empty()
+        || parsed.threshold.is_some();
+    if decision_op {
+        if threshold.is_none() && !has_tail {
+            return None;
+        }
+    } else if !has_tail {
         return None;
     }
-    let threshold = ep.threshold?;
     Some(DecisionStack {
-        models: Vec::new(),
-        takes: None,
-        combine: None,
-        threshold: Some(threshold),
-        phrasings: Vec::new(),
+        models,
+        takes,
+        combine,
+        threshold: if decision_op || parsed.threshold.is_some() { threshold } else { None },
+        phrasings,
         pick: None,
     })
 }
@@ -2549,6 +2774,32 @@ mod tests {
         assert_eq!(parsed["items"].as_array().unwrap().len(), 3);
         assert_eq!(parsed["items"][0]["extract_mode"], "summary");
         assert_eq!(parsed["items"][2]["inputs"]["input"], "three");
+    }
+
+    #[test]
+    fn user_template_names_the_argument_and_folds_default_takes() {
+        let mut ep = rvbbit_resolve::default_endpoint();
+        ep.arg_names = vec!["notes".into()];
+        ep.user_prompt = "Does {{notes}} mention a biped?".into();
+        ep.default_clauses = Some("WITH TAKES 1".into());
+        ep.user_fn = true;
+        let input = "a large hairy biped";
+        let criterion = super::derive_criterion(&ep, input);
+        assert!(criterion.contains("a large hairy biped"));
+        assert!(criterion.contains("biped"));
+        let inputs = super::predict_inputs(&ep, input, &criterion);
+        assert_eq!(inputs["notes"], input);
+        let body = encode_items(&ep, Operation::Predict, &[inputs]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["decision"]["takes"], 1);
+        assert_eq!(parsed["items"][0]["inputs"]["notes"], input);
+        assert!(parsed["items"][0]["prompt"].as_str().unwrap().contains("{{notes}}"));
+        let bare = {
+            let mut ep = ep.clone();
+            ep.user_prompt = "large hairy biped".into();
+            super::derive_criterion(&ep, input)
+        };
+        assert_eq!(bare, "large hairy biped");
     }
 }
 

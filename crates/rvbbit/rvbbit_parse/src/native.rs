@@ -378,13 +378,19 @@ fn rewrite_pipe(sql: &str, pipe: usize, out: &mut String) -> Option<usize> {
     let verb_at = skip_ws(b, pipe + 2);
     let verb_end = ident_end(b, verb_at)?;
     let verb = sql[verb_at..verb_end].to_ascii_lowercase();
-    if !matches!(
+    let known = matches!(
         verb.as_str(),
         "means" | "means_score" | "extract" | "classify" | "rerank" | "summarize" | "consensus"
-    ) {
-        return None;
-    }
+    );
     let left = pop_simple_expr(out)?;
+    if !known {
+        let Some((end, sql_out)) = pipe_user(sql, verb_end, &left, &verb) else {
+            out.push_str(&left);
+            return None;
+        };
+        out.push_str(&sql_out);
+        return Some(end);
+    }
     let rewritten = match verb.as_str() {
         "means" | "means_score" | "consensus" => pipe_means(sql, verb_end, &left, &verb),
         "rerank" => pipe_binary(sql, verb_end, &left, "rerank"),
@@ -399,6 +405,52 @@ fn rewrite_pipe(sql: &str, pipe: usize, out: &mut String) -> Option<usize> {
     };
     out.push_str(&sql_out);
     Some(end)
+}
+
+fn pipe_user(sql: &str, at: usize, left: &str, name: &str) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    let mut end = at;
+    let mut extras = Vec::new();
+    loop {
+        let arg_at = skip_ws(b, end);
+        if arg_at >= b.len() {
+            break;
+        }
+        if b[arg_at] == b',' || b[arg_at] == b')' || b[arg_at] == b';' || b[arg_at] == b'|' {
+            break;
+        }
+        if is_ident_start(b[arg_at]) {
+            let word_end = ident_end(b, arg_at)?;
+            let word = sql[arg_at..word_end].to_ascii_lowercase();
+            if matches!(
+                word.as_str(),
+                "from" | "where" | "group" | "order" | "limit" | "union" | "having"
+                    | "window" | "offset" | "fetch" | "as" | "with" | "join" | "on"
+            ) {
+                break;
+            }
+        }
+        let expr_end = simple_expr_end(sql, arg_at)?;
+        if expr_end == arg_at {
+            break;
+        }
+        extras.push(sql[arg_at..expr_end].trim().to_string());
+        end = expr_end;
+        let comma = skip_ws(b, end);
+        if comma < b.len() && b[comma] == b',' {
+            end = comma + 1;
+            continue;
+        }
+        break;
+    }
+    let mut call = format!("rvbbit.{name}(({left})");
+    for extra in extras {
+        call.push_str(", (");
+        call.push_str(&extra);
+        call.push(')');
+    }
+    call.push(')');
+    Some((end, call))
 }
 
 fn pipe_means(sql: &str, at: usize, left: &str, op: &str) -> Option<(usize, String)> {
@@ -1660,6 +1712,18 @@ mod tests {
             nemotron.contains("rvbbit.rerank_for((notes), ('logging road'), 'nvidia/nemotron-3.5-rerank-8b:free')"),
             "{nemotron}"
         );
+    }
+
+    #[test]
+    fn pipe_user_function_becomes_a_call() {
+        let sql = "SELECT notes |> is_biped FROM t";
+        let out = rewrite_native_semantic(sql).unwrap();
+        assert!(out.contains("rvbbit.is_biped((notes))"), "{out}");
+        assert!(out.contains("FROM t"), "{out}");
+        let extra = rewrite_native_semantic("SELECT notes |> mentions 'biped'").unwrap();
+        assert!(extra.contains("rvbbit.mentions((notes), ('biped'))"), "{extra}");
+        let geo = "SELECT p |>> q";
+        assert!(rewrite_native_semantic(geo).is_none());
     }
 
     #[test]

@@ -117,7 +117,27 @@ pub fn predict_yes(input: &str, criterion: &str) -> bool {
     if let Some(candidate) = confirm_candidate(criterion) {
         return input.to_ascii_lowercase().contains(&candidate.to_ascii_lowercase());
     }
+    if embedded_template(input, criterion) {
+        return true;
+    }
     matches(input, criterion)
+}
+
+/// A 1-argument template renders the whole note into the criterion
+/// (`Does {{notes}} mention a biped?`). The mock says yes when some
+/// leftover word of the template also appears in the note.
+fn embedded_template(input: &str, criterion: &str) -> bool {
+    if input.is_empty() || criterion.len() <= input.len() {
+        return false;
+    }
+    let input_l = input.to_ascii_lowercase();
+    let crit_l = criterion.to_ascii_lowercase();
+    if !crit_l.contains(&input_l) {
+        return false;
+    }
+    let rest = crit_l.replace(&input_l, " ");
+    rest.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word.len() >= 4 && input_l.contains(word))
 }
 
 fn confirm_candidate(criterion: &str) -> Option<&str> {
@@ -391,7 +411,18 @@ fn mock_scored(op: Operation, item: &rvbbit_contract::ItemRequest) -> (serde_jso
             let yes = predict_yes(&input, &criterion);
             (serde_json::Value::Bool(yes), Some(if yes { 0.82 } else { 0.15 }))
         }
-        Operation::Classify => (serde_json::Value::String(criterion), Some(0.75)),
+        Operation::Classify => {
+            let labels = item.labels.clone().unwrap_or_default();
+            let label = if !criterion.is_empty() {
+                criterion
+            } else {
+                labels
+                    .into_iter()
+                    .find(|label| folded.contains(&label.to_ascii_lowercase()))
+                    .unwrap_or_default()
+            };
+            (serde_json::Value::String(label), Some(0.75))
+        }
         Operation::Extract => {
             if item.extract_mode.as_deref() == Some("many") {
                 let listed = if folded.contains("biped") || folded.contains("hairy") {
@@ -447,6 +478,14 @@ mod tests {
         assert!(!predict_yes("Large gray triangular aircraft", "is night a color?"));
         let dog = "A black dog crossed the road";
         let q = "Text: A black dog crossed the road. In this text, does \"black dog\" name a specific creature, rather than a generic word for the kind itself?";
+        assert!(predict_yes(
+            "a large hairy biped crossed the road",
+            "Does a large hairy biped crossed the road mention a biped?"
+        ));
+        assert!(!predict_yes(
+            "an invoice for widgets",
+            "Does an invoice for widgets mention a biped?"
+        ));
         assert!(predict_yes(dog, q));
         assert!(!predict_yes(dog, "Text: A black dog crossed the road. In this text, does \"aircraft\" name a specific creature, rather than a generic word for the kind itself?"));
         assert!(matches(road, "biped"));

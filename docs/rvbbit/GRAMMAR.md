@@ -73,9 +73,20 @@ to these expressions.
    `None`. gram.y therefore still sees the original bytes, and a
    database that only runs that corpus does not get schema `rvbbit`.
 
-3. **User `SEMANTIC FUNCTION`s** are unchanged. `CREATE SEMANTIC FUNCTION`
-   still builds a catalog function. A fixed-label one returns JSON text
-   `{"label","score","scores"}`. Native `CLASSIFY` returns the bare
+3. **User `SEMANTIC FUNCTION`s** batch. The old `MODEL` / `PROMPT` form
+   is unchanged: a 2-argument bool is still `rvbbit_means`, a fixed-label
+   text function still returns JSON `{"label","score","scores"}` from
+   `rvbbit_classify`, and text without labels is still `rvbbit_extract`.
+   Shorthand is `RETURNS bool|score|text|label`, `AS 'template {{arg}}'`,
+   `USING MODEL name`, and `DEFAULT CLAUSES (...)`. `RETURNS label`
+   requires `LABELS`. A template, a 1-argument bool or score, `RETURNS
+   label`, or `AS DECISION TREE name` is `rvbbit_user`: one predict,
+   classify, extract, or tree batch per window, remembered so the builtin
+   does not call again. `AS PIPE $$ ... $$` is a `LANGUAGE sql VOLATILE`
+   function whose body is the native rewrite (`{{arg}}` becomes the
+   argument). Volatility matches the inner call so the planner can inline
+   it, and Semantic Project batches that call. `|> name` after an expression is `rvbbit.name(left, ...)`.
+   `|>>` stays the geometric operator. Native `CLASSIFY` returns the bare
    label and does not need a predeclared function. It uses the `means`
    backend and the decision model (default `typesafe/jev-1.14`). Native
    `EXTRACT` uses that backend's URL but sends model `mock`, which
@@ -93,7 +104,7 @@ order, and fall back to the builtin.
 | Variant | What is lifted | Group key | HTTP |
 | --- | --- | --- | --- |
 | Filter | `WHERE ... MEANS` / `ABOUT` on a base scan. Cheap quals stay on the scan. | `(input, criterion)` | one POST per 32 rows, up to 4 in flight |
-| Project | `rvbbit.classify`, `rvbbit.classify_enum`, `rvbbit.extract_typed`, or `rvbbit.extract_many` (3 args, empty clause tail), or `rvbbit.rerank` / `rvbbit.rerank_for` (2 or 3 args), including a call nested under `round` or a cast | means backend URL, model, and the label set, extract kind, or rerank query | one POST per group per window of 32 rows. A dedicated rerank model collapses one query's documents into one OpenRouter `/rerank` |
+| Project | `rvbbit.classify`, `rvbbit.classify_enum`, `rvbbit.extract_typed`, or `rvbbit.extract_many` (3 args, empty clause tail), or `rvbbit.rerank` / `rvbbit.rerank_for` (2 or 3 args), or a `rvbbit_user` function (template, label, score, or decision tree), including a call nested under `round` or a cast. A pipe workflow is not batched as itself; its inlined call is | means backend URL, model, and the label set, extract kind, rerank query, or user function oid | one POST per group per window of 32 rows. A dedicated rerank model collapses one query's documents into one OpenRouter `/rerank`. `DEFAULT CLAUSES` (`TAKES`, `PHRASINGS`, `ACROSS`) ride on that POST |
 
 `EXPLAIN` names the filter `Semantic Filter` and the project
 `Semantic Project`, and prints `Batch Size`. Under `ANALYZE` it prints

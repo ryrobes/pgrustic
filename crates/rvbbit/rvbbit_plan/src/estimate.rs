@@ -247,7 +247,14 @@ fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found>
     let oid = func.funcid;
     let name = proc_name(oid);
     let tail = clause_tail(func);
-    let knobs = tail.as_deref().map(knobs_from_tail).unwrap_or_default();
+    let mut knobs = tail.as_deref().map(knobs_from_tail).unwrap_or_default();
+    if tail.is_none() && rvbbit_resolve::is_semantic_func(oid) {
+        if let Some(defaults) = rvbbit_resolve::endpoint_for(oid).default_clauses {
+            if !defaults.trim().is_empty() {
+                knobs = knobs_from_tail(&defaults);
+            }
+        }
+    }
     let (op, filters, per_row, grouping) = classify(oid, &name, in_qual, in_agg)?;
     let mut model = knobs.model.clone().unwrap_or_else(|| model_for(oid, &name));
     if model.is_empty() {
@@ -295,8 +302,20 @@ fn classify(oid: u32, name: &str, in_qual: bool, in_agg: bool) -> Option<(Op, bo
         if name_is(name, &["decide", "rvbbit_decide"]) {
             return Some((Op::Decide, false, 3.0, grouping));
         }
+        if rvbbit_resolve::is_semantic_func(oid) {
+            let ep = rvbbit_resolve::endpoint_for(oid);
+            if ep.user_prompt.starts_with(rvbbit_resolve::TREE_PREFIX) {
+                return Some((Op::Decide, false, 3.0, grouping));
+            }
+            if ep.labels.len() >= 2 {
+                return Some((Op::Classify, false, 1.0, grouping));
+            }
+            if ep.return_type.eq_ignore_ascii_case("text") {
+                return Some((Op::Extract, false, 1.0, grouping));
+            }
+            return Some((Op::Predict, in_qual || oid == CLAUSE_BOOL_OID, 1.0, grouping));
+        }
         if oid == MEANS_OID || oid == MEANS_SCORE_OID || oid == CLAUSE_BOOL_OID || name_is(name, &["means", "rvbbit_means", "means_score", "rvbbit_means_score", "clause_bool", "consensus"])
-            || rvbbit_resolve::is_semantic_func(oid)
         {
             return Some((Op::Predict, in_qual || oid == CLAUSE_BOOL_OID, 1.0, grouping));
         }

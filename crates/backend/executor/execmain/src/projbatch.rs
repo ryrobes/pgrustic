@@ -120,11 +120,13 @@ enum Kind {
     Extract,
     ExtractMany,
     Rerank,
+    User,
 }
 
 fn accepts_project(kind: Kind, nargs: usize) -> bool {
     match kind {
         Kind::Rerank => nargs == 2 || nargs == 3,
+        Kind::User => (1..=8).contains(&nargs),
         _ => nargs == 3,
     }
 }
@@ -133,13 +135,13 @@ fn project_kind<'mcx>(mcx: Mcx<'mcx>, funcid: Oid) -> PgResult<Option<Kind>> {
     let Some(name) = get_func_name(mcx, funcid)? else {
         return Ok(None);
     };
-    let kind = match name.as_str() {
-        "classify" => Kind::Classify,
-        "classify_enum" => Kind::Enum,
-        "extract_typed" => Kind::Extract,
-        "extract_many" => Kind::ExtractMany,
-        "rerank" | "rerank_for" => Kind::Rerank,
-        _ => return Ok(None),
+    let named = match name.as_str() {
+        "classify" => Some(Kind::Classify),
+        "classify_enum" => Some(Kind::Enum),
+        "extract_typed" => Some(Kind::Extract),
+        "extract_many" => Some(Kind::ExtractMany),
+        "rerank" | "rerank_for" => Some(Kind::Rerank),
+        _ => None,
     };
     let nsp = get_func_namespace(funcid)?;
     let Some(nsname) = get_namespace_name(mcx, nsp)? else {
@@ -148,14 +150,20 @@ fn project_kind<'mcx>(mcx: Mcx<'mcx>, funcid: Oid) -> PgResult<Option<Kind>> {
     if nsname.as_str() != "rvbbit" {
         return Ok(None);
     }
-    Ok(Some(kind))
+    if let Some(kind) = named {
+        return Ok(Some(kind));
+    }
+    let ep = rvbbit_resolve::endpoint_for(funcid);
+    if ep.user_fn && ep.system_prompt != rvbbit_resolve::PIPE_BODY {
+        return Ok(Some(Kind::User));
+    }
+    Ok(None)
 }
 
 struct Site<'mcx> {
     kind: Kind,
-    first: PgBox<'mcx, ExprState<'mcx>>,
-    second: PgBox<'mcx, ExprState<'mcx>>,
-    third: Option<PgBox<'mcx, ExprState<'mcx>>>,
+    oid: u32,
+    args: Vec<PgBox<'mcx, ExprState<'mcx>>>,
 }
 
 enum PendingCall {
@@ -163,6 +171,7 @@ enum PendingCall {
     Extract { key: String, kind: String, input: String },
     ExtractMany { key: String, kind: String, input: String },
     Rerank { key: String, model: String, query: String, input: String },
+    User { oid: u32, values: Vec<String> },
 }
 
 struct Pending {
@@ -245,15 +254,17 @@ pub fn compile<'mcx>(
         if !accepts_project(kind, f.args.len()) {
             return Err(err("native CLASSIFY, EXTRACT, and RERANK have the wrong arity"));
         }
-        let first = semantic::compile_expr(estate, mcx, params, f.args.nth(0))?;
-        let second = semantic::compile_expr(estate, mcx, params, f.args.nth(1))?;
-        let third = if matches!(kind, Kind::ExtractMany) || (matches!(kind, Kind::Rerank) && f.args.len() == 3)
-        {
-            Some(semantic::compile_expr(estate, mcx, params, f.args.nth(2))?)
-        } else {
-            None
+        let n = match kind {
+            Kind::User => f.args.len(),
+            Kind::ExtractMany => 3,
+            Kind::Rerank if f.args.len() == 3 => 3,
+            _ => 2,
         };
-        sites.push(Site { kind, first, second, third });
+        let mut args = Vec::with_capacity(n);
+        for i in 0..n {
+            args.push(semantic::compile_expr(estate, mcx, params, f.args.nth(i))?);
+        }
+        sites.push(Site { kind, oid: f.funcid, args });
     }
     Ok(Some(Box::new(ProjectState {
         sites,
@@ -463,12 +474,22 @@ impl<'mcx> ProjectState<'mcx> {
     ) -> PgResult<Vec<Option<PendingCall>>> {
         let mut calls = Vec::with_capacity(self.sites.len());
         for site in &mut self.sites {
-            let first = semantic::eval_text(estate, ecxt, &mut site.first)?;
-            let second = semantic::eval_text(estate, ecxt, &mut site.second)?;
-            let extra = match site.third.as_mut() {
-                Some(expr) => semantic::eval_text(estate, ecxt, expr)?.unwrap_or_default(),
-                None => String::new(),
-            };
+            let mut texts = Vec::with_capacity(site.args.len());
+            for expr in &mut site.args {
+                texts.push(semantic::eval_text(estate, ecxt, expr)?);
+            }
+            let first = texts.first().cloned().flatten();
+            let second = texts.get(1).cloned().flatten();
+            let extra = texts.get(2).cloned().flatten().unwrap_or_default();
+            if matches!(site.kind, Kind::User) {
+                if texts.iter().any(|text| text.is_none()) {
+                    calls.push(None);
+                } else {
+                    let values = texts.into_iter().flatten().collect();
+                    calls.push(Some(PendingCall::User { oid: site.oid, values }));
+                }
+                continue;
+            }
             let call = match (site.kind, first, second) {
                 (Kind::Classify, Some(input), Some(raw)) => {
                     let labels: Vec<String> = raw
@@ -533,6 +554,7 @@ impl<'mcx> ProjectState<'mcx> {
                             lists: false,
                             rerank: None,
                             inputs: Vec::new(),
+                            user_rows: Vec::new(),
                         });
                         group.inputs.push(input.clone());
                     }
@@ -543,6 +565,7 @@ impl<'mcx> ProjectState<'mcx> {
                             lists: false,
                             rerank: None,
                             inputs: Vec::new(),
+                            user_rows: Vec::new(),
                         });
                         group.inputs.push(input.clone());
                     }
@@ -553,6 +576,7 @@ impl<'mcx> ProjectState<'mcx> {
                             lists: true,
                             rerank: None,
                             inputs: Vec::new(),
+                            user_rows: Vec::new(),
                         });
                         group.inputs.push(input.clone());
                     }
@@ -563,14 +587,57 @@ impl<'mcx> ProjectState<'mcx> {
                             lists: false,
                             rerank: Some((model.clone(), query.clone())),
                             inputs: Vec::new(),
+                            user_rows: Vec::new(),
                         });
                         group.inputs.push(input.clone());
+                    }
+                    PendingCall::User { oid, values } => {
+                        let key = rvbbit_dispatch::user_memo_key(*oid);
+                        let group = grouped.entry(key).or_insert_with(|| Group {
+                            labels: None,
+                            kind: None,
+                            lists: false,
+                            rerank: None,
+                            inputs: Vec::new(),
+                            user_rows: Vec::new(),
+                        });
+                        group.user_rows.push(values.clone());
                     }
                 }
             }
         }
         let mut forget = Forget(Vec::new());
         for (key, group) in &grouped {
+            if !group.user_rows.is_empty() {
+                let oid = key
+                    .rsplit('\u{1e}')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let mut seen = BTreeSet::new();
+                let mut unique = Vec::new();
+                for row in &group.user_rows {
+                    if seen.insert(row.join("\u{1e}")) {
+                        unique.push(row.clone());
+                    }
+                }
+                self.memo_hits += (group.user_rows.len() - unique.len()) as u64;
+                let reply = rvbbit_dispatch::user_eval_many(oid, &unique)?;
+                self.http_calls += reply.http_calls as u64;
+                if reply.values.len() != unique.len() {
+                    return Err(err(format!(
+                        "semantic batch returned {} values for {} inputs",
+                        reply.values.len(),
+                        unique.len()
+                    )));
+                }
+                for (row, value) in unique.iter().zip(reply.values.into_iter()) {
+                    let input = row.join("\u{1e}");
+                    rvbbit_dispatch::remember_scalar(key, &input, rvbbit_dispatch::ScalarHit::Value(value));
+                    forget.0.push((key.clone(), input));
+                }
+                continue;
+            }
             let mut seen = BTreeSet::new();
             let mut unique = Vec::new();
             for input in &group.inputs {
@@ -640,6 +707,7 @@ struct Group {
     /// `(model, query)` for a rerank batch. Documents are `inputs`.
     rerank: Option<(String, String)>,
     inputs: Vec<String>,
+    user_rows: Vec<Vec<String>>,
 }
 
 fn err(message: impl Into<String>) -> Box<PgError> {

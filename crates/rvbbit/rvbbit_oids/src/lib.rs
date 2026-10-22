@@ -71,6 +71,11 @@ pub const CLAUSE_TEXT_OID: u32 = 9042;
 /// `rvbbit_rerank`, with the model slug in the third argument. Empty
 /// slug keeps the jev default.
 pub const RERANK_FOR_OID: u32 = 9043;
+/// `rvbbit_user(...)`. Body for a user semantic function that is not the
+/// 2-argument means/score operator: a prompt template, `RETURNS label`,
+/// a 1-argument bool or score, or `AS DECISION TREE`. Arity comes from
+/// `pg_proc`, not from this oid.
+pub const USER_OID: u32 = 9044;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -95,6 +100,7 @@ pub const CLAUSE_BOOL_NAME: &str = "rvbbit_clause_bool";
 pub const CLAUSE_SCORE_NAME: &str = "rvbbit_clause_score";
 pub const CLAUSE_TEXT_NAME: &str = "rvbbit_clause_text";
 pub const RERANK_FOR_NAME: &str = "rvbbit_rerank_for";
+pub const USER_NAME: &str = "rvbbit_user";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;
