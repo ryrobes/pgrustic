@@ -279,10 +279,10 @@ returns the bare label (the catalog `LABELS` function still returns
 JSON). `CLASSIFY(expr AS enumname)` reads `pg_enum`.
 `EXTRACT(int FROM expr)` and `EXTRACT(creature FROM expr) ON ERROR 'unknown'`
 are the typed form; datetime `EXTRACT`, including `FORTNIGHT`, is unchanged.
-The typed call sends `extract_mode = scalar` and asks for a noun or
-literal of at most three words, so a creature answer is a name rather
-than a description. `ON ERROR` is the default when the model or the
-typed parse fails.
+The typed call sends `extract_mode = scalar` at temperature 0 with seed 0
+and a `{found, value}` schema. A miss (`found` false, or a placeholder
+such as `None`) is SQL NULL, so `ON ERROR` does not replace it. `ON ERROR`
+still applies when the model or the typed parse fails.
 
 Those project calls batch on a Result named `Semantic Project`: one HTTP
 call per window per `(backend, model, labels-or-kind)`, duplicates

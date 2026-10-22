@@ -61,7 +61,8 @@ to these expressions.
      `rvbbit.extract_typed('<kind>', (expr), fallback)`
    - `ON ERROR literal` is that third argument. Omitted means `NULL`.
      The three functions are not `STRICT`, so a null fallback can still
-     run and a model error can return the default.
+     run and a model error can return the default. A scalar EXTRACT that
+     finds nothing returns SQL NULL and does not use `ON ERROR`.
 
    `EXTRACT` is rewritten for a scalar kind (`int`, `integer`, `bigint`,
    `int2`, `int4`, `int8`, `smallint`, `float`, `float4`, `float8`,

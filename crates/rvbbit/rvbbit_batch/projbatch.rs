@@ -721,6 +721,9 @@ impl<'mcx> ProjectState<'mcx> {
                 let hit = match value {
                     Ok(raw) => match &group.kind {
                         Some(_) if group.lists => rvbbit_dispatch::ScalarHit::Value(raw),
+                        Some(_) if raw == rvbbit_dispatch::EXTRACT_ABSENT => {
+                            rvbbit_dispatch::ScalarHit::Missing
+                        }
                         Some(kind) => match rvbbit_dispatch::coerce_extracted(kind, &raw) {
                             Ok(text) => rvbbit_dispatch::ScalarHit::Value(text),
                             Err(message) => rvbbit_dispatch::ScalarHit::Failed(message),

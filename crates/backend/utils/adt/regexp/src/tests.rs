@@ -41,6 +41,21 @@ fn match_operators() {
     assert!(nameicregexne(m, b"PG_CLASS", b"^xx", C).unwrap());
 }
 
+/// `'None' ~* '^(none|unknown)'` must compile and match under the C
+/// collation. The 12 GB OOM on this text was the rvbbit pre-parse lexer
+/// stalling on a bare `~`, not this engine. Spencer `allcases` only adds
+/// the two case variants of each letter.
+#[test]
+fn icase_anchor_alternation_stays_bounded() {
+    utf8();
+    let cx = MemoryContext::new("test");
+    let m = cx.mcx();
+    let got = texticregexeq(m, b"None", b"^(none|unknown)", C).unwrap();
+    assert!(got);
+    assert!(!texticregexeq(m, b"Gas Basis", b"^(none|unknown)", C).unwrap());
+    assert!(textregexeq(m, b"none", b"^(none|unknown)", C).unwrap());
+}
+
 #[test]
 fn invalid_pattern_errors() {
     utf8();
