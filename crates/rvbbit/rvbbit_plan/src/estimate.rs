@@ -256,6 +256,18 @@ fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found>
         });
     }
     let name = proc_name(oid);
+    // Inlined tool bodies are this internal function. The SQL wrapper's
+    // oid is handled above, once `load_installed` has filled the cache.
+    if name_is(&name, &["mcp_invoke_text", "rvbbit_mcp_invoke_text"]) {
+        return Some(Found {
+            op: Op::Mcp,
+            model: "mcp:invoke/mcp_invoke_text".into(),
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: if func.funcretset || in_agg { Grouping::PerGroup } else { Grouping::Batched },
+            filters: false,
+        });
+    }
     let tail = clause_tail(func);
     let mut knobs = tail.as_deref().map(knobs_from_tail).unwrap_or_default();
     if rvbbit_resolve::is_semantic_func(oid) {

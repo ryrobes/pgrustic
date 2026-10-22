@@ -5,6 +5,7 @@
 //! JWTs: role, credential version, and a one-hour expiry. An API key is
 //! a bearer that never looks like a JWT; only its hash is stored.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_sha2::{PgSha256Ctx, PG_SHA256_DIGEST_LENGTH};
@@ -348,6 +349,13 @@ struct Claims {
     ver: i32,
 }
 
+static JTI_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_jti() -> String {
+    let n = JTI_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{n}", now_secs())
+}
+
 pub fn sign_jwt(secret: &[u8], role: &str, subject: &str, ver: i32, exp: u64) -> Result<String, String> {
     let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = b64url(
@@ -355,6 +363,8 @@ pub fn sign_jwt(secret: &[u8], role: &str, subject: &str, ver: i32, exp: u64) ->
             "sub": subject,
             "role": role,
             "ver": ver,
+            "iat": now_secs(),
+            "jti": next_jti(),
             "exp": exp,
         })
         .to_string()
@@ -553,9 +563,17 @@ mod tests {
     fn jwt_round_trip_carries_role_and_version() {
         let secret = b"test-secret";
         let token = sign_jwt(secret, "analyst", "analyst", 3, now_secs() + 60).unwrap();
+        let again = sign_jwt(secret, "analyst", "analyst", 3, now_secs() + 60).unwrap();
+        assert_ne!(token, again, "iat and jti must make a refresh differ");
         let claims = verify_jwt(secret, &token).unwrap();
         assert_eq!(claims.role, "analyst");
         assert_eq!(claims.ver, 3);
+        let payload = token.split('.').nth(1).unwrap();
+        let body: Value = serde_json::from_slice(&b64url_decode(payload).unwrap()).unwrap();
+        assert!(body.get("iat").and_then(|v| v.as_u64()).is_some(), "{body}");
+        assert!(body.get("jti").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()), "{body}");
+        let other: Value = serde_json::from_slice(&b64url_decode(again.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        assert_ne!(body["jti"], other["jti"]);
         let mut parts: Vec<String> = token.split('.').map(|s| s.to_string()).collect();
         parts[2].pop();
         parts[2].push('A');

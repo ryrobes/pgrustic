@@ -102,6 +102,7 @@ pub fn mcp_batch(
         "cache_ttl_ms": opts.cache_ttl_ms,
         "read_only": opts.read_only,
         "max_cost": opts.max_cost,
+        "role": crate::call_role(),
         "calls": calls.into_iter().map(|(tool, arguments)| json!({"tool": tool, "arguments": arguments})).collect::<Vec<_>>(),
     });
     let text = post("/v1/mcp/batch", &body.to_string(), budget_secs(opts))?;
@@ -154,6 +155,7 @@ fn call_body(spec: &ServerSpec, tool: &str, arguments: Value, opts: &McpCallOpts
         "cache_ttl_ms": opts.cache_ttl_ms,
         "read_only": opts.read_only,
         "max_cost": opts.max_cost,
+        "role": crate::call_role(),
     })
 }
 
@@ -174,7 +176,7 @@ pub fn note_mcp_memo_hit(server: &str, tool: &str, ok: bool) {
         "provider_latency_ms": null,
         "cache": "hit",
         "items": 1,
-        "tenant": "",
+        "tenant": crate::call_role(),
         "generation_id": status,
         "node": server,
         "score": null,
@@ -257,9 +259,14 @@ fn budget_secs(opts: &McpCallOpts) -> u64 {
 
 fn post(path: &str, body: &str, timeout_secs: u64) -> Result<String, String> {
     let url = format!("{}{path}", mcp_url().trim_end_matches('/'));
-    let resp = ureq::post(&url)
+    let role = crate::call_role();
+    let mut req = ureq::post(&url)
         .set("content-type", "application/json")
-        .timeout(Duration::from_secs(timeout_secs))
+        .timeout(Duration::from_secs(timeout_secs));
+    if !role.is_empty() {
+        req = req.set("X-Rvbbit-Role", &role);
+    }
+    let resp = req
         .send_string(body)
         .map_err(|e| format!("hutch-mcp {path}: {e}"))?;
     resp.into_string().map_err(|e| format!("hutch-mcp body: {e}"))

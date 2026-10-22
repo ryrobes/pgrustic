@@ -140,6 +140,14 @@ pub fn pg_plan_query<'mcx>(
         ResetUsage();
     }
 
+    // Before `planner`. SPI from inside `planner` reenters it (plancache
+    // calls the planner seam directly) and deadlocks on the outer frame.
+    // The catalog SELECT planned from here is the only planner frame.
+    // Unset in planner-less tests: skip.
+    if planner_seams::preload_installed_cache::is_installed() {
+        planner_seams::preload_installed_cache::call()?;
+    }
+
     let plan =
         planner_seams::planner::call(mcx, querytree, query_string, cursor_options, bound_params)?;
 

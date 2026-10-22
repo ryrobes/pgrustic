@@ -39,8 +39,11 @@ Semantic Latency, and Semantic Model, and the same lines for an MCP tool \
 `semantic.max_cost` and a clause BUDGET reject an estimate above the cap before the provider is called.
 
 Inbound `run_sql` is read-only. A role whose max_cost is 0 cannot run it. \
-A positive max_cost is SET LOCAL semantic.max_cost and also rejects a plan whose total USD is above it.\
+A positive max_cost is SET LOCAL semantic.max_cost and also rejects a plan whose total USD is above it. \
+Only SELECT, WITH, VALUES, TABLE, and EXPLAIN of those are accepted.\
 ";
+
+type ToolOut = Result<rmcp::model::CallToolResult, rmcp::ErrorData>;
 
 pub struct Warehouse {
     oauth: std::sync::Arc<Oauth>,
@@ -83,14 +86,14 @@ impl Warehouse {
     async fn list_schemas(
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.finish(&ctx, "list_schemas", None, |_id, conn| {
             let rows = conn.query(
                 "SELECT nspname FROM pg_namespace \
                  WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema' \
                  ORDER BY 1",
             )?;
-            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, 0.0))
+            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, 0.0, 0.0))
         })
         .await
     }
@@ -100,7 +103,7 @@ impl Warehouse {
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.search(&ctx, "list_tables", args).await
     }
 
@@ -109,7 +112,7 @@ impl Warehouse {
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.search(&ctx, "search_data", args).await
     }
 
@@ -118,7 +121,7 @@ impl Warehouse {
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
         Parameters(args): Parameters<DescribeArgs>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.finish(&ctx, "describe_table", None, move |id, conn| {
             let schema = checked_ident(&args.schema)?;
             let table = checked_ident(&args.table)?;
@@ -152,7 +155,7 @@ impl Warehouse {
                 "sample_error": sample_error,
             });
             let _ = id;
-            Ok((body.to_string(), cols.rows.len() as i64, 0.0))
+            Ok((body.to_string(), cols.rows.len() as i64, 0.0, 0.0))
         })
         .await
     }
@@ -162,7 +165,7 @@ impl Warehouse {
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
         Parameters(args): Parameters<SqlArgs>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.explain_tool(&ctx, "validate_sql", &args.sql, true).await
     }
 
@@ -171,7 +174,7 @@ impl Warehouse {
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
         Parameters(args): Parameters<SqlArgs>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.explain_tool(&ctx, "explain", &args.sql, false).await
     }
 
@@ -180,7 +183,7 @@ impl Warehouse {
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
         Parameters(args): Parameters<SqlArgs>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         let sql = args.sql;
         let limit = args.limit.unwrap_or(ROW_CAP).clamp(1, 1000);
         self.finish(&ctx, "run_sql", Some(sql.clone()), move |id, conn| {
@@ -188,16 +191,23 @@ impl Warehouse {
                 return Err("semantic estimate exceeds budget 0".into());
             }
             one_statement(&sql)?;
+            read_only_sql(&sql)?;
+            if is_explain(&sql) {
+                let rows = conn.query(sql.trim().trim_end_matches(';').trim())?;
+                let plan = explain_lines(&rows);
+                return Ok((plan.clone(), rows.rows.len() as i64, total_usd(&plan), semantic_calls(&plan)));
+            }
             let statement = capped(&sql, limit);
+            let plan = explain_text(conn, &statement)?;
+            let usd = total_usd(&plan);
+            let calls = semantic_calls(&plan);
             if let Some(cap) = id.max_cost {
-                let plan = explain_text(conn, &statement)?;
-                let usd = total_usd(&plan);
                 if usd > cap + 1e-12 {
                     return Err(format!("semantic estimate {usd:.8} USD exceeds budget {cap:.8}"));
                 }
             }
             let rows = conn.query(&statement)?;
-            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, 0.0))
+            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, usd, calls))
         })
         .await
     }
@@ -206,9 +216,9 @@ impl Warehouse {
     async fn semantic_ops_help(
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.finish(&ctx, "semantic_ops_help", None, |_id, _conn| {
-            Ok((json!({"help": HELP}).to_string(), 1, 0.0))
+            Ok((json!({"help": HELP}).to_string(), 1, 0.0, 0.0))
         })
         .await
     }
@@ -217,14 +227,14 @@ impl Warehouse {
     async fn list_semantic_functions(
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.finish(&ctx, "list_semantic_functions", None, |_id, conn| {
             let rows = conn.query(
                 "SELECT p.proname, pg_get_function_identity_arguments(p.oid) \
                  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
                  WHERE n.nspname = 'rvbbit' ORDER BY 1",
             )?;
-            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, 0.0))
+            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, 0.0, 0.0))
         })
         .await
     }
@@ -236,7 +246,7 @@ impl Warehouse {
         ctx: &rmcp::service::RequestContext<RoleServer>,
         tool: &'static str,
         args: SearchArgs,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         self.finish(ctx, tool, None, move |_id, conn| {
             let mut filter = String::from(
                 "c.relkind = 'r' AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema'",
@@ -272,7 +282,7 @@ impl Warehouse {
                     "sample": sample.as_ref().map(json_rows).unwrap_or(Value::Null),
                 }));
             }
-            Ok((json!(out).to_string(), out.len() as i64, 0.0))
+            Ok((json!(out).to_string(), out.len() as i64, 0.0, 0.0))
         })
         .await
     }
@@ -283,21 +293,22 @@ impl Warehouse {
         tool: &'static str,
         sql: &str,
         as_validate: bool,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> ToolOut {
         let sql = sql.to_string();
         self.finish(ctx, tool, Some(sql.clone()), move |_id, conn| {
-            match one_statement(&sql).and_then(|_| explain_text(conn, &sql)) {
+            match one_statement(&sql).and_then(|_| read_only_sql(&sql)).and_then(|_| explain_text(conn, &sql)) {
                 Ok(plan) => {
                     let usd = total_usd(&plan);
+                    let calls = semantic_calls(&plan);
                     let body = if as_validate {
                         json!({"ok": true, "plan": plan, "usd": usd}).to_string()
                     } else {
                         plan
                     };
-                    Ok((body, 1, usd))
+                    Ok((body, 1, usd, calls))
                 }
                 Err(message) if as_validate => {
-                    Ok((json!({"ok": false, "error": message}).to_string(), 0, 0.0))
+                    Ok((json!({"ok": false, "error": message}).to_string(), 0, 0.0, 0.0))
                 }
                 Err(message) => Err(message),
             }
@@ -310,24 +321,36 @@ impl Warehouse {
         ctx: &rmcp::service::RequestContext<RoleServer>,
         tool: &'static str,
         sql: Option<String>,
-        work: impl FnOnce(&Identity, &mut super::pg::Conn) -> Result<(String, i64, f64), String> + Send + 'static,
-    ) -> Result<String, rmcp::ErrorData> {
+        work: impl FnOnce(&Identity, &mut super::pg::Conn) -> Result<(String, i64, f64, f64), String> + Send + 'static,
+    ) -> ToolOut {
         let oauth = self.oauth.clone();
         let token = match bearer_of(ctx, self.stdio_bearer.as_deref()) {
             Ok(token) => token,
-            Err(message) => return Err(tool_err(message)),
+            Err(message) => return Ok(tool_failure(message)),
         };
         let result = tokio::task::spawn_blocking(move || {
             let id = oauth.identity_for_bearer(&token)?;
             let started = Instant::now();
             let outcome = oauth.pool.with(|conn| in_role(conn, &id, |conn| work(&id, conn)));
             let elapsed = started.elapsed().as_millis() as i64;
-            let (text, rows, cost, err) = match outcome {
-                Ok((text, rows, cost)) => (Some(text), Some(rows), cost, None),
-                Err(message) => (None, None, 0.0, Some(message)),
+            let (text, rows, cost, calls, err) = match outcome {
+                Ok((text, rows, cost, calls)) => (Some(text), Some(rows), cost, calls, None),
+                Err(message) => (None, None, 0.0, 0.0, Some(message)),
             };
             let hash = sql.as_deref().map(|s| sha256_hex(s.as_bytes()));
-            let _ = audit(&oauth.pool, &id, tool, hash.as_deref(), elapsed, rows, cost);
+            let status = if err.is_some() { "error" } else { "ok" };
+            let _ = audit(
+                &oauth.pool,
+                &id,
+                tool,
+                hash.as_deref(),
+                elapsed,
+                rows,
+                cost,
+                status,
+                err.as_deref(),
+                calls,
+            );
             match err {
                 Some(message) => Err(message),
                 None => Ok(text.unwrap_or_default()),
@@ -335,7 +358,10 @@ impl Warehouse {
         })
         .await
         .map_err(|e| tool_err(e.to_string()))?;
-        result.map_err(tool_err)
+        match result {
+            Ok(text) => Ok(rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)])),
+            Err(message) => Ok(tool_failure(message)),
+        }
     }
 }
 
@@ -372,6 +398,9 @@ fn audit(
     duration_ms: i64,
     rows: Option<i64>,
     cost: f64,
+    status: &str,
+    error: Option<&str>,
+    semantic_calls: f64,
 ) -> Result<(), String> {
     let hash_sql = match sql_hash {
         Some(hash) => quote_lit(hash),
@@ -381,36 +410,59 @@ fn audit(
         Some(n) => n.to_string(),
         None => "NULL".into(),
     };
+    let error_sql = match error {
+        Some(message) => quote_lit(message),
+        None => "NULL".into(),
+    };
     pool.with(|conn| {
         conn.exec(&format!(
-            "INSERT INTO rvbbit.mcp_audit (subject, role, tool, sql_hash, duration_ms, rows, cost) \
-             VALUES ({}, {}, {}, {hash_sql}, {duration_ms}, {rows_sql}, {cost})",
+            "INSERT INTO rvbbit.mcp_audit \
+             (subject, role, tool, sql_hash, duration_ms, rows, cost, status, error, cost_usd, semantic_calls) \
+             VALUES ({}, {}, {}, {hash_sql}, {duration_ms}, {rows_sql}, {cost}, {}, {error_sql}, {cost}, {semantic_calls})",
             quote_lit(&id.subject),
             quote_lit(&id.role),
             quote_lit(tool),
+            quote_lit(status),
         ))
     })
 }
 
 fn explain_text(conn: &mut super::pg::Conn, sql: &str) -> Result<String, String> {
     let rows = conn.query(&format!("EXPLAIN {sql}"))?;
+    Ok(explain_lines(&rows))
+}
+
+fn explain_lines(rows: &super::pg::Rows) -> String {
     let mut lines = Vec::new();
     for row in &rows.rows {
         if let Some(Some(line)) = row.first() {
             lines.push(line.clone());
         }
     }
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
 fn total_usd(plan: &str) -> f64 {
+    plan_metric(plan, "total usd")
+}
+
+fn semantic_calls(plan: &str) -> f64 {
+    let semantic = plan_metric(plan, "semantic total provider calls");
+    if semantic > 0.0 {
+        semantic
+    } else {
+        plan_metric(plan, "mcp total provider calls")
+    }
+}
+
+fn plan_metric(plan: &str, label: &str) -> f64 {
     let mut best: f64 = 0.0;
     for line in plan.lines() {
         let lower = line.to_ascii_lowercase();
-        if !lower.contains("total usd") {
+        let Some(rest) = lower.split(label).nth(1) else {
             continue;
-        }
-        if let Some(num) = lower.split("total usd").nth(1).and_then(first_number) {
+        };
+        if let Some(num) = first_number(rest) {
             best = best.max(num);
         }
     }
@@ -448,6 +500,76 @@ fn checked_ident(name: &str) -> Result<String, String> {
         Ok(name.to_string())
     } else {
         Err(format!("{name} is not an identifier"))
+    }
+}
+
+const READ_ONLY_SQL: &str = "only read-only SELECT/WITH/VALUES/EXPLAIN allowed";
+
+/// Leading `--` and `/* */` comments, then the first keyword.
+fn statement_head(sql: &str) -> (String, String) {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(tail) = rest.strip_prefix("--") {
+            rest = tail.split_once('\n').map(|(_, right)| right).unwrap_or("").trim_start();
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix("/*") {
+            let Some(end) = tail.find("*/") else {
+                return (String::new(), String::new());
+            };
+            rest = tail[end + 2..].trim_start();
+            continue;
+        }
+        break;
+    }
+    let head = rest
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (head, rest.to_string())
+}
+
+fn is_explain(sql: &str) -> bool {
+    statement_head(sql).0 == "explain"
+}
+
+fn command_after_explain(rest: &str) -> String {
+    let mut body = rest.trim_start();
+    let head = body
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or("");
+    if head.eq_ignore_ascii_case("explain") {
+        body = body[head.len()..].trim_start();
+    }
+    if body.starts_with('(') {
+        let Some(end) = body.find(')') else {
+            return String::new();
+        };
+        body = body[end + 1..].trim_start();
+    }
+    loop {
+        let word = body
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(word.as_str(), "analyze" | "analyse" | "verbose") {
+            body = body[word.len()..].trim_start();
+            continue;
+        }
+        return word;
+    }
+}
+
+fn read_only_sql(sql: &str) -> Result<(), String> {
+    let (head, rest) = statement_head(sql);
+    let command = if head == "explain" { command_after_explain(&rest) } else { head };
+    if matches!(command.as_str(), "select" | "with" | "values" | "table" | "explain") {
+        Ok(())
+    } else {
+        Err(READ_ONLY_SQL.into())
     }
 }
 
@@ -530,12 +652,38 @@ fn bearer_of(ctx: &rmcp::service::RequestContext<RoleServer>, stdio: Option<&str
     stdio.map(|s| s.to_string()).ok_or_else(|| "missing bearer token".into())
 }
 
+fn tool_failure(message: String) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message)])
+}
+
 fn tool_err(message: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(message, None)
 }
 
 pub fn bootstrap_sql() -> &'static str {
     include_str!("../../sql/bootstrap.sql")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_sql_rejects_ddl_and_set_role() {
+        assert!(read_only_sql("SELECT 1").is_ok());
+        assert!(read_only_sql("  -- note\nWITH t AS (SELECT 1) SELECT * FROM t").is_ok());
+        assert!(read_only_sql("VALUES (1)").is_ok());
+        assert!(read_only_sql("TABLE notes").is_ok());
+        assert!(read_only_sql("EXPLAIN SELECT 1").is_ok());
+        assert!(read_only_sql("EXPLAIN (ANALYZE, VERBOSE) SELECT 1").is_ok());
+        assert!(read_only_sql("EXPLAIN ANALYZE SELECT 1").is_ok());
+        let drop = read_only_sql("DROP TABLE notes").unwrap_err();
+        assert_eq!(drop, READ_ONLY_SQL);
+        assert_eq!(read_only_sql("SET ROLE postgres").unwrap_err(), READ_ONLY_SQL);
+        assert_eq!(read_only_sql("/* hide */ INSERT INTO notes VALUES (1)").unwrap_err(), READ_ONLY_SQL);
+        assert_eq!(read_only_sql("EXPLAIN DROP TABLE notes").unwrap_err(), READ_ONLY_SQL);
+        assert_eq!(read_only_sql("EXPLAIN ANALYZE DELETE FROM notes").unwrap_err(), READ_ONLY_SQL);
+    }
 }
 
 // ServerHandler is emitted by tool_router. This keeps the trait in scope for readers.

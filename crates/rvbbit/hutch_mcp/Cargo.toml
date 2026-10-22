@@ -40,3 +40,4 @@ chrono = "0.4"
 
 [dev-dependencies]
 ureq = "2.12"
+hutch_mock = { path = "../hutch_mock" }

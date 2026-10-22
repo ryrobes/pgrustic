@@ -45,6 +45,9 @@ const TOOL_DDL: &str = "CREATE TABLE IF NOT EXISTS mcp.tool (
     PRIMARY KEY (nsp, name))";
 
 pub fn ensure() -> PgResult<()> {
+    if !super::catalog_writes_allowed()? {
+        return Ok(());
+    }
     ensure_schema("mcp")?;
     if !relation_exists("mcp", "server")? {
         exec(SERVER_DDL)?;
@@ -75,6 +78,13 @@ pub fn load() -> PgResult<()> {
     )?;
     if have.is_none() {
         rvbbit_resolve::install_mcp_tools(Vec::new());
+        return Ok(());
+    }
+    // mcp.server holds command lines and headers. A mapped semantic role
+    // can run MEANS without being granted that schema. Leave the process
+    // cache as it is; a role that can read mcp refreshes it.
+    let usage = scalar("SELECT has_schema_privilege(current_user, 'mcp', 'USAGE')")?;
+    if !matches!(usage.as_deref(), Some("t") | Some("true") | Some("on")) {
         return Ok(());
     }
     let rows = query(

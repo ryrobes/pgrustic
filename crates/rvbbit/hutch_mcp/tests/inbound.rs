@@ -339,6 +339,34 @@ INSERT INTO notes (owner, body) VALUES ('analyst', 'a-secret'), ('intern', 'i-se
     assert_eq!(status, 200, "{denied}");
     let denied_text = serde_json::to_string(&denied).unwrap().to_ascii_lowercase();
     assert!(denied_text.contains("read-only") || denied_text.contains("read only"), "{denied}");
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    assert!(denied.get("error").is_none(), "tool failure is an isError result, not a protocol error: {denied}");
+
+    let (_, dropped, _) = mcp(
+        &http,
+        &base,
+        access,
+        session.as_deref(),
+        8,
+        "tools/call",
+        json!({"name":"run_sql","arguments":{"sql":"DROP TABLE notes"}}),
+    );
+    let drop_text = tool_text(&dropped);
+    assert_eq!(dropped["result"]["isError"], true, "{dropped}");
+    assert!(drop_text.contains("only read-only SELECT/WITH/VALUES/EXPLAIN allowed"), "{dropped}");
+    assert!(dropped.get("error").is_none(), "{dropped}");
+
+    let (_, set_role, _) = mcp(
+        &http,
+        &base,
+        access,
+        session.as_deref(),
+        9,
+        "tools/call",
+        json!({"name":"run_sql","arguments":{"sql":"SET ROLE postgres"}}),
+    );
+    assert_eq!(set_role["result"]["isError"], true, "{set_role}");
+    assert!(tool_text(&set_role).contains("only read-only SELECT/WITH/VALUES/EXPLAIN allowed"), "{set_role}");
 
     let (status, plan, _) = mcp(
         &http,
@@ -410,6 +438,10 @@ INSERT INTO notes (owner, body) VALUES ('analyst', 'a-secret'), ('intern', 'i-se
     );
     let (status, refreshed, _) = call(&http, "POST", &format!("{base}/token"), "application/x-www-form-urlencoded", &refresh_body);
     assert_eq!(status, 200, "{refreshed}");
+    let refreshed_json: Value = serde_json::from_str(&refreshed).unwrap();
+    let refreshed_access = refreshed_json["access_token"].as_str().unwrap();
+    assert_ne!(refreshed_access, access, "refreshed access tokens must differ");
+    assert_ne!(refreshed_json["refresh_token"].as_str().unwrap(), refresh);
 
     let key = Command::new(bin())
         .args(["--issue-key", "analyst", "claude"])
@@ -442,6 +474,16 @@ INSERT INTO notes (owner, body) VALUES ('analyst', 'a-secret'), ('intern', 'i-se
 
     let audit = psql(pg_port, "SELECT count(*) FROM rvbbit.mcp_audit");
     assert!(audit.parse::<i64>().unwrap_or(0) >= 5, "{audit}");
+    let failed = psql(
+        pg_port,
+        "SELECT count(*) FROM rvbbit.mcp_audit WHERE status = 'error' AND error ILIKE '%read-only%'",
+    );
+    assert!(failed.parse::<i64>().unwrap_or(0) >= 1, "{failed}");
+    let priced = psql(
+        pg_port,
+        "SELECT count(*) FROM rvbbit.mcp_audit WHERE tool = 'run_sql' AND status = 'ok' AND cost_usd IS NOT NULL AND semantic_calls IS NOT NULL",
+    );
+    assert!(priced.parse::<i64>().unwrap_or(0) >= 1, "{priced}");
     let subjects = psql(pg_port, "SELECT string_agg(DISTINCT subject, ',') FROM rvbbit.mcp_audit");
     assert!(subjects.contains("analyst"), "{subjects}");
     assert!(subjects.contains("intern"), "{subjects}");

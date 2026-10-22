@@ -46,6 +46,9 @@ const RETRY_CAP: Duration = Duration::from_millis(2_000);
 struct Job {
     url: String,
     auth: Option<String>,
+    /// SQL `current_user` for the call log. The cache key stays the hutch
+    /// tenant; this is only the meter row `rvbbit.my_calls` filters on.
+    role: String,
     timeout_ms: u64,
     retries: u32,
     limiter: Arc<Limiter>,
@@ -53,6 +56,19 @@ struct Job {
     cache_header: String,
     audit: bool,
     reply: mpsc::Sender<Result<RawReply, String>>,
+}
+
+std::thread_local! {
+    static CALL_ROLE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Role stamped on the next hutch or MCP call from this backend thread.
+pub fn set_call_role(role: &str) {
+    CALL_ROLE.with(|slot| *slot.borrow_mut() = role.to_string());
+}
+
+pub fn call_role() -> String {
+    CALL_ROLE.with(|slot| slot.borrow().clone())
 }
 
 struct RawReply {
@@ -1563,6 +1579,7 @@ fn enqueue(
         limiter: limiter_for(&url, ep.max_concurrent),
         url,
         auth,
+        role: call_role(),
         timeout_ms: hutch_timeout_ms(),
         retries: ep.retries.max(1),
         body,
@@ -2303,6 +2320,9 @@ fn post_once(agent: &ureq::Agent, job: &Job) -> Result<String, PostErr> {
         .set("Content-Type", "application/json")
         .set(HEADER_CONTRACT, CONTRACT_VERSION)
         .set(HEADER_CACHE, &job.cache_header);
+    if !job.role.is_empty() {
+        req = req.set("X-Rvbbit-Role", &job.role);
+    }
     if job.audit {
         req = req.set("X-Rvbbit-Audit", "payloads");
     }

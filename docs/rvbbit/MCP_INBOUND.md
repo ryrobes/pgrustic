@@ -33,6 +33,24 @@ grants the authenticator DML on those tables only. User tables stay
 where they are. GRANTs and RLS are the enforcement. The server does not
 filter rows itself.
 
+Running that script before rvbbit setup does not block the catalog.
+Setup creates each missing table, view, and function on its own, even
+when schema `rvbbit` already exists. A read-only transaction, including
+`BEGIN READ ONLY` and a hot standby, does not migrate or log into the
+catalog. Call history, cost history, and the tool memo stay in memory
+(or on hutch). Install or upgrade the catalog in a read-write session.
+If it is missing, semantic SQL returns `rvbbit catalog is not installed;
+set it up in a read-write transaction`.
+
+`rvbbit_semantic_user` is a `NOLOGIN` role. Bootstrap creates it and
+grants it to every role inserted into `rvbbit.users` (a trigger covers
+rows added later). Once the catalog tables exist, that role has `USAGE`
+on schema `rvbbit` and `SELECT` on `semop`, `semfn`, `backend`, `model`,
+`decision_tree`, and `workflow`. `rvbbit.my_calls` is a security-barrier
+view of `rvbbit.calls` filtered to `tenant = current_user`. Mapped roles
+read their own rows there. The full `rvbbit.calls` log stays with the
+owner.
+
 `RVBBIT_PG_CONNINFO` is the authenticator connection, usually a local
 socket as `rvbbit_auth`. Login is a separate TCP connection as the
 person's role, with the password they typed. `pg_hba.conf` needs a
@@ -119,11 +137,17 @@ The pool is a handful of authenticator connections. One call:
 
 The mapped role does not need `INSERT` on the audit table.
 
-`run_sql` accepts one statement. `SELECT`, `WITH`, `VALUES`, and `TABLE`
-are wrapped as `SELECT * FROM (...) AS rvbbit_mcp_q LIMIT n`. `n` is
-clamped to 1..=1000 and defaults to 200. Anything else runs as written
-and is rejected by `transaction_read_only`. A `max_cost` of 0 returns
+`run_sql` accepts one statement. The command is classified before any
+`EXPLAIN` pre-flight. `SELECT`, `WITH`, `VALUES`, and `TABLE` are
+wrapped as `SELECT * FROM (...) AS rvbbit_mcp_q LIMIT n`. `EXPLAIN` of
+those commands is allowed and is not wrapped. `n` is clamped to
+1..=1000 and defaults to 200. `DROP`, `SET ROLE`, and other commands
+return `only read-only SELECT/WITH/VALUES/EXPLAIN allowed`. A tool
+failure is an `isError` result whose text is the message. It is not a
+JSON-RPC protocol error. A `max_cost` of 0 returns
 `semantic estimate exceeds budget 0` before the statement runs.
+`run_sql` reads `Semantic Total USD` and `Semantic Total Provider Calls`
+from one `EXPLAIN` and stores them on the audit row.
 
 ## Tools
 
@@ -144,8 +168,11 @@ There are no Calliope tools and no Google tools.
 
 `rvbbit.mcp_audit` gets one row per tool call: `subject`, `role`,
 `tool`, `sql_hash` (SHA-256 hex of the SQL, or NULL), `duration_ms`,
-`rows`, and `cost`. A failed call is still logged. `subject` is the
-JWT `sub` (the role name, for a password login) or the API key's name.
+`rows`, `cost`, `status` (`ok` or `error`), `error` (the message, or
+NULL), `cost_usd`, and `semantic_calls`. A failed call is still logged.
+`subject` is the JWT `sub` (the role name, for a password login) or the
+API key's name. Access tokens carry `iat` and `jti`, so a refresh is a
+different token even in the same second.
 
 ## stdio
 

@@ -173,6 +173,15 @@ ECHO=$("${PSQL[@]}" -tA -c "SELECT mcp_demo.echo('Ken Lay') = to_jsonb('Ken Lay'
 echo "echo=$ECHO"
 test "$ECHO" = "t"
 
+echo "=== count(*) over a table batches a volatile tool ==="
+"${PSQL[@]}" <<'SQL' | tee "$RUNDIR/aggtable.out"
+CREATE TABLE mcp_agg (x text);
+INSERT INTO mcp_agg SELECT 'row' FROM generate_series(1, 8);
+EXPLAIN (ANALYZE, COSTS ON) SELECT count(*) FROM (SELECT mcp_demo.echo(x) FROM mcp_agg) s;
+SQL
+grep -q 'MCP Provider Calls' "$RUNDIR/aggtable.out"
+grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/aggtable.out"
+
 RETSET=$("${PSQL[@]}" -tA -c "SELECT proretset::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'mcp_demo' AND p.proname = 'people'")
 if [[ "$RETSET" == "t" ]]; then
   "${PSQL[@]}" -c "SELECT name FROM mcp_demo.people() ORDER BY 1;" | tee "$RUNDIR/people.out"
@@ -216,8 +225,8 @@ SQL
 grep -q 'hit' "$RUNDIR/bag.out"
 
 echo "=== explain and refresh ==="
-# EXPLAIN reads the in-memory tool cache. A statement in the same session
-# loads it. A fresh backend's first statement is the documented gap.
+# Planning loads installed tools before the lift, so a fresh session
+# still prints MCP lines under an aggregate.
 "${PSQL[@]}" <<'SQL' | tee "$RUNDIR/explain.out"
 SELECT mcp_demo.echo('plan');
 EXPLAIN (ANALYZE, COSTS ON) SELECT mcp_demo.echo(x) FROM (VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('g'), ('h'), ('i'), ('j')) v(x);
@@ -232,6 +241,12 @@ grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/explain.out"
 EXPLAIN (ANALYZE, COSTS ON) SELECT count(*) FROM (SELECT mcp_demo.now() AS r FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) v(x)) s;
 SQL
 grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/subquery.out"
+# Same shape on a real table. now() stays volatile, so count(*) cannot drop it.
+"${PSQL[@]}" <<'SQL' | tee "$RUNDIR/aggnow.out"
+EXPLAIN (ANALYZE, COSTS ON) SELECT count(*) FROM (SELECT mcp_demo.now() FROM mcp_agg) s;
+SQL
+grep -q 'MCP Provider Calls' "$RUNDIR/aggnow.out"
+grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/aggnow.out"
 "${PSQL[@]}" <<'SQL' | tee "$RUNDIR/rows.out"
 CREATE TABLE mcp_rows (x text);
 INSERT INTO mcp_rows SELECT 'a' FROM generate_series(1, 10);

@@ -8508,6 +8508,7 @@ dependencies = [
  "chrono",
  "futures",
  "http",
+ "hutch_mock",
  "mcp_core",
  "pg_sha2",
  "rmcp",

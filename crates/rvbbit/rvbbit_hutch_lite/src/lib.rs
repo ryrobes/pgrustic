@@ -411,6 +411,8 @@ fn handle(mut stream: TcpStream, server: &Server) {
                 cache_header = value.trim().to_string();
             } else if name.eq_ignore_ascii_case("x-rvbbit-audit") {
                 audit_header = value.trim().to_string();
+            } else if name.eq_ignore_ascii_case("x-rvbbit-role") {
+                DISPLAY_TENANT.with(|slot| *slot.borrow_mut() = value.trim().to_string());
             }
         }
     }
@@ -434,6 +436,7 @@ fn handle(mut stream: TcpStream, server: &Server) {
         audit,
         &body,
     );
+    DISPLAY_TENANT.with(|slot| slot.borrow_mut().clear());
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
@@ -2272,7 +2275,7 @@ fn miss_meter(
         latency_ms,
         cache: "miss".into(),
         items: 1,
-        tenant: tenant.to_string(),
+        tenant: meter_tenant(tenant),
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
         node,
@@ -2314,7 +2317,7 @@ fn saved_meter(
         latency_ms: elapsed_ms(started),
         cache: cache.into(),
         items: 1,
-        tenant: tenant.to_string(),
+        tenant: meter_tenant(tenant),
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
         node,
@@ -2352,7 +2355,7 @@ fn meter_cached(
         latency_ms: elapsed_ms(started),
         cache: cache.into(),
         items: 1,
-        tenant: tenant.to_string(),
+        tenant: meter_tenant(tenant),
         timestamp: rfc3339_now(),
         generation_id: stored.generation_id.clone(),
         node,
@@ -2935,7 +2938,7 @@ fn lookup_hit_meter(tenant: &str, stored: &Scored) -> CallMeter {
         latency_ms: 0,
         cache: "hit".into(),
         items: 1,
-        tenant: tenant.to_string(),
+        tenant: meter_tenant(tenant),
         timestamp: rfc3339_now(),
         generation_id: stored.generation_id.clone(),
         node: None,
@@ -3142,6 +3145,21 @@ fn calls_json(server: &Server, limit: usize) -> String {
     let start = cache.calls.len().saturating_sub(limit);
     let calls: Vec<&CallMeter> = cache.calls.iter().skip(start).collect();
     serde_json::json!({ "calls": calls }).to_string()
+}
+
+std::thread_local! {
+    static DISPLAY_TENANT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Cache keys keep [`tenant_of`]. The call log row uses the SQL role when
+/// the client sent `X-Rvbbit-Role`, so `rvbbit.my_calls` can filter it.
+fn meter_tenant(cache_tenant: &str) -> String {
+    let display = DISPLAY_TENANT.with(|slot| slot.borrow().clone());
+    if display.is_empty() {
+        cache_tenant.to_string()
+    } else {
+        display
+    }
 }
 
 fn tenant_of(cfg: &Config, auth: &str) -> String {
