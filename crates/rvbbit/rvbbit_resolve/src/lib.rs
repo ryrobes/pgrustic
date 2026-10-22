@@ -63,6 +63,7 @@ pub struct Resolved {
 }
 
 static ENSURE: Mutex<Option<fn() -> PgResult<()>>> = Mutex::new(None);
+static LOAD: Mutex<Option<fn() -> PgResult<()>>> = Mutex::new(None);
 static EXECUTE: Mutex<Option<fn(&str) -> PgResult<()>>> = Mutex::new(None);
 static CACHE: Mutex<Cache> = Mutex::new(Cache {
     by_word: None,
@@ -120,6 +121,11 @@ pub fn set_ensure(hook: fn() -> PgResult<()>) {
     *lock_hooks(&ENSURE) = Some(hook);
 }
 
+/// Read-only catalog refresh used by the planner. No DDL.
+pub fn set_load_installed(hook: fn() -> PgResult<()>) {
+    *lock_hooks(&LOAD) = Some(hook);
+}
+
 pub fn set_execute(hook: fn(&str) -> PgResult<()>) {
     *lock_hooks(&EXECUTE) = Some(hook);
 }
@@ -142,16 +148,34 @@ pub fn enum_labels(type_name: &str) -> PgResult<Vec<String>> {
 
 /// Create the catalog schema if this statement needs it, then refresh the
 /// process cache from `rvbbit.*`. No-op until [`set_ensure`].
+///
+/// The hook lock is dropped before the hook runs. The hook uses SPI, and
+/// planning that SQL reenters this function on the same thread.
 pub fn ensure() -> PgResult<()> {
-    if let Some(hook) = *lock_hooks(&ENSURE) {
-        hook()?;
+    let hook = *lock_hooks(&ENSURE);
+    match hook {
+        Some(hook) => hook(),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Load `rvbbit.semfn` and `mcp.tool` when those tables already exist.
+/// Does not create them. No-op until [`set_load_installed`].
+///
+/// The hook lock is dropped before the hook runs. Holding it across SPI
+/// deadlocks: the catalog SELECT is planned by reentering `load_installed`.
+pub fn load_installed() -> PgResult<()> {
+    let hook = *lock_hooks(&LOAD);
+    match hook {
+        Some(hook) => hook(),
+        None => Ok(()),
+    }
 }
 
 /// Run one rvbbit DDL statement. No-op-error until [`set_execute`].
 pub fn execute(sql: &str) -> PgResult<()> {
-    match *lock_hooks(&EXECUTE) {
+    let hook = *lock_hooks(&EXECUTE);
+    match hook {
         Some(hook) => hook(sql),
         None => Err(Box::new(types_error::PgError::error(
             "rvbbit catalog hook is not installed".to_string(),

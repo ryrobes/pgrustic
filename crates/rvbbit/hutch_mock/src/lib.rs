@@ -231,6 +231,7 @@ fn handle(mut stream: TcpStream, cfg: &Config, stats: &Stats) {
     let mut is_post = false;
     let mut path = String::new();
     let mut auth = String::new();
+    let mut role = String::new();
     for (i, line) in header.lines().enumerate() {
         if i == 0 {
             let mut parts = line.split_whitespace();
@@ -242,6 +243,8 @@ fn handle(mut stream: TcpStream, cfg: &Config, stats: &Stats) {
                 content_length = v.1.trim().parse().unwrap_or(0);
             } else if v.0.eq_ignore_ascii_case("authorization") {
                 auth = v.1.trim().to_string();
+            } else if v.0.eq_ignore_ascii_case("x-rvbbit-role") {
+                role = v.1.trim().to_string();
             }
         }
     }
@@ -259,7 +262,7 @@ fn handle(mut stream: TcpStream, cfg: &Config, stats: &Stats) {
         thread::sleep(cfg.latency);
     }
 
-    let (status, extra, payload) = route(is_post, &path, &auth, &body, cfg, stats);
+    let (status, extra, payload) = route(is_post, &path, &auth, &role, &body, cfg, stats);
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
@@ -300,6 +303,7 @@ fn route(
     is_post: bool,
     path: &str,
     auth: &str,
+    role: &str,
     body: &[u8],
     cfg: &Config,
     stats: &Stats,
@@ -364,7 +368,7 @@ fn route(
             .iter()
             .map(|item| {
                 let (value, score) = mock_scored(op, item);
-                let meter = mock_meter(op);
+                let meter = mock_meter(op, role);
                 logged.push(meter.clone());
                 ItemResponse {
                     key: item.key.clone(),
@@ -393,7 +397,7 @@ fn route(
 
 /// One miss at the jev seed price so EXPLAIN ANALYZE can show USD.
 /// 300 billed tokens at $0.042 per million.
-fn mock_meter(op: Operation) -> CallMeter {
+fn mock_meter(op: Operation, role: &str) -> CallMeter {
     let name = match op {
         Operation::Predict => "predict",
         Operation::Classify => "classify",
@@ -420,7 +424,7 @@ fn mock_meter(op: Operation) -> CallMeter {
         latency_ms: 1,
         cache: "miss".into(),
         items: 1,
-        tenant: "mock".into(),
+        tenant: if role.is_empty() { "mock".into() } else { role.to_string() },
         timestamp: "1970-01-01T00:00:00.000Z".into(),
         generation_id: None,
         identical: None,

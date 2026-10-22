@@ -59,6 +59,13 @@ pub fn expr_contains_means(node: Node<'_>) -> bool {
     }
 }
 
+/// Fill the tool and user-function caches. Called from `pg_plan_query`,
+/// before `planner`. SPI from inside `planner` reenters it and deadlocks.
+/// A cold cache left `count(*)` over a subquery on the serial scan path.
+pub fn load_installed_cache() -> PgResult<()> {
+    rvbbit_resolve::load_installed()
+}
+
 /// Walk `plan` and wrap any base scan whose qual contains MEANS.
 pub fn lift_semantic_filters<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Node<'mcx>> {
     let plan = lift_tree(mcx, plan)?;
@@ -598,10 +605,32 @@ fn func_is_mcp_project(func: &FuncExpr<'_>) -> bool {
     if func.funcretset {
         return false;
     }
-    match rvbbit_resolve::mcp_tool_by_oid(func.funcid) {
-        Some(tool) => !tool.returns_table,
-        None => false,
+    if let Some(tool) = rvbbit_resolve::mcp_tool_by_oid(func.funcid) {
+        return !tool.returns_table;
     }
+    // An inlined SQL body is `rvbbit.mcp_invoke_text`. The tool's own
+    // function is recognized from the cache `load_installed` fills
+    // before this walk. Do not look up prosrc here: that seam needs a
+    // live memory context, and a cold cache is filled by the load.
+    if !syscache_seams::pg_proc_proname::is_installed()
+        || !syscache_seams::lookup_pg_proc_shape::is_installed()
+        || !syscache_seams::pg_namespace_nspname::is_installed()
+    {
+        return false;
+    }
+    let Ok(Some(name)) = syscache_seams::pg_proc_proname::call(func.funcid) else {
+        return false;
+    };
+    if name.name_str() != b"mcp_invoke_text" {
+        return false;
+    }
+    let Ok(Some(shape)) = syscache_seams::lookup_pg_proc_shape::call(func.funcid) else {
+        return false;
+    };
+    let Ok(Some(ns)) = syscache_seams::pg_namespace_nspname::call(shape.pronamespace) else {
+        return false;
+    };
+    ns.name_str() == b"rvbbit"
 }
 
 /// A catalog function whose body is `rvbbit_user`. The Result batcher

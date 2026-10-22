@@ -150,6 +150,7 @@ pub fn init_seams() {
     planner_seams::planner::set(|mcx, parse, query_string, cursor_options, bound_params| {
         planner(mcx, parse, query_string, cursor_options, bound_params)
     });
+    planner_seams::preload_installed_cache::set(preload_installed_cache);
     // find_simplified_clause's gate (rangetypes.c): volatile / subplan /
     // >10*cpu_operator_cost elemExprs must not be evaluated twice. Deliberate
     // divergence from rangetypes.c:2910 cost_qual_eval_node(root): with the
@@ -293,6 +294,13 @@ seam_core::tap!(
     )
 );
 
+/// Fill the installed-tool cache. Callers must be outside `planner`:
+/// the catalog SELECT is itself planned by `planner`, and a nested call
+/// deadlocks.
+pub fn preload_installed_cache() -> PgResult<()> {
+    rvbbit_plan::load_installed_cache()
+}
+
 pub fn planner<'mcx>(
     mcx: Mcx<'mcx>,
     parse: &'mcx mut Query<'mcx>,
@@ -300,6 +308,8 @@ pub fn planner<'mcx>(
     cursor_options: i32,
     bound_params: ParamListHandle,
 ) -> PgResult<PlannedStmt<'mcx>> {
+    // Do not SPI here. A catalog SELECT is planned by reentering `planner`,
+    // and that reentry deadlocks. `pg_plan_query` loads the cache first.
     let (query_id, stmt_location, stmt_len) = (parse.queryId, parse.stmt_location, parse.stmt_len);
     tap_planner_enter::call_if(|f| f(query_id));
     let result = standard_planner(mcx, parse, query_string, cursor_options, bound_params);

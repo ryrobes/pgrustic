@@ -1345,6 +1345,12 @@ fn build_stmt_list(
     }
 
     let plan = |mcx: Mcx<'static>| -> PgResult<PgVec<'static, PlannedStmt<'static>>> {
+        // Same preload as pg_plan_query. Extended-protocol plans never enter
+        // that function. A nested catalog plan hits the catalog guard and
+        // does not SPI again.
+        if planner_seams::preload_installed_cache::is_installed() {
+            planner_seams::preload_installed_cache::call()?;
+        }
         let mut stmts: PgVec<'static, PlannedStmt<'static>> = PgVec::new_in(mcx);
         stmts
             .try_reserve_exact(query_list.len())

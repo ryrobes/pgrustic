@@ -124,11 +124,87 @@ fn ensure_m6_ops() -> PgResult<()> {
 }
 
 pub fn ensure_and_load() -> PgResult<()> {
+    let Some(_guard) = CatalogGuard::enter() else {
+        return Ok(());
+    };
+    // Call log, cost history, and the tool memo stay in process memory
+    // (or on hutch). This path must not INSERT into the user transaction:
+    // semantic SQL runs under `transaction_read_only` and on a hot standby.
     ensure_schema()?;
-    bootstrap_means()?;
-    ensure_about()?;
-    ensure_score_shim()?;
+    note_call_role()?;
+    if catalog_writes_allowed()? {
+        bootstrap_means()?;
+        ensure_about()?;
+        ensure_score_shim()?;
+    } else {
+        bootstrap_means_readonly()?;
+    }
     reload()
+}
+
+/// Planner refresh. Selects the catalog when it is already installed and
+/// does not take an advisory lock or run DDL.
+pub fn load_installed() -> PgResult<()> {
+    if CATALOG_LOADED.with(|loaded| loaded.get()) {
+        return Ok(());
+    }
+    let Some(_guard) = CatalogGuard::enter() else {
+        return Ok(());
+    };
+    note_call_role()?;
+    // `semfn` is created before `semop`. A plan started between those two
+    // statements must not reload: the join targets `semop`.
+    if relation_exists("rvbbit", "semfn")? && relation_exists("rvbbit", "semop")? {
+        reload()?;
+        CATALOG_LOADED.with(|loaded| loaded.set(true));
+    } else if relation_exists("mcp", "tool")? {
+        mcp::load()?;
+        CATALOG_LOADED.with(|loaded| loaded.set(true));
+    }
+    Ok(())
+}
+
+std::thread_local! {
+    static CATALOG_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CATALOG_LOADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct CatalogGuard;
+
+impl CatalogGuard {
+    fn enter() -> Option<Self> {
+        if CATALOG_BUSY.with(|busy| busy.replace(true)) {
+            None
+        } else {
+            Some(CatalogGuard)
+        }
+    }
+}
+
+impl Drop for CatalogGuard {
+    fn drop(&mut self) {
+        CATALOG_BUSY.with(|busy| busy.set(false));
+    }
+}
+
+fn note_call_role() -> PgResult<()> {
+    if let Some(role) = scalar("SELECT current_user")? {
+        if !role.is_empty() {
+            rvbbit_dispatch::set_call_role(&role);
+        }
+    }
+    Ok(())
+}
+
+/// True when this transaction can run DDL. Read-only transactions and hot
+/// standbys cannot, including `BEGIN READ ONLY` and recovery.
+pub(crate) fn catalog_writes_allowed() -> PgResult<bool> {
+    let ro = scalar("SELECT current_setting('transaction_read_only')")?;
+    if matches!(ro.as_deref(), Some("on") | Some("true") | Some("t")) {
+        return Ok(false);
+    }
+    let recovery = scalar("SELECT pg_is_in_recovery()")?;
+    Ok(!matches!(recovery.as_deref(), Some("on") | Some("true") | Some("t")))
 }
 
 /// Run the latest stored workflow, or `version` when it is set.
@@ -200,7 +276,19 @@ pub fn semfn_def(name: &str) -> PgResult<Option<String>> {
     Ok(rows.into_iter().next().map(|r| render_function(&r)))
 }
 
+fn bootstrap_means_readonly() -> PgResult<()> {
+    if !relation_exists("rvbbit", "semop")? {
+        return Err(pg(
+            "rvbbit catalog is not installed; set it up in a read-write transaction",
+        ));
+    }
+    Ok(())
+}
+
 fn bootstrap_means() -> PgResult<()> {
+    if !relation_exists("rvbbit", "semop")? {
+        return Ok(());
+    }
     if scalar("SELECT 1 FROM rvbbit.semop WHERE word = 'means'")?.is_some() {
         return Ok(());
     }
@@ -377,6 +465,11 @@ fn reload() -> PgResult<()> {
 }
 
 fn load_trees() -> PgResult<()> {
+    // Install creates `semfn` before `decision_tree`. A reload from the
+    // planner between those statements has no tree table yet.
+    if !relation_exists("rvbbit", "decision_tree")? {
+        return Ok(());
+    }
     let rows = query(
         "SELECT t.name, t.nodes::text, COALESCE(t.version, 1)::text, \
                 COALESCE(m.remote_name, ''), \
@@ -1226,13 +1319,15 @@ fn proc_body(args: &[Arg], returns: &str, clauses: &FnClauses) -> PgResult<&'sta
 }
 
 fn ensure_schema() -> PgResult<()> {
-    exec("SELECT pg_catalog.pg_advisory_xact_lock(910001)")?;
-    let have = scalar("SELECT 1 FROM pg_namespace WHERE nspname = 'rvbbit'")?;
-    if have.is_none() {
-        for sql in SCHEMA_DDL {
-            exec(sql)?;
-        }
+    if !catalog_writes_allowed()? {
+        return require_core_tables();
     }
+    if schema_current()? && !pending_user_grants()? {
+        return Ok(());
+    }
+    // Advisory xact locks fail on a hot standby. Writers only.
+    exec("SELECT pg_catalog.pg_advisory_xact_lock(910001)")?;
+    install_base_objects()?;
     // Clusters created before fixed-label classify have no labels column.
     // Skip the ALTER when the column is already there. ADD COLUMN IF NOT
     // EXISTS still emits a notice, and ensure runs on ordinary queries.
@@ -1352,6 +1447,131 @@ fn ensure_schema() -> PgResult<()> {
         }
     }
     ensure_call_shims()?;
+    ensure_grants()?;
+    Ok(())
+}
+
+fn require_core_tables() -> PgResult<()> {
+    for rel in ["backend", "model", "semfn", "semop", "decision_tree", "workflow"] {
+        if !relation_exists("rvbbit", rel)? {
+            return Err(pg(
+                "rvbbit catalog is not installed; set it up in a read-write transaction",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn schema_current() -> PgResult<bool> {
+    Ok(relation_exists("rvbbit", "semfn")?
+        && relation_exists("rvbbit", "semop")?
+        && relation_exists("rvbbit", "workflow")?
+        && relation_exists("rvbbit", "my_calls")?
+        && relation_exists("mcp", "tool")?
+        && catalog_column("semfn", "clauses")?
+        && catalog_column("calls", "server")?
+        && scalar("SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_semantic_user'")?.is_some()
+        && !proc_missing("flow", "rvbbit_flow", 3)?
+        && !proc_missing("mcp_invoke_text", "rvbbit_mcp_invoke_text", 5)?)
+}
+
+fn pending_user_grants() -> PgResult<bool> {
+    if !relation_exists("rvbbit", "users")? {
+        return Ok(false);
+    }
+    if scalar("SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_semantic_user'")?.is_none() {
+        return Ok(true);
+    }
+    Ok(scalar(
+        "SELECT 1 FROM rvbbit.users u \
+         WHERE EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = u.role) \
+           AND NOT pg_has_role(u.role::name, 'rvbbit_semantic_user'::name, 'member')",
+    )?
+    .is_some())
+}
+
+/// Each object is created when it is missing. A schema left behind by
+/// `bootstrap.sql` does not skip the tables.
+fn install_base_objects() -> PgResult<()> {
+    if scalar("SELECT 1 FROM pg_namespace WHERE nspname = 'rvbbit'")?.is_none() {
+        exec(SCHEMA_DDL[0])?;
+    }
+    // SCHEMA_DDL: 0 schema, 1 sequence, 2..7 tables, 8..13 views.
+    let rels = ["oid_seq", "backend", "model", "semfn", "semop", "decision_tree", "workflow"];
+    for (i, rel) in rels.iter().enumerate() {
+        if !relation_exists("rvbbit", rel)? {
+            exec(SCHEMA_DDL[i + 1])?;
+        }
+    }
+    let views = [
+        "backends",
+        "models",
+        "semantic_functions",
+        "semantic_operators",
+        "decision_trees",
+        "workflows",
+    ];
+    for (i, rel) in views.iter().enumerate() {
+        if !relation_exists("rvbbit", rel)? {
+            exec(SCHEMA_DDL[rels.len() + 1 + i])?;
+        }
+    }
+    Ok(())
+}
+
+fn relation_exists(nsp: &str, rel: &str) -> PgResult<bool> {
+    Ok(scalar(&format!(
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {} AND c.relname = {}",
+        qlit(nsp),
+        qlit(rel)
+    ))?
+    .is_some())
+}
+
+const MY_CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.my_calls WITH (security_barrier = true) AS \
+    SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
+           latency_ms, provider_latency_ms, cache, items, tenant, \
+           generation_id, node, score, identical, server, tool, status, ts \
+    FROM rvbbit.calls \
+    WHERE tenant = current_user";
+
+fn ensure_grants() -> PgResult<()> {
+    exec(
+        "DO $rvbbit_role$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_semantic_user') THEN \
+             CREATE ROLE rvbbit_semantic_user NOLOGIN; \
+           END IF; \
+         END $rvbbit_role$",
+    )?;
+    exec("GRANT USAGE ON SCHEMA rvbbit TO rvbbit_semantic_user")?;
+    exec(
+        "GRANT SELECT ON rvbbit.semop, rvbbit.semfn, rvbbit.backend, rvbbit.model, \
+         rvbbit.decision_tree, rvbbit.workflow TO rvbbit_semantic_user",
+    )?;
+    if !relation_exists("rvbbit", "calls")? {
+        exec(CALLS_VIEW)?;
+    }
+    exec(MY_CALLS_VIEW)?;
+    exec("GRANT SELECT ON rvbbit.my_calls TO rvbbit_semantic_user")?;
+    if !relation_exists("rvbbit", "users")? {
+        return Ok(());
+    }
+    let roles = query(
+        "SELECT u.role FROM rvbbit.users u \
+         WHERE EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = u.role) \
+           AND NOT pg_has_role(u.role::name, 'rvbbit_semantic_user'::name, 'member')",
+    )?;
+    for row in roles {
+        let Some(Some(role)) = row.first() else { continue };
+        if role.is_empty() {
+            continue;
+        }
+        exec(&format!(
+            "GRANT rvbbit_semantic_user TO {}",
+            qident(role)
+        ))?;
+    }
     Ok(())
 }
 
@@ -2128,6 +2348,17 @@ fn ensure_about() -> PgResult<()> {
 /// Move a stored default of 0.40, or a missing threshold, onto
 /// [`ABOUT_THRESHOLD`]. Any other number was chosen on purpose.
 fn refresh_about_default_threshold() -> PgResult<()> {
+    if !catalog_writes_allowed()? {
+        return Ok(());
+    }
+    let stale = scalar(
+        "SELECT 1 FROM rvbbit.semfn \
+         WHERE nsp = 'rvbbit' AND name = 'about' \
+           AND (threshold IS NULL OR abs(threshold - 0.40) < 0.0000001)",
+    )?;
+    if stale.is_none() {
+        return Ok(());
+    }
     exec(&format!(
         "UPDATE rvbbit.semfn SET threshold = {new} \
          WHERE nsp = 'rvbbit' AND name = 'about' \
@@ -2181,6 +2412,12 @@ fn scalar(sql: &str) -> PgResult<Option<String>> {
 
 fn query(sql: &str) -> PgResult<Vec<Vec<Option<String>>>> {
     with_spi(|| {
+        // read_only=false so a SELECT sees rows this transaction just
+        // inserted (backend, then model). The statement is still a SELECT:
+        // a read-only transaction and a hot standby accept it. read_only=true
+        // kept the caller's snapshot and hid those rows, so install skipped
+        // the semantic function and the next statement reported
+        // `backend "hutch" does not exist`.
         let code = spi::SPI_execute(sql, false, 0)?;
         if code != spi::SPI_OK_SELECT {
             return Err(pg(format!("expected a row set from {sql}")));

@@ -182,6 +182,7 @@ Postgres. Live mode is not part of the mock gate.
   schema order inside each group.
 - Streamable HTTP uses rustls. A plaintext `http://` URL still works.
   The gateway listens with `SO_REUSEADDR`.
-- `EXPLAIN` for a fresh backend that has not loaded the rvbbit catalog
-  yet does not print MCP lines. `IMPORT` in the same session does.
+- Planning loads installed MCP tools before it lifts a project call,
+  including the first statement of a fresh backend. A subquery or
+  aggregate over a table batches the same way a `VALUES` scan does.
 - The mock `now` tool is not a real RFC3339 timestamp.

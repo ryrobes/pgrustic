@@ -23,6 +23,12 @@ seam_core::seam!(
     ) -> PgResult<PlannedStmt<'mcx>>
 );
 
+/// Installed-tool cache fill. Must run outside `planner`: the catalog
+/// SELECT is planned by reentering `planner`, which deadlocks.
+seam_core::seam!(
+    pub fn preload_installed_cache() -> PgResult<()>
+);
+
 /// amcostestimate output shape (C fills the out-params of the AM handler).
 pub struct AmCostEstimate {
     pub index_startup_cost: f64,

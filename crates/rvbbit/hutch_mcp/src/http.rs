@@ -191,7 +191,7 @@ fn call_batch(body: &Value) -> Value {
             continue;
         }
         if let Err(message) = cost_gate(&opts) {
-            results[i] = error_row(&spec, &tool, &message, 0, "miss");
+            results[i] = error_row(&spec, &tool, &message, 0, "miss", &opts.role);
             continue;
         }
         pending.push((i, tool, arguments));
@@ -206,7 +206,7 @@ fn call_batch(body: &Value) -> Value {
             }
             Err(message) => {
                 for (idx, tool, _) in pending {
-                    results[idx] = error_row(&spec, &tool, &message, 0, "miss");
+                    results[idx] = error_row(&spec, &tool, &message, 0, "miss", &opts.role);
                 }
             }
         }
@@ -221,6 +221,7 @@ struct Opts {
     read_only: bool,
     max_cost: Option<f64>,
     concurrency: usize,
+    role: String,
 }
 
 fn opts_of(body: &Value, spec: &ServerSpec) -> Opts {
@@ -231,6 +232,7 @@ fn opts_of(body: &Value, spec: &ServerSpec) -> Opts {
         read_only: body.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false),
         max_cost: body.get("max_cost").and_then(|v| v.as_f64()),
         concurrency: body.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
+        role: body.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(),
     }
 }
 
@@ -243,7 +245,7 @@ fn invoke(spec: &ServerSpec, tool: &str, arguments: Value, opts: &Opts) -> Value
         return hit;
     }
     if let Err(message) = cost_gate(opts) {
-        return error_row(spec, tool, &message, 0, "miss");
+        return error_row(spec, tool, &message, 0, "miss", &opts.role);
     }
     let mut last = String::new();
     let started = Instant::now();
@@ -263,7 +265,7 @@ fn invoke(spec: &ServerSpec, tool: &str, arguments: Value, opts: &Opts) -> Value
         }
     }
     let latency = started.elapsed().as_millis() as u64;
-    error_row(spec, tool, &last, latency, "miss")
+    error_row(spec, tool, &last, latency, "miss", &opts.role)
 }
 
 fn finish(
@@ -285,9 +287,9 @@ fn finish(
                     Instant::now(),
                 );
             }
-            ok_row(spec, tool, value, latency_ms, "miss")
+            ok_row(spec, tool, value, latency_ms, "miss", &opts.role)
         }
-        Err(message) => error_row(spec, tool, &display_error(&message), latency_ms, "miss"),
+        Err(message) => error_row(spec, tool, &display_error(&message), latency_ms, "miss", &opts.role),
     }
 }
 
@@ -299,7 +301,7 @@ fn cache_get(spec: &ServerSpec, tool: &str, arguments: &Value, opts: &Opts) -> O
     let hit = guard.cache.get(&cache_key(spec, tool, arguments), Instant::now())?;
     drop(guard);
     let value = serde_json::from_str(&hit).unwrap_or(Value::String(hit));
-    Some(ok_row(spec, tool, value, 0, "hit"))
+    Some(ok_row(spec, tool, value, 0, "hit", &opts.role))
 }
 
 fn cache_key(spec: &ServerSpec, tool: &str, arguments: &Value) -> String {
@@ -318,8 +320,8 @@ fn cost_gate(opts: &Opts) -> Result<(), String> {
     }
 }
 
-fn ok_row(spec: &ServerSpec, tool: &str, value: Value, latency_ms: u64, cache: &str) -> Value {
-    let meter = meter(spec, tool, latency_ms, cache, "ok");
+fn ok_row(spec: &ServerSpec, tool: &str, value: Value, latency_ms: u64, cache: &str, role: &str) -> Value {
+    let meter = meter(spec, tool, latency_ms, cache, "ok", role);
     json!({
         "value": value,
         "error": null,
@@ -330,8 +332,8 @@ fn ok_row(spec: &ServerSpec, tool: &str, value: Value, latency_ms: u64, cache: &
     })
 }
 
-fn error_row(spec: &ServerSpec, tool: &str, message: &str, latency_ms: u64, cache: &str) -> Value {
-    let meter = meter(spec, tool, latency_ms, cache, "error");
+fn error_row(spec: &ServerSpec, tool: &str, message: &str, latency_ms: u64, cache: &str, role: &str) -> Value {
+    let meter = meter(spec, tool, latency_ms, cache, "error", role);
     json!({
         "value": null,
         "error": message,
@@ -342,7 +344,7 @@ fn error_row(spec: &ServerSpec, tool: &str, message: &str, latency_ms: u64, cach
     })
 }
 
-fn meter(spec: &ServerSpec, tool: &str, latency_ms: u64, cache: &str, status: &str) -> CallMeter {
+fn meter(spec: &ServerSpec, tool: &str, latency_ms: u64, cache: &str, status: &str, role: &str) -> CallMeter {
     let row = CallMeter {
         op: "mcp".into(),
         model: format!("mcp:{}/{}", spec.name, tool),
@@ -354,7 +356,7 @@ fn meter(spec: &ServerSpec, tool: &str, latency_ms: u64, cache: &str, status: &s
         latency_ms,
         cache: cache.into(),
         items: 1,
-        tenant: String::new(),
+        tenant: role.to_string(),
         timestamp: stamp(),
         generation_id: Some(status.into()),
         identical: None,

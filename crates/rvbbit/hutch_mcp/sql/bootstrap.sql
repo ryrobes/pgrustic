@@ -58,9 +58,79 @@ CREATE TABLE IF NOT EXISTS rvbbit.mcp_audit (
     sql_hash text,
     duration_ms integer NOT NULL,
     rows integer,
-    cost double precision
+    cost double precision,
+    status text,
+    error text,
+    cost_usd double precision,
+    semantic_calls double precision
 );
+
+ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS error text;
+ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS cost_usd double precision;
+ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS semantic_calls double precision;
 
 GRANT USAGE ON SCHEMA rvbbit TO rvbbit_auth;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA rvbbit TO rvbbit_auth;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA rvbbit TO rvbbit_auth;
+
+-- Mapped warehouse roles. Object privileges wait until the catalog
+-- tables exist (rvbbit setup creates them per relation). Membership is
+-- granted here, including for rows inserted after this script.
+DO $rvbbit_sem_role$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_semantic_user') THEN
+        CREATE ROLE rvbbit_semantic_user NOLOGIN;
+    END IF;
+END
+$rvbbit_sem_role$;
+
+DO $rvbbit_sem_grant$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rvbbit' AND c.relname = 'semfn'
+    ) THEN
+        GRANT USAGE ON SCHEMA rvbbit TO rvbbit_semantic_user;
+        GRANT SELECT ON rvbbit.semop, rvbbit.semfn, rvbbit.backend, rvbbit.model,
+            rvbbit.decision_tree, rvbbit.workflow TO rvbbit_semantic_user;
+    END IF;
+END
+$rvbbit_sem_grant$;
+
+CREATE OR REPLACE FUNCTION rvbbit.grant_semantic_user() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    BEGIN
+        EXECUTE format('GRANT rvbbit_semantic_user TO %I', NEW.role);
+    EXCEPTION
+        WHEN undefined_object OR insufficient_privilege THEN
+            NULL;
+    END;
+    RETURN NEW;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS grant_semantic_user ON rvbbit.users;
+CREATE TRIGGER grant_semantic_user
+    AFTER INSERT ON rvbbit.users
+    FOR EACH ROW
+    EXECUTE FUNCTION rvbbit.grant_semantic_user();
+
+DO $rvbbit_sem_members$
+DECLARE
+    r text;
+BEGIN
+    FOR r IN SELECT role FROM rvbbit.users LOOP
+        BEGIN
+            EXECUTE format('GRANT rvbbit_semantic_user TO %I', r);
+        EXCEPTION
+            WHEN undefined_object OR insufficient_privilege THEN
+                NULL;
+        END;
+    END LOOP;
+END
+$rvbbit_sem_members$;
