@@ -317,7 +317,7 @@ struct IdClaims {
     email_verified: Option<bool>,
 }
 
-pub(crate) fn verify_id_token(token: &str, keys: &[Jwk], issuer: &str, audience: &str, nonce: &str) -> Result<IdClaims, String> {
+fn verify_id_token(token: &str, keys: &[Jwk], issuer: &str, audience: &str, nonce: &str) -> Result<IdClaims, String> {
     let mut parts = token.split('.');
     let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
