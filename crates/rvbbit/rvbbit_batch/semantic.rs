@@ -1,5 +1,9 @@
 //! Semantic batch execution for a Result node whose qual is `rvbbit_means`.
 //!
+//! This file is compiled as `execmain::semantic` (`#[path]` in that crate).
+//! It is not a separate crate: the loop calls `exec_proc_node` and the
+//! Result lanes, and a real crate dependency would cycle.
+//!
 //! Rows are pulled from the child (which already applied the cheap quals),
 //! projected, and grouped into batches (32 by default, from the backend
 //! row). Up to that backend's concurrency (4 by default) are in flight.
