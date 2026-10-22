@@ -98,6 +98,10 @@ to these expressions.
    `rvbbit.extract_typed`. The check is `proname` plus `prosrc`, so a
    user function with a different signature can share the name.
 
+The operator, the `rvbbit.*` function, and `rvbbit.flow` are the three
+pg_rvbbit call styles. [MIGRATION.md](MIGRATION.md) maps each one onto
+the expressions above.
+
 ## SemanticBatch
 
 The Result node is the batch node. Both variants dedupe, keep child

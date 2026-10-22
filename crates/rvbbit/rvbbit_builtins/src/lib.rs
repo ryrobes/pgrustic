@@ -11,7 +11,8 @@ use rvbbit_oids::{
     CLAUSE_BOOL_NAME, CLAUSE_BOOL_OID, CLAUSE_SCORE_NAME, CLAUSE_SCORE_OID, CLAUSE_TEXT_NAME,
     CLAUSE_TEXT_OID, CONSENSUS_FINAL_NAME, CONSENSUS_FINAL_OID, CONSENSUS_TRANS_NAME,
     CONSENSUS_TRANS_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_MANY_NAME,
-    EXTRACT_MANY_OID, EXTRACT_NAME, EXTRACT_OID, EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, GETDEF_NAME,
+    EXTRACT_MANY_OID, EXTRACT_NAME, EXTRACT_OID, EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, FLOW_NAME,
+    FLOW_OID, GETDEF_NAME,
     GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_FOR_NAME,
     RERANK_FOR_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID, SUMMARIZE_FINAL_NAME,
     SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID, SUMMARIZE_TRANS_NAME,
@@ -133,8 +134,10 @@ pub fn rvbbit_decide(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgR
     )?))
 }
 
-/// Native `CLASSIFY(x INTO ...)`. `labels` is U+001F-separated. A null
-/// fallback means a model error is raised. The SQL result is the label.
+/// Native `CLASSIFY(x INTO ...)` and `rvbbit.classify(input, labels)`.
+/// Three arguments: `labels` is U+001F-separated and `fallback` may be
+/// null. Two arguments: `labels` may be comma-separated, and a model
+/// error is raised. The SQL result is the label.
 pub fn rvbbit_classify_labels(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     rvbbit_resolve::ensure()?;
     let Some(input) = arg_text(fcinfo, 0)? else {
@@ -145,13 +148,13 @@ pub fn rvbbit_classify_labels(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinf
             "CLASSIFY requires a label list".to_string(),
         )));
     };
-    let labels: Vec<String> = raw.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    let labels = rvbbit_dispatch::split_classify_labels(&raw);
     if labels.len() < 2 {
         return Err(Box::new(types_error::PgError::error(
             "CLASSIFY needs at least two labels".to_string(),
         )));
     }
-    let fallback = arg_text(fcinfo, 2)?;
+    let fallback = if fcinfo.nargs() >= 3 { arg_text(fcinfo, 2)? } else { None };
     let key = rvbbit_dispatch::scalar_key_classify(&labels);
     if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &input) {
         return apply_scalar(fcinfo, fallback, hit);
@@ -196,13 +199,25 @@ pub fn rvbbit_classify_enum(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo)
 /// `ON ERROR` supplies the text used when the model or the parse fails.
 pub fn rvbbit_extract_typed(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     rvbbit_resolve::ensure()?;
-    let Some(kind) = arg_text(fcinfo, 0)? else {
-        return Ok(fcinfo.return_null());
+    // The native call is `(kind, input, fallback)`. `rvbbit.extract(input, kind)`
+    // is the two-argument function-call form and has no fallback.
+    let (kind, input, fallback) = if fcinfo.nargs() == 2 {
+        let Some(input) = arg_text(fcinfo, 0)? else {
+            return Ok(fcinfo.return_null());
+        };
+        let Some(kind) = arg_text(fcinfo, 1)? else {
+            return Ok(fcinfo.return_null());
+        };
+        (kind, input, None)
+    } else {
+        let Some(kind) = arg_text(fcinfo, 0)? else {
+            return Ok(fcinfo.return_null());
+        };
+        let Some(input) = arg_text(fcinfo, 1)? else {
+            return Ok(fcinfo.return_null());
+        };
+        (kind, input, arg_text(fcinfo, 2)?)
     };
-    let Some(input) = arg_text(fcinfo, 1)? else {
-        return Ok(fcinfo.return_null());
-    };
-    let fallback = arg_text(fcinfo, 2)?;
     let key = rvbbit_dispatch::scalar_key_extract(&kind);
     if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &input) {
         return apply_scalar(fcinfo, fallback, hit);
@@ -527,6 +542,22 @@ pub fn rvbbit_restore_sql(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -
     Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), msg.as_bytes())?))
 }
 
+/// `rvbbit.flow(name, input)` runs the latest stored workflow. A third
+/// argument is the version. The body is native SQL; `{{input}}` and the
+/// first workflow argument are the row.
+pub fn rvbbit_flow(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let name = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let input = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let version = if fcinfo.nargs() >= 3 && !fcinfo.argisnull(2) {
+        Some(i64::from(fcinfo.arg_i32(2)))
+    } else {
+        None
+    };
+    let text = rvbbit_catalog::run_flow(&name, &input, version)?;
+    text_datum(fcinfo, &text)
+}
+
 pub fn rvbbit_get_semfn_def(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     // SAFETY: strict, so the argument is non-null text.
     let arg = unsafe { fcinfo.arg_varlena_packed(0)?.data() };
@@ -740,6 +771,14 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: false,
         retset: false,
         func: rvbbit_clause_text as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: FLOW_OID,
+        name: FLOW_NAME,
+        nargs: 2,
+        strict: true,
+        retset: false,
+        func: rvbbit_flow as PGFunction,
     },
     FmgrBuiltin {
         foid: SIMILARITY_OID,

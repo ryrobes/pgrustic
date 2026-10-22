@@ -123,7 +123,36 @@ pub fn ensure_and_load() -> PgResult<()> {
     ensure_schema()?;
     bootstrap_means()?;
     ensure_about()?;
+    ensure_score_shim()?;
     reload()
+}
+
+/// Run the latest stored workflow, or `version` when it is set.
+/// `{{input}}` and the first declared argument receive `input`. The
+/// statement is one `SELECT` / `WITH` / `VALUES`, or an expression wrapped
+/// as `SELECT (expr)`. The first column of the first row is the result.
+pub fn run_flow(name: &str, input: &str, version: Option<i64>) -> PgResult<String> {
+    ensure_schema()?;
+    let lookup = match version {
+        Some(v) => format!(
+            "SELECT args, body FROM rvbbit.workflow WHERE name = {} AND version = {v}",
+            qlit(name)
+        ),
+        None => format!(
+            "SELECT args, body FROM rvbbit.workflow WHERE name = {} ORDER BY version DESC LIMIT 1",
+            qlit(name)
+        ),
+    };
+    let Some(row) = query(&lookup)?.into_iter().next() else {
+        return Err(pg(match version {
+            Some(v) => format!("workflow \"{name}\" version {v} does not exist"),
+            None => format!("workflow \"{name}\" does not exist"),
+        }));
+    };
+    let args = cell_opt(&row, 0);
+    let body = cell(&row, 1);
+    let statement = rvbbit_parse::flow_statement(args.as_deref(), &body, input).map_err(pg)?;
+    scalar(&statement)?.ok_or_else(|| pg(format!("workflow \"{name}\" returned no row")))
 }
 
 pub fn execute(sql: &str) -> PgResult<()> {
@@ -226,6 +255,35 @@ fn bootstrap_means() -> PgResult<()> {
         threshold: None,
     })?;
     Ok(())
+}
+
+/// `rvbbit.means_score(text, text)` is the function-call form of the MEANS
+/// yes-probability. It shares the `default` model with `rvbbit.means`.
+/// A function the user already created under that name is left alone.
+fn ensure_score_shim() -> PgResult<()> {
+    if scalar("SELECT 1 FROM rvbbit.semfn WHERE nsp = 'rvbbit' AND name = 'means_score'")?.is_some()
+        || proc_named("means_score")?
+    {
+        return Ok(());
+    }
+    if scalar("SELECT 1 FROM rvbbit.model WHERE name = 'default'")?.is_none() {
+        return Ok(());
+    }
+    let mut clauses = FnClauses::default();
+    clauses.model = Some("default".into());
+    clauses.max_tokens = Some(16);
+    clauses.temperature = Some(0.0);
+    clauses.cache = Some("memoize".into());
+    apply(Command::CreateFunction {
+        or_replace: false,
+        name: "means_score".into(),
+        args: vec![
+            Arg { name: "text".into(), typ: "text".into() },
+            Arg { name: "criterion".into(), typ: "text".into() },
+        ],
+        returns: "double precision".into(),
+        clauses,
+    })
 }
 
 fn reload() -> PgResult<()> {
@@ -1279,7 +1337,67 @@ fn ensure_schema() -> PgResult<()> {
             exec(sql)?;
         }
     }
+    ensure_call_shims()?;
     Ok(())
+}
+
+/// Function-call names that are not the operator. `extract` and the 2-argument
+/// `classify` forward to the native project functions. `flow` runs a stored
+/// workflow. Existing functions of those names are not replaced.
+fn ensure_call_shims() -> PgResult<()> {
+    if !proc_named("extract")? {
+        exec(
+            "CREATE FUNCTION rvbbit.extract(input text, instruction text) RETURNS text \
+             LANGUAGE internal VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_extract_typed'",
+        )?;
+    }
+    if !proc_named_nargs("classify", 2)? {
+        exec(
+            "CREATE FUNCTION rvbbit.classify(input text, labels text) RETURNS text \
+             LANGUAGE internal VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_classify_labels'",
+        )?;
+    }
+    if proc_missing("flow", "rvbbit_flow", 2)? {
+        exec(
+            "CREATE FUNCTION rvbbit.flow(name text, input text) RETURNS text \
+             LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_flow'",
+        )?;
+    }
+    if proc_missing("flow", "rvbbit_flow", 3)? {
+        exec(
+            "CREATE FUNCTION rvbbit.flow(name text, input text, version integer) RETURNS text \
+             LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_flow'",
+        )?;
+    }
+    Ok(())
+}
+
+fn proc_named(name: &str) -> PgResult<bool> {
+    Ok(scalar(&format!(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = {}",
+        qlit(name)
+    ))?
+    .is_some())
+}
+
+fn proc_named_nargs(name: &str, nargs: i32) -> PgResult<bool> {
+    Ok(scalar(&format!(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = {} AND p.pronargs = {nargs}",
+        qlit(name)
+    ))?
+    .is_some())
+}
+
+fn proc_missing(name: &str, prosrc: &str, nargs: i32) -> PgResult<bool> {
+    Ok(scalar(&format!(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = {} AND p.prosrc = {} AND p.pronargs = {nargs}",
+        qlit(name),
+        qlit(prosrc)
+    ))?
+    .is_none())
 }
 
 const SCHEMA_DDL: &[&str] = &[
