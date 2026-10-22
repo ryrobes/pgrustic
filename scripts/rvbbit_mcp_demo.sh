@@ -388,7 +388,7 @@ fi
 grep -q 'unchanged' "$RUNDIR/refresh.out"
 
 echo "=== drop ==="
-"${PSQL[@]}" -c "DROP SERVER demo CASCADE;"
+"${PSQL[@]}" -c "DROP SERVER demo CASCADE; DROP SERVER time CASCADE;"
 LEFT=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM mcp.tool;")
 echo "tools left=$LEFT"
 test "$LEFT" = "0"
