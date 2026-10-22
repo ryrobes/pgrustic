@@ -130,12 +130,14 @@ import sys
 text = open(sys.argv[1]).read()
 for needle in (
     "Semantic Filter",
-    "Semantic Calls",
+    "Semantic Provider Calls",
+    "Semantic HTTP Batches",
     "Semantic USD",
     "Semantic Latency",
     "Semantic Model",
     "Semantic Selectivity",
-    "Semantic Total Calls",
+    "Semantic Total Provider Calls",
+    "Semantic Total HTTP Batches",
     "Semantic Total USD",
 ):
     if needle not in text:
@@ -198,6 +200,7 @@ if [[ "$budget_status" == 0 ]]; then
   exit 1
 fi
 grep -q "exceeds budget" "$RUNDIR/budget.txt"
+grep -q "0.00000010" "$RUNDIR/budget.txt"
 # The error is pre-flight: hutch must not have been posted to.
 if [[ "$STARTED_MOCK" == 1 ]]; then
   python3 - "${RVBBIT_HUTCH_URL%/}/stats" <<'PY'
@@ -236,10 +239,13 @@ text = open(sys.argv[1]).read()
 for needle in (
     "Actual Semantic Calls",
     "Actual Cache Hits",
+    "Actual HTTP Batches",
     "Actual Semantic USD",
     "Actual Semantic Latency",
     "Actual Semantic Model",
     "Actual Total Calls",
+    "Actual Total Cache Hits",
+    "Actual Total HTTP Batches",
     "Actual Total USD",
 ):
     if needle not in text:

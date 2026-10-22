@@ -327,7 +327,6 @@ pub fn selectivity(threshold: Option<f64>) -> f64 {
 struct Seed {
     usd_per_item: f64,
     latency_ms: f64,
-    priced_as: &'static str,
 }
 
 fn seed_for(model: &str, op: Op) -> Seed {
@@ -338,20 +337,17 @@ fn seed_for(model: &str, op: Op) -> Seed {
                 + MINI_TOKENS_OUT * MINI_USD_PER_MILLION_OUT)
                 / 1_000_000.0,
             latency_ms: MINI_LATENCY_MS,
-            priced_as: "gpt-4o-mini",
         };
     }
     if op == Op::Rerank && (m.contains("voyage") || m.contains("rerank-3")) {
         return Seed {
             usd_per_item: VOYAGE_TOKENS_PER_DOC * VOYAGE_USD_PER_MILLION / 1_000_000.0,
             latency_ms: VOYAGE_LATENCY_MS,
-            priced_as: "voyageai/rerank-3",
         };
     }
     Seed {
         usd_per_item: JEV_BILLED_TOKENS * JEV_USD_PER_MILLION / 1_000_000.0,
         latency_ms: JEV_LATENCY_MS,
-        priced_as: "jev",
     }
 }
 
@@ -444,13 +440,43 @@ fn learned(op: Op, model: &str) -> Learned {
     }
 }
 
+/// Wire `mock` is not what hutch calls. Extract and summarize chat is
+/// gpt-4o-mini. A voyage slug is the rerank list price. Any other explicit
+/// slug keeps its name so a nemotron rerank is not relabeled jev.
+fn priced_model(op: Op, model: &str) -> String {
+    let m = model.trim();
+    let blank = m.is_empty() || m.eq_ignore_ascii_case("mock") || m.eq_ignore_ascii_case("default");
+    match op {
+        Op::Extract | Op::Summarize if blank => "openai/gpt-4o-mini".to_string(),
+        Op::Rerank => {
+            let low = m.to_ascii_lowercase();
+            if low.contains("voyage") || low.contains("rerank-3") {
+                "voyageai/rerank-3".to_string()
+            } else if blank || low == "jev" {
+                "jev".to_string()
+            } else {
+                m.to_string()
+            }
+        }
+        _ if blank => "jev".to_string(),
+        _ => m.to_string(),
+    }
+}
+
+/// Dedicated rerank is one provider request for the whole HTTP batch.
+/// Jev and chat calls fan out, one provider call per charged item.
+fn one_shot_rerank(op: Op, model: &str) -> bool {
+    op == Op::Rerank && model != "jev"
+}
+
 pub fn estimate(work: &Work) -> Estimate {
-    let model = work
+    let requested = work
         .knobs
         .model
         .clone()
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| work.model.clone());
+    let model = priced_model(work.op, &requested);
     let seed = seed_for(&model, work.op);
     let learned = learned(work.op, &model);
     let usd_per_item = learned.usd_per_item.unwrap_or(seed.usd_per_item);
@@ -480,26 +506,23 @@ pub fn estimate(work: &Work) -> Estimate {
         Grouping::PerGroup => charged,
     };
     let conc = work.concurrency.max(1) as f64;
-    let waves = if calls <= 0.0 { 0.0 } else { (calls / conc).ceil() };
+    // `calls` is HTTP batches. Fan-out ops wait on provider calls, so a
+    // batch of 12 at concurrency 4 is three waves, not one flat seed.
+    // Voyage posts one `/rerank` per HTTP batch, so its wave count stays
+    // on the batch.
+    let wave_units = if one_shot_rerank(work.op, &model) { calls } else { charged };
+    let waves = if wave_units <= 0.0 { 0.0 } else { (wave_units / conc).ceil() };
     let sel = if work.filters {
         selectivity(work.threshold.or(work.knobs.threshold))
     } else {
         1.0
-    };
-    let shown_model = if model.is_empty() || model.eq_ignore_ascii_case("mock") || model.eq_ignore_ascii_case("default")
-    {
-        seed.priced_as.to_string()
-    } else if seed.priced_as == "voyageai/rerank-3" && !model.contains("voyage") {
-        seed.priced_as.to_string()
-    } else {
-        model
     };
     Estimate {
         calls,
         usd: charged * usd_per_item,
         latency_ms: waves * latency_per,
         selectivity: sel,
-        model: shown_model,
+        model,
         items: charged,
     }
 }
@@ -565,25 +588,65 @@ pub fn ingest_calls_json(text: &str) -> usize {
 
 #[derive(Clone, Debug, Default)]
 pub struct Actual {
+    /// Provider misses. A cache hit is not a call.
     pub calls: u64,
     pub cache_hits: u64,
+    /// HTTP attempts for this node. A fully local cache run is 0.
+    pub http_batches: u64,
     pub usd: f64,
+    /// Wall time: per-wave maxima, not the sum of every call.
     pub latency_ms: f64,
     pub model: String,
 }
 
+struct MissSample {
+    op: String,
+    model: String,
+    latency_ms: f64,
+    stamp: String,
+    generation: String,
+}
+
 impl Actual {
-    fn add_call(&mut self, usd: f64, latency_ms: f64, hit: bool, model: &str) {
+    fn add_miss(&mut self, usd: f64, model: &str) {
         self.calls += 1;
-        if hit {
-            self.cache_hits += 1;
-        }
         self.usd += usd;
-        self.latency_ms += latency_ms;
+        self.remember_model(model);
+    }
+
+    fn add_hit(&mut self, model: &str) {
+        self.cache_hits += 1;
+        self.remember_model(model);
+    }
+
+    fn remember_model(&mut self, model: &str) {
         if self.model.is_empty() && !model.is_empty() {
             self.model = model.to_string();
         }
     }
+}
+
+/// One wave is `concurrency` calls wide. The wave costs its slowest call.
+/// Cloned rerank meters share a timestamp and a latency; they are one
+/// provider request, so they contribute one sample.
+fn wall_ms(misses: &[MissSample], concurrency: u32) -> f64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut latencies = Vec::new();
+    for miss in misses {
+        let key = format!(
+            "{}\u{1e}{}\u{1e}{}\u{1e}{}\u{1e}{}",
+            miss.op,
+            miss.model,
+            miss.stamp,
+            miss.latency_ms.to_bits(),
+            miss.generation
+        );
+        if seen.insert(key) {
+            latencies.push(miss.latency_ms);
+        }
+    }
+    let width = concurrency.max(1) as usize;
+    latencies.chunks(width).map(|chunk| chunk.iter().copied().fold(0.0, f64::max)).sum()
 }
 
 struct QueryState {
@@ -714,38 +777,84 @@ pub fn query_actual() -> Actual {
 }
 
 /// Parse a hutch batch body and record its `calls` arrays.
-pub fn observe_response(body: &str) {
+///
+/// An output with a value and no `calls` array is a client-memo or lookup
+/// hit. Those used to leave the actuals empty, so `EXPLAIN ANALYZE` hid
+/// the block on a fully cached run. `http_calls` is that response's HTTP
+/// attempts; a local body passes 0. `concurrency` is the fan-out width
+/// used to turn miss latencies into wall time.
+pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return;
     };
     let Some(outputs) = v.get("outputs").and_then(|o| o.as_array()) else {
         return;
     };
+    let mut misses = Vec::new();
     for item in outputs {
-        let Some(calls) = item.get("calls").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        for call in calls {
-            let op = call.get("op").and_then(|s| s.as_str()).unwrap_or("");
-            let model = call.get("model").and_then(|s| s.as_str()).unwrap_or("");
-            let usd = call.get("cost_usd").and_then(|s| s.as_f64()).unwrap_or(0.0);
-            let latency = call
-                .get("provider_latency_ms")
-                .or_else(|| call.get("latency_ms"))
-                .and_then(|s| s.as_f64())
-                .unwrap_or(0.0);
-            let cache = call.get("cache").and_then(|s| s.as_str()).unwrap_or("miss");
-            let hit = cache == "hit";
-            if !op.is_empty() {
-                note_observation(op, model, usd, latency, hit);
+        let calls = item.get("calls").and_then(|c| c.as_array()).filter(|c| !c.is_empty());
+        if let Some(calls) = calls {
+            for call in calls {
+                let op = call.get("op").and_then(|s| s.as_str()).unwrap_or("");
+                let model = call.get("model").and_then(|s| s.as_str()).unwrap_or("");
+                let usd = call.get("cost_usd").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                let latency = call
+                    .get("provider_latency_ms")
+                    .or_else(|| call.get("latency_ms"))
+                    .and_then(|s| s.as_f64())
+                    .unwrap_or(0.0);
+                let cache = call.get("cache").and_then(|s| s.as_str()).unwrap_or("miss");
+                let hit = cache == "hit";
+                if !op.is_empty() {
+                    note_observation(op, model, usd, latency, hit);
+                }
+                let mut q = query();
+                let node = q.node;
+                if hit {
+                    q.total.add_hit(model);
+                } else {
+                    q.total.add_miss(usd, model);
+                    misses.push(MissSample {
+                        op: op.to_string(),
+                        model: model.to_string(),
+                        latency_ms: latency,
+                        stamp: call.get("timestamp").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                        generation: call
+                            .get("generation_id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    });
+                }
+                if let Some(id) = node {
+                    let act = q.by_node.entry(id).or_default();
+                    if hit {
+                        act.add_hit(model);
+                    } else {
+                        act.add_miss(usd, model);
+                    }
+                }
             }
+        } else if item.get("value").is_some_and(|v| !v.is_null())
+            && item.get("error").map(|e| e.is_null()).unwrap_or(true)
+        {
             let mut q = query();
             let node = q.node;
-            q.total.add_call(usd, latency, hit, model);
+            q.total.add_hit("");
             if let Some(id) = node {
-                q.by_node.entry(id).or_default().add_call(usd, latency, hit, model);
+                q.by_node.entry(id).or_default().add_hit("");
             }
         }
+    }
+    let wall = wall_ms(&misses, concurrency);
+    let mut q = query();
+    let node = q.node;
+    q.total.latency_ms += wall;
+    q.total.http_batches += u64::from(http_calls);
+    if let Some(id) = node {
+        let act = q.by_node.entry(id).or_default();
+        act.latency_ms += wall;
+        act.http_batches += u64::from(http_calls);
     }
 }
 
@@ -786,7 +895,7 @@ pub fn preflight() -> Result<(), String> {
     };
     if usd > cap + 1e-12 {
         return Err(format!(
-            "semantic estimate {usd:.6} USD exceeds budget {cap:.6}"
+            "semantic estimate {usd:.8} USD exceeds budget {cap:.8}"
         ));
     }
     query().checked = true;
@@ -894,7 +1003,103 @@ mod tests {
             filters: false,
         });
         assert!((learned.usd - 10.0 * 0.5 * 0.01).abs() < 1e-12);
+        // One HTTP batch, so the learned 15ms is one wave, not 5 * 15.
         assert!((learned.latency_ms - 15.0).abs() < 1e-9);
+        assert!((voyage.latency_ms - VOYAGE_LATENCY_MS).abs() < 1e-9);
+        reset_history();
+    }
+
+    #[test]
+    fn extract_and_summarize_price_mini_and_means_fans_out() {
+        reset_history();
+        let mini = (MINI_TOKENS_IN * MINI_USD_PER_MILLION_IN + MINI_TOKENS_OUT * MINI_USD_PER_MILLION_OUT)
+            / 1_000_000.0;
+        let extract = estimate(&Work {
+            op: Op::Extract,
+            model: "mock".into(),
+            rows: 3.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        assert_eq!(extract.model, "openai/gpt-4o-mini");
+        assert!((extract.usd - 3.0 * mini).abs() < 1e-12);
+        assert_eq!(extract.calls, 1.0);
+        assert!((extract.items - 3.0).abs() < 1e-9);
+        assert!((extract.latency_ms - MINI_LATENCY_MS).abs() < 1e-9);
+
+        let summary = estimate(&Work {
+            op: Op::Summarize,
+            model: "mock".into(),
+            rows: 3.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::PerGroup,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        assert_eq!(summary.model, "openai/gpt-4o-mini");
+        assert!((summary.usd - 3.0 * mini).abs() < 1e-12);
+
+        let means = estimate(&Work {
+            op: Op::Predict,
+            model: "jev".into(),
+            rows: 12.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        let per = JEV_BILLED_TOKENS * JEV_USD_PER_MILLION / 1_000_000.0;
+        assert_eq!(means.model, "jev");
+        assert_eq!(means.calls, 1.0);
+        assert!((means.items - 12.0).abs() < 1e-9);
+        assert!((means.usd - 12.0 * per).abs() < 1e-12);
+        assert!((means.latency_ms - 3.0 * JEV_LATENCY_MS).abs() < 1e-9);
+
+        let mut knobs = Knobs::default();
+        knobs.model = Some("voyageai/rerank-3".into());
+        let voyage = estimate(&Work {
+            op: Op::Rerank,
+            model: "mock".into(),
+            rows: 12.0,
+            per_row: 1.0,
+            knobs,
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        let doc = VOYAGE_TOKENS_PER_DOC * VOYAGE_USD_PER_MILLION / 1_000_000.0;
+        assert_eq!(voyage.model, "voyageai/rerank-3");
+        assert_eq!(voyage.calls, 1.0);
+        assert!((voyage.items - 12.0).abs() < 1e-9);
+        assert!((voyage.usd - 12.0 * doc).abs() < 1e-12);
+        assert!((voyage.latency_ms - VOYAGE_LATENCY_MS).abs() < 1e-9);
+
+        let nemotron = estimate(&Work {
+            op: Op::Rerank,
+            model: "nvidia/nemotron-3.5-rerank-8b:free".into(),
+            rows: 2.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 1,
+            threshold: None,
+            filters: false,
+        });
+        assert_eq!(nemotron.model, "nvidia/nemotron-3.5-rerank-8b:free");
         reset_history();
     }
 
@@ -937,8 +1142,13 @@ mod tests {
         arm_query(0.02, Some(0.001));
         let err = preflight().unwrap_err();
         assert!(err.contains("exceeds budget"));
+        assert!(err.contains("0.00100000"), "{err}");
         let again = preflight().unwrap_err();
         assert!(again.contains("exceeds budget"));
+        arm_query(0.0000002, Some(0.0000001));
+        let tiny = preflight().unwrap_err();
+        assert!(tiny.contains("0.00000010"), "{tiny}");
+        assert!(!tiny.contains("0.000000 USD"), "{tiny}");
         arm_query(0.02, Some(0.001));
         set_guc_reader(|name| {
             if name == "semantic.cost_check" {
@@ -959,20 +1169,42 @@ mod tests {
         let _scope = charge_scope(7);
         observe_response(
             r#"{"outputs":[{"key":"0","calls":[
-                {"op":"predict","model":"jev","cost_usd":0.0000126,"latency_ms":40,"cache":"miss"},
-                {"op":"predict","model":"jev","cost_usd":0,"latency_ms":0,"cache":"hit"}
-            ]}]}"#,
+                {"op":"predict","model":"jev","cost_usd":0.0000126,"latency_ms":100,"cache":"miss","timestamp":"t0"},
+                {"op":"predict","model":"jev","cost_usd":0.0000126,"latency_ms":400,"cache":"miss","timestamp":"t1"},
+                {"op":"predict","model":"jev","cost_usd":0,"latency_ms":1,"cache":"hit","timestamp":"t2"},
+                {"op":"predict","model":"jev","cost_usd":0.0000126,"latency_ms":50,"cache":"miss","timestamp":"t3"},
+                {"op":"predict","model":"jev","cost_usd":0.0000126,"latency_ms":200,"cache":"miss","timestamp":"t4"}
+            ]},{"key":"1","value":true}]}"#,
+            1,
+            2,
         );
         drop(_scope);
         let node = node_actual(7).expect("node 7");
-        assert_eq!(node.calls, 2);
-        assert_eq!(node.cache_hits, 1);
-        assert!((node.usd - 0.0000126).abs() < 1e-12);
-        assert!((node.latency_ms - 40.0).abs() < 1e-9);
+        assert_eq!(node.calls, 4);
+        assert_eq!(node.cache_hits, 2);
+        assert_eq!(node.http_batches, 1);
+        assert!((node.usd - 0.0000504).abs() < 1e-12);
+        // Waves of 2: max(100, 400) + max(50, 200). The hit and the
+        // valueless-calls gap do not add. Summing the misses would be 750.
+        assert!((node.latency_ms - 600.0).abs() < 1e-9);
         assert_eq!(node.model, "jev");
         let total = query_actual();
-        assert_eq!(total.calls, 2);
-        assert_eq!(total.cache_hits, 1);
+        assert_eq!(total.calls, 4);
+        assert_eq!(total.cache_hits, 2);
+        assert_eq!(total.http_batches, 1);
+        end_query();
+        begin_query();
+        let _scope = charge_scope(3);
+        observe_response(
+            r#"{"outputs":[{"key":"0","value":true},{"key":"1","value":false}]}"#,
+            0,
+            4,
+        );
+        let cached = node_actual(3).expect("cached node");
+        assert_eq!(cached.calls, 0);
+        assert_eq!(cached.cache_hits, 2);
+        assert_eq!(cached.http_batches, 0);
+        assert!((cached.latency_ms - 0.0).abs() < 1e-9);
         end_query();
         begin_query();
         assert_eq!(query_actual().calls, 0);

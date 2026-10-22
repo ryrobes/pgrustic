@@ -14,7 +14,10 @@ use crate::qual_contains_means;
 
 #[derive(Clone, Debug)]
 pub struct Shown {
-    pub calls: f64,
+    /// Charged provider calls (after the cache hit rate).
+    pub provider_calls: f64,
+    /// HTTP batches. One batch carries up to `batch_rows` fan-out calls.
+    pub http_batches: f64,
     pub usd: f64,
     pub latency_ms: f64,
     pub model: String,
@@ -41,7 +44,8 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
         return None;
     }
     let mut shown = Shown {
-        calls: 0.0,
+        provider_calls: 0.0,
+        http_batches: 0.0,
         usd: 0.0,
         latency_ms: 0.0,
         model: String::new(),
@@ -72,7 +76,8 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
             shown.clause_budget = Some(shown.clause_budget.map_or(b, |c: f64| c.min(b)));
         }
     }
-    shown.calls = est.calls;
+    shown.provider_calls = est.items;
+    shown.http_batches = est.calls;
     shown.usd = est.usd;
     shown.latency_ms = est.latency_ms;
     shown.model = est.model;
@@ -84,7 +89,8 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
 
 pub fn tree_estimate(node: Node<'_>) -> Option<Shown> {
     let mut total = Shown {
-        calls: 0.0,
+        provider_calls: 0.0,
+        http_batches: 0.0,
         usd: 0.0,
         latency_ms: 0.0,
         model: String::new(),
@@ -100,7 +106,8 @@ pub fn tree_estimate(node: Node<'_>) -> Option<Shown> {
 fn walk_tree(node: Node<'_>, total: &mut Shown, any: &mut bool) {
     if let Some(one) = node_estimate(node) {
         *any = true;
-        total.calls += one.calls;
+        total.provider_calls += one.provider_calls;
+        total.http_batches += one.http_batches;
         total.usd += one.usd;
         total.latency_ms += one.latency_ms;
         if total.model.is_empty() {
@@ -246,14 +253,28 @@ fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found>
     if model.is_empty() {
         model = "jev".into();
     }
-    if oid == RERANK_FOR_OID {
+    // `USING MODEL` on rerank is the third argument of `rerank_for`, not a
+    // clause tail. The catalog oid is not always `RERANK_FOR_OID`, so a
+    // slug-shaped argument is enough. A clause tail stays on `knobs`.
+    if op == Op::Rerank && knobs.model.is_none() {
         if let Some(slug) = func.args.iter().nth(2).and_then(const_text) {
-            if !slug.is_empty() {
+            if rerank_slug(&slug) {
                 model = slug;
             }
         }
     }
     Some(Found { op, model, per_row, knobs, grouping, filters })
+}
+
+fn rerank_slug(text: &str) -> bool {
+    let low = text.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    if low.contains("takes") || low.contains("budget") || low.contains("phras") || low.contains("fallback") {
+        return false;
+    }
+    low.contains('/') || low.contains("voyage") || low.contains("rerank") || low == "jev" || low == "mock"
 }
 
 fn classify(oid: u32, name: &str, in_qual: bool, in_agg: bool) -> Option<(Op, bool, f64, Grouping)> {

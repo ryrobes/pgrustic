@@ -79,7 +79,8 @@ call. EXTRACT MANY uses an object schema with a `mentions` array of
 strings and stores that array, so a bare JSON array still decodes. A
 provider error that rejects the schema is retried once without
 `response_format`. Temperature on that call is 0 unless a clause tail
-sets one.
+sets one. pgrustic then asks Jev `is <candidate> a <kind>?` once per
+mention and drops the ones that come back false. That check fails open.
 
 Response. `outputs[i]` answers `items[i]`. The `key` is echoed. A failed
 item sets `error` and leaves `value` null. Siblings may still succeed.

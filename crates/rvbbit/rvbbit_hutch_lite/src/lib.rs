@@ -963,12 +963,12 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                 }
                 Some("summary") => "Summarize the notes in one or two sentences. No markdown.".into(),
                 Some("many") => {
-                    "Return JSON {\"mentions\":[...]} and no markdown. Each string is one mention of the requested kind. \
-                     A proper noun counts: asked for a creature, \"My story of Bigfoot\" yields Bigfoot. \
-                     A descriptive word or short phrase counts: asked for a color, \"Large gray triangular aircraft\" yields gray. \
-                     A synonym counts even when the text does not use the kind word: asked for a creature, \"a sasquatch crossed the road\" yields sasquatch. \
-                     Those examples are not the user text. Every mention must appear in the user text. Do not copy the examples. \
-                     Leave out anything that is not that kind. If there are none, mentions is []."
+                    "Return JSON {\"mentions\":[...]} and no markdown. \
+                     Examples, do not copy: creature in \"My story of Bigfoot\" is Bigfoot; \
+                     color in \"Large gray triangular aircraft\" is gray; \
+                     creature in \"a sasquatch crossed the road\" is sasquatch. \
+                     Copy only words from the user text. Leave out anything that is not that kind. \
+                     If there are none, mentions is []."
                         .into()
                 }
                 _ => "Return only JSON. No markdown.".into(),

@@ -480,6 +480,7 @@ pub fn extract_lists(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
             inputs.len()
         )));
     }
+    let values = confirm_mentions(kind, inputs, values);
     Ok(ManyReply { values, http_calls: raw.http_calls })
 }
 
@@ -603,9 +604,7 @@ fn many_schema(kind: &str) -> serde_json::Value {
         "properties": {
             "mentions": {
                 "type": "array",
-                "description": format!(
-                    "One string per {kind}. A proper noun, a short descriptive phrase, or a synonym. Empty when the text has none."
-                ),
+                "description": format!("One {kind} copied from the text, or empty."),
                 "items": { "type": "string" }
             }
         }
@@ -632,13 +631,11 @@ fn many_endpoint(kind: &str) -> Endpoint {
     ep.return_type = schema_text.clone();
     ep.extract_mode = Some("many".into());
     ep.system_prompt = format!(
-        "Extract every {kind} from the user text. \
-         Reply with JSON only, matching this schema, and no markdown: {schema_text} \
+        "Extract every {kind}. JSON only, no markdown, schema {schema_text}. \
          {} \
-         Those examples are not the user text. Every mention must appear in the user text. Do not copy the examples. \
-         Leave out anything that is not a {kind}. A color list does not include the aircraft, its size, or its shape. A creature list does not include the story or the road. \
-         If the text has no {kind}, mentions is [].",
-        many_examples(kind)
+         Copy only words from the user text. Leave out anything that is not a {kind}. \
+         If there are none, mentions is [].",
+        many_examples()
     );
     ep.user_prompt = format!(
         "List every {kind}. Proper nouns, descriptive phrases, and synonyms count. \
@@ -648,13 +645,94 @@ fn many_endpoint(kind: &str) -> Endpoint {
     ep
 }
 
-/// The two live misses, plus a synonym. They stay in every kind's prompt
-/// so a proper noun, a descriptive word, and a synonym are all shown.
-fn many_examples(_kind: &str) -> String {
-    "A proper noun counts. Asked for a creature, the text \"My story of Bigfoot\" yields Bigfoot. \
-     A descriptive word or short phrase counts. Asked for a color, the text \"Large gray triangular aircraft\" yields gray. \
-     A synonym counts even when the text never uses the kind word. Asked for a creature, \"a sasquatch crossed the road\" yields sasquatch."
+/// Short recall cues. A longer example block made each chat call about
+/// 2.5x more expensive without improving the jev check that drops junk.
+fn many_examples() -> String {
+    "Examples, do not copy: creature in \"My story of Bigfoot\" is Bigfoot; \
+     color in \"Large gray triangular aircraft\" is gray; \
+     creature in \"a sasquatch crossed the road\" is sasquatch."
         .to_string()
+}
+
+/// One batched jev question per candidate: `is {candidate} a {kind}?`.
+/// The input is the source text. A false answer drops that candidate.
+/// A transport error, or a reply that does not line up, keeps the chat
+/// list. Jev is much cheaper than the extract call, and an outage must
+/// not wipe recall. Empty lists skip the check.
+fn confirm_mentions(
+    kind: &str,
+    inputs: &[String],
+    mut values: Vec<Result<String, String>>,
+) -> Vec<Result<String, String>> {
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    let mut where_job: Vec<(usize, usize)> = Vec::new();
+    let mut parsed: Vec<Option<Vec<String>>> = Vec::with_capacity(values.len());
+    for (row, value) in values.iter().enumerate() {
+        let Some(text) = value.as_ref().ok() else {
+            parsed.push(None);
+            continue;
+        };
+        let Some(mentions) = parse_mention_list(text) else {
+            parsed.push(None);
+            continue;
+        };
+        let input = inputs.get(row).map(|s| s.as_str()).unwrap_or("");
+        for (index, cand) in mentions.iter().enumerate() {
+            let trimmed = cand.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            jobs.push((input.to_string(), format!("is {trimmed} a {kind}?")));
+            where_job.push((row, index));
+        }
+        parsed.push(Some(mentions));
+    }
+    if jobs.is_empty() {
+        return values;
+    }
+    let oid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
+    let Ok(reply) = submit(oid, &jobs).and_then(wait) else {
+        return values;
+    };
+    if reply.matched.len() != where_job.len() {
+        return values;
+    }
+    let mut dropped: Vec<Vec<bool>> = parsed
+        .iter()
+        .map(|mentions| mentions.as_ref().map(|m| vec![false; m.len()]).unwrap_or_default())
+        .collect();
+    for (flag, (row, index)) in reply.matched.iter().zip(where_job) {
+        if !flag {
+            dropped[row][index] = true;
+        }
+    }
+    for (row, mentions) in parsed.into_iter().enumerate() {
+        let Some(mentions) = mentions else {
+            continue;
+        };
+        values[row] = Ok(retain_mentions(&mentions, &dropped[row]));
+    }
+    values
+}
+
+fn retain_mentions(mentions: &[String], rejected: &[bool]) -> String {
+    let kept: Vec<&str> = mentions
+        .iter()
+        .enumerate()
+        .filter(|(index, cand)| !cand.trim().is_empty() && !rejected.get(*index).copied().unwrap_or(false))
+        .map(|(_, cand)| cand.as_str())
+        .collect();
+    serde_json::to_string(&kept).unwrap_or_else(|_| "[]".into())
+}
+
+fn parse_mention_list(text: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let arr = value.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        out.push(item.as_str()?.to_string());
+    }
+    Some(out)
 }
 
 fn empty_agg() -> serde_json::Value {
@@ -792,7 +870,7 @@ pub fn scalar_key_rerank(model: &str, query: &str) -> String {
 }
 
 pub fn extract_many_json(kind: &str, input: &str, clauses: &str) -> PgResult<String> {
-    if clauses.trim().is_empty() {
+    let listed = if clauses.trim().is_empty() {
         let ep = many_endpoint(kind);
         let body = encode_items(&ep, Operation::Extract, &[serde_json::json!({ "input": input })])
             .map_err(pg)?;
@@ -801,9 +879,15 @@ pub fn extract_many_json(kind: &str, input: &str, clauses: &str) -> PgResult<Str
         if let Some(err) = hit.error {
             return Err(pg(err));
         }
-        return Ok(hit.value);
+        hit.value
+    } else {
+        winner_of(&apply_clauses_text("extract_many", input, kind, clauses)?)?
+    };
+    match confirm_mentions(kind, &[input.to_string()], vec![Ok(listed)]).into_iter().next() {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(message)) => Err(pg(message)),
+        None => Ok("[]".into()),
     }
-    winner_of(&apply_clauses_text("extract_many", input, kind, clauses)?)
 }
 
 fn winner_of(report: &str) -> PgResult<String> {
@@ -1051,6 +1135,11 @@ fn cache_lookup_ep(ep: &Endpoint, keys: &[String]) -> PgResult<CacheLookupRespon
     serde_json::from_str(&raw.body).map_err(|e| pg(format!("cache lookup decode: {e}")))
 }
 
+fn observe_cost(body: &str, http_calls: u32) {
+    let conc = rvbbit_resolve::max_concurrent().max(1) as u32;
+    rvbbit_cost::observe_response(body, http_calls, conc);
+}
+
 fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
     let Ticket { rx, order, ahead, posted } = ticket;
     let raw = loop {
@@ -1065,7 +1154,7 @@ fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
         }
     };
     if order.is_empty() {
-        rvbbit_cost::observe_response(&raw.body);
+        observe_cost(&raw.body, raw.http_calls);
         return Ok(raw);
     }
     let mut parsed: BatchResponse = serde_json::from_str(&raw.body).map_err(|e| pg(e.to_string()))?;
@@ -1086,7 +1175,7 @@ fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
     }
     parsed.outputs = merged;
     let body = serde_json::to_string(&parsed).map_err(|e| pg(e.to_string()))?;
-    rvbbit_cost::observe_response(&body);
+    observe_cost(&body, raw.http_calls);
     Ok(RawReply {
         body,
         http_calls: raw.http_calls,
@@ -1978,16 +2067,15 @@ mod tests {
         assert_eq!(ep.extract_mode.as_deref(), Some("many"));
         assert_eq!(ep.temperature, 0.0);
         assert_eq!(ep.max_tokens, Some(256));
-        assert!(ep.system_prompt.contains("proper noun"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("Bigfoot"), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("descriptive word"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("gray"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("sasquatch"), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("synonym"), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("Do not copy the examples"), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("must appear in the user text"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("do not copy"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("Copy only words from the user text"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("not a creature"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("mentions is []"), "{}", ep.system_prompt);
+        assert!(!ep.system_prompt.contains("descriptive word or short phrase"), "{}", ep.system_prompt);
+        assert!(!ep.system_prompt.contains("does not include the aircraft"), "{}", ep.system_prompt);
         assert!(ep.user_prompt.contains("Proper nouns, descriptive phrases, and synonyms count"));
         assert!(ep.user_prompt.contains("not a creature"));
         assert!(ep.user_prompt.contains("mentions is []"));
@@ -2003,6 +2091,13 @@ mod tests {
         let color = super::many_endpoint("color");
         assert!(color.system_prompt.contains("Large gray triangular aircraft"));
         assert!(color.system_prompt.contains("not a color"));
+        let mentions = super::parse_mention_list("[\"gray\",\"night\",\"bright\"]").unwrap();
+        assert_eq!(
+            super::retain_mentions(&mentions, &[false, true, true]),
+            "[\"gray\"]"
+        );
+        assert_eq!(format!("is {} a color?", mentions[1].trim()), "is night a color?");
+        assert!(super::parse_mention_list("not json").is_none());
         assert!(!color.system_prompt.contains("or adjectives"));
         let body = encode_items(
             &ep,

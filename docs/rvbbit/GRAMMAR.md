@@ -102,19 +102,30 @@ batches, HTTP calls, memo hits, and rows in/out.
 Each semantic node also carries a provider estimate. The seed is jev at
 $0.042 per million input tokens and about 300 billed tokens a call,
 gpt-4o-mini at its list rates, and voyage rerank at $0.05 per million
-tokens. A response `calls` array, `rvbbit.calls`, or hutch `/stats`
-replaces that seed for the same operation and model. `TAKES`,
-`PHRASINGS`, `ACROSS`, and `FALLBACK` multiply the items. A cache hit
-rate, including `CACHE off`, reduces the charged items, and batching
-turns them into `ceil(items / batch)` calls. A filter's selectivity is
-0.5, or `1 - THRESHOLD` clamped to 0.05..0.95.
+tokens. `SUMMARIZE` and `EXTRACT` are priced as gpt-4o-mini when the
+wire model is empty, `mock`, or `default`, because that is the chat
+model hutch actually calls. `USING MODEL 'voyageai/rerank-3'` is priced
+as voyage. MEANS stays on jev. A response `calls` array, `rvbbit.calls`,
+or hutch `/stats` replaces that seed for the same operation and model.
+`TAKES`, `PHRASINGS`, `ACROSS`, and `FALLBACK` multiply the items. A
+cache hit rate, including `CACHE off`, reduces the charged provider
+calls. HTTP batches are `ceil(provider calls / batch)` for a fan-out
+op, or one batch for a dedicated rerank. Latency is wall time: fan-out
+ops take `ceil(provider calls / concurrency)` waves, and a voyage
+rerank takes one wave per HTTP batch. A filter's selectivity is 0.5,
+or `1 - THRESHOLD` clamped to 0.05..0.95.
 
-`EXPLAIN` prints `Semantic Calls`, `Semantic USD`, `Semantic Latency`,
-and `Semantic Model` on the node and `Semantic Total` for the statement.
-`EXPLAIN (COSTS OFF)` leaves those lines out. `EXPLAIN ANALYZE` adds
-`Actual Semantic Calls`, `Actual Cache Hits`, `Actual Semantic USD`,
-`Actual Semantic Latency`, and `Actual Semantic Model`, plus the same
-totals. Cheap predicates stay on the scan. A semantic filter moves
+`EXPLAIN` prints `Semantic Provider Calls`, `Semantic HTTP Batches`,
+`Semantic USD`, `Semantic Latency`, and `Semantic Model` on the node,
+and the same `Semantic Total` lines for the statement.
+`EXPLAIN (COSTS OFF)` leaves those lines out. `EXPLAIN ANALYZE` always
+adds `Actual Semantic Calls` (provider misses), `Actual Cache Hits`,
+`Actual HTTP Batches`, `Actual Semantic USD`, `Actual Semantic Latency`
+(wall time, not the sum of every call), and `Actual Semantic Model`,
+including when every row was a cache hit and the provider-call count
+is 0. The statement totals use the same names. A client-memo or
+`/v1/cache/lookup` hit has no `calls` array and still counts as a cache
+hit. Cheap predicates stay on the scan. A semantic filter moves
 above an inner join when the join emits fewer rows than its input, and
 a project or decision tree moves above `LIMIT` so the limit runs first.
 

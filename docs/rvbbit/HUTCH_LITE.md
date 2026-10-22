@@ -90,7 +90,11 @@ synonym counts even when the text never uses the kind word. Anything
 that is not that kind stays out, and the list is empty when the text
 has none. The chat call uses temperature 0 and a strict JSON Schema
 whose `mentions` array is what SQL explodes. A provider that rejects
-the schema is retried once without it. The array is one batched extract, the same Semantic
+the schema is retried once without it. The examples in the prompt are
+short on purpose. After the list comes back, each candidate is one
+batched Jev question, `is <candidate> a <kind>?`, against the source
+text. A false answer is dropped. A Jev error keeps the original list,
+so a noul outage does not erase recall. The array is one batched extract, the same Semantic
 Project shape as `CLASSIFY` and typed `EXTRACT`, then a `LEFT JOIN
 LATERAL` explodes each value onto its source row. The helper list
 column stays inside that subquery. An empty array keeps the row with a

@@ -99,9 +99,15 @@ pub fn ExplainPrintPlan<'mcx>(
 }
 
 fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
+    let est = if es.costs || es.analyze {
+        rvbbit_plan::node_estimate(node)
+    } else {
+        None
+    };
     if es.costs {
-        if let Some(est) = rvbbit_plan::node_estimate(node) {
-            ExplainPropertyFloat("Semantic Calls", None, est.calls, 2, es);
+        if let Some(est) = &est {
+            ExplainPropertyFloat("Semantic Provider Calls", None, est.provider_calls, 2, es);
+            ExplainPropertyFloat("Semantic HTTP Batches", None, est.http_batches, 2, es);
             ExplainPropertyFloat("Semantic USD", None, est.usd, 8, es);
             ExplainPropertyFloat("Semantic Latency", Some("ms"), est.latency_ms, 1, es);
             if !est.model.is_empty() {
@@ -112,39 +118,50 @@ fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
             }
         }
     }
+    // A fully cached run has zero provider calls. Still print the block,
+    // including Actual Cache Hits, so ANALYZE does not look empty.
     if es.analyze {
-        let id = node.as_plan().map(|p| p.plan_node_id).unwrap_or(-1);
-        if let Some(act) = rvbbit_plan::node_actual(id) {
-            if act.calls > 0 {
-                ExplainPropertyInteger("Actual Semantic Calls", None, act.calls as i64, es);
-                ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
-                ExplainPropertyFloat("Actual Semantic USD", None, act.usd, 8, es);
-                ExplainPropertyFloat("Actual Semantic Latency", Some("ms"), act.latency_ms, 1, es);
-                if !act.model.is_empty() {
-                    ExplainPropertyText("Actual Semantic Model", &act.model, es);
-                }
+        if let Some(est) = &est {
+            let id = node.as_plan().map(|p| p.plan_node_id).unwrap_or(-1);
+            let act = rvbbit_plan::node_actual(id).unwrap_or_default();
+            ExplainPropertyInteger("Actual Semantic Calls", None, act.calls as i64, es);
+            ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
+            ExplainPropertyInteger("Actual HTTP Batches", None, act.http_batches as i64, es);
+            ExplainPropertyFloat("Actual Semantic USD", None, act.usd, 8, es);
+            ExplainPropertyFloat("Actual Semantic Latency", Some("ms"), act.latency_ms, 1, es);
+            let model = if act.model.is_empty() { est.model.clone() } else { act.model };
+            if !model.is_empty() {
+                ExplainPropertyText("Actual Semantic Model", &model, es);
             }
         }
     }
 }
 
 fn show_semantic_totals(root: Node<'_>, es: &mut ExplainState<'_>) {
+    let total = if es.costs || es.analyze {
+        rvbbit_plan::tree_estimate(root)
+    } else {
+        None
+    };
     if es.costs {
-        if let Some(total) = rvbbit_plan::tree_estimate(root) {
-            ExplainPropertyFloat("Semantic Total Calls", None, total.calls, 2, es);
+        if let Some(total) = &total {
+            ExplainPropertyFloat("Semantic Total Provider Calls", None, total.provider_calls, 2, es);
+            ExplainPropertyFloat("Semantic Total HTTP Batches", None, total.http_batches, 2, es);
             ExplainPropertyFloat("Semantic Total USD", None, total.usd, 8, es);
             ExplainPropertyFloat("Semantic Total Latency", Some("ms"), total.latency_ms, 1, es);
         }
     }
     if es.analyze {
-        let act = rvbbit_plan::query_actual();
-        if act.calls > 0 {
+        if let Some(total) = &total {
+            let act = rvbbit_plan::query_actual();
             ExplainPropertyInteger("Actual Total Calls", None, act.calls as i64, es);
             ExplainPropertyInteger("Actual Total Cache Hits", None, act.cache_hits as i64, es);
+            ExplainPropertyInteger("Actual Total HTTP Batches", None, act.http_batches as i64, es);
             ExplainPropertyFloat("Actual Total USD", None, act.usd, 8, es);
             ExplainPropertyFloat("Actual Total Latency", Some("ms"), act.latency_ms, 1, es);
-            if !act.model.is_empty() {
-                ExplainPropertyText("Actual Total Model", &act.model, es);
+            let model = if act.model.is_empty() { total.model.clone() } else { act.model };
+            if !model.is_empty() {
+                ExplainPropertyText("Actual Total Model", &model, es);
             }
         }
     }

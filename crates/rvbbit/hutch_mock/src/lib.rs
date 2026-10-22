@@ -109,6 +109,37 @@ pub fn matches(input: &str, criterion: &str) -> bool {
     input.contains(&criterion)
 }
 
+/// Predict, including the EXTRACT MANY check `is <candidate> a <kind>?`.
+/// That question is not a substring of the source text, so the mock
+/// answers true when the candidate itself appears in the text. A live
+/// jev call is what drops "night" or "animal".
+pub fn predict_yes(input: &str, criterion: &str) -> bool {
+    if let Some(candidate) = confirm_candidate(criterion) {
+        return input.to_ascii_lowercase().contains(&candidate.to_ascii_lowercase());
+    }
+    matches(input, criterion)
+}
+
+fn confirm_candidate(criterion: &str) -> Option<&str> {
+    let text = criterion.trim();
+    let lower = text.to_ascii_lowercase();
+    if !lower.starts_with("is ") || !lower.ends_with('?') {
+        return None;
+    }
+    let rest = text[3..text.len() - 1].trim();
+    let lower_rest = rest.to_ascii_lowercase();
+    let idx = lower_rest.rfind(" a ")?;
+    let candidate = rest[..idx].trim();
+    let kind = rest[idx + 3..].trim();
+    if candidate.is_empty() || kind.is_empty() || kind.split_whitespace().count() != 1 {
+        return None;
+    }
+    if !kind.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+        return None;
+    }
+    Some(candidate)
+}
+
 pub fn serve(addr: &str, cfg: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     serve_listener(listener, cfg)
@@ -348,7 +379,7 @@ fn mock_scored(op: Operation, item: &rvbbit_contract::ItemRequest) -> (serde_jso
     let folded = input.to_ascii_lowercase();
     match op {
         Operation::Predict => {
-            let yes = matches(&input, &criterion);
+            let yes = predict_yes(&input, &criterion);
             (serde_json::Value::Bool(yes), Some(if yes { 0.82 } else { 0.15 }))
         }
         Operation::Classify => (serde_json::Value::String(criterion), Some(0.75)),
@@ -392,4 +423,20 @@ pub fn item_error(key: &str, message: &str) -> ItemResponse {
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{matches, predict_yes};
+
+    #[test]
+    fn confirm_question_keeps_a_candidate_that_appears_in_the_text() {
+        let road = "A large hairy biped crossed the logging road";
+        assert!(predict_yes(road, "is biped a creature?"));
+        assert!(!predict_yes(road, "is aircraft a color?"));
+        assert!(predict_yes("Large gray triangular aircraft", "is gray a color?"));
+        assert!(!predict_yes("Large gray triangular aircraft", "is night a color?"));
+        assert!(matches(road, "biped"));
+        assert!(!matches(road, "is biped a creature?"));
+    }
 }
