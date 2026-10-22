@@ -485,6 +485,7 @@ pub fn init_all_with_transport(transport: Transport) {
     rvbbit_resolve::set_enum_labels(rvbbit_catalog::enum_labels);
     rvbbit_dispatch::define_gucs();
     rvbbit_dispatch::start();
+    nodeagg::set_summary_prefetcher(rvbbit_dispatch::prefetch_summaries);
 }
 
 // A PgError-payload panic is the ereport-through-infallible-C idiom (a sort

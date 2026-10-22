@@ -388,6 +388,42 @@ fn estimate_size_math_matches_tableam_c() {
     assert_eq!(pages, 3);
     assert_eq!(tuples, 75.0);
     assert_eq!(allvisfrac, 0.0);
+
+    // Un-ANALYZEd heap: 1 real page, reltuples still -1, density 0.4, and
+    // the 10-page floor. That is the "estimated 4 rows" MEANS plan.
+    block_relation_estimate_size_math(
+        1,
+        0,
+        -1.0,
+        0,
+        false,
+        |_| Ok(0.4),
+        None,
+        &mut pages,
+        &mut tuples,
+        &mut allvisfrac,
+    )
+    .unwrap();
+    assert_eq!(pages, 10);
+    assert_eq!(tuples, 4.0);
+
+    // ANALYZE wrote reltuples = 12 and relpages = 1. The floor does not
+    // apply, and the estimate is the actual row count.
+    block_relation_estimate_size_math(
+        1,
+        1,
+        12.0,
+        0,
+        false,
+        |_| panic!("analyzed stats must not use the width fallback"),
+        None,
+        &mut pages,
+        &mut tuples,
+        &mut allvisfrac,
+    )
+    .unwrap();
+    assert_eq!(pages, 1);
+    assert_eq!(tuples, 12.0);
 }
 
 #[test]
