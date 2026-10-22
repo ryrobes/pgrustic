@@ -1055,11 +1055,17 @@ fn run_batch(
     // provider call after another.
     let slots = server.cfg.concurrency.max(1);
     let gate = Arc::new((Mutex::new(slots), Condvar::new()));
+    let display_role = meter_role();
     thread::scope(|scope| {
         for (i, item) in req.items.iter().enumerate() {
             let gate = Arc::clone(&gate);
             let outputs = Arc::clone(&outputs);
+            let display_role = display_role.clone();
             scope.spawn(move || {
+                // Scoped workers do not inherit thread-locals. Without this
+                // copy, MEANS/CLASSIFY/EXTRACT/RERANK meters fall back to
+                // the cache tenant ("local") and disappear from my_calls.
+                DISPLAY_TENANT.with(|slot| *slot.borrow_mut() = display_role);
                 acquire(&gate);
                 let result = run_item(server, tenant, operation, mode, req, item, audit);
                 release(&gate);
@@ -2276,6 +2282,7 @@ fn miss_meter(
         cache: "miss".into(),
         items: 1,
         tenant: meter_tenant(tenant),
+        role: meter_role(),
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
         node,
@@ -2318,6 +2325,7 @@ fn saved_meter(
         cache: cache.into(),
         items: 1,
         tenant: meter_tenant(tenant),
+        role: meter_role(),
         timestamp: rfc3339_now(),
         generation_id: usage.generation_id.clone(),
         node,
@@ -2356,6 +2364,7 @@ fn meter_cached(
         cache: cache.into(),
         items: 1,
         tenant: meter_tenant(tenant),
+        role: meter_role(),
         timestamp: rfc3339_now(),
         generation_id: stored.generation_id.clone(),
         node,
@@ -2939,6 +2948,7 @@ fn lookup_hit_meter(tenant: &str, stored: &Scored) -> CallMeter {
         cache: "hit".into(),
         items: 1,
         tenant: meter_tenant(tenant),
+        role: meter_role(),
         timestamp: rfc3339_now(),
         generation_id: stored.generation_id.clone(),
         node: None,
@@ -3153,8 +3163,12 @@ std::thread_local! {
 
 /// Cache keys keep [`tenant_of`]. The call log row uses the SQL role when
 /// the client sent `X-Rvbbit-Role`, so `rvbbit.my_calls` can filter it.
+fn meter_role() -> String {
+    DISPLAY_TENANT.with(|slot| slot.borrow().clone())
+}
+
 fn meter_tenant(cache_tenant: &str) -> String {
-    let display = DISPLAY_TENANT.with(|slot| slot.borrow().clone());
+    let display = meter_role();
     if display.is_empty() {
         cache_tenant.to_string()
     } else {

@@ -357,6 +357,7 @@ fn meter(spec: &ServerSpec, tool: &str, latency_ms: u64, cache: &str, status: &s
         cache: cache.into(),
         items: 1,
         tenant: role.to_string(),
+        role: role.to_string(),
         timestamp: stamp(),
         generation_id: Some(status.into()),
         identical: None,

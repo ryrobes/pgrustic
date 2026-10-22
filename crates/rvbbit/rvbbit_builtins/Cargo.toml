@@ -11,6 +11,7 @@ path = "src/lib.rs"
 datum = { path = "../../_support/types/datum" }
 serde_json = "1"
 rvbbit_catalog = { path = "../rvbbit_catalog" }
+rvbbit_cost = { path = "../rvbbit_cost" }
 rvbbit_dispatch = { path = "../rvbbit_dispatch" }
 rvbbit_oids = { path = "../rvbbit_oids" }
 rvbbit_resolve = { path = "../rvbbit_resolve" }

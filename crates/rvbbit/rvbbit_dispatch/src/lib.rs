@@ -210,6 +210,10 @@ pub fn define_gucs() {
             "semantic.max_cost",
             "Pre-flight USD cap. An estimate above this errors before any provider call. Empty disables the cap.",
         ),
+        (
+            "semantic.capture_actual",
+            "When on, the executor snapshots provider calls and USD for rvbbit.last_actual(). The inbound audit sets this for the user statement only.",
+        ),
         ("semantic.retry", "Default RETRY count."),
         ("semantic.threshold", "Default noul cutoff."),
         (
@@ -2191,6 +2195,7 @@ pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
             "cache": meter.cache,
             "items": meter.items,
             "tenant": meter.tenant,
+            "role": meter.role,
             "generation_id": meter.generation_id,
             "node": meter.node,
             "score": meter.score,

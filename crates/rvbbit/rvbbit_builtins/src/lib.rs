@@ -13,7 +13,8 @@ use rvbbit_oids::{
     CONSENSUS_TRANS_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_MANY_NAME,
     EXTRACT_MANY_OID, EXTRACT_NAME, EXTRACT_OID, EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, FLOW_NAME,
     FLOW_OID, GETDEF_NAME, MCP_INVOKE_NAME, MCP_INVOKE_OID,
-    GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_FOR_NAME,
+    GETDEF_OID, LAST_ACTUAL_NAME, LAST_ACTUAL_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME,
+    MEANS_SCORE_OID, RERANK_FOR_NAME,
     RERANK_FOR_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID, SUMMARIZE_FINAL_NAME,
     SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID, SUMMARIZE_TRANS_NAME,
     SUMMARIZE_TRANS_OID, USER_NAME, USER_OID, SIMILARITY_NAME, SIMILARITY_OID,
@@ -519,6 +520,11 @@ fn user_value(fcinfo: &mut Fcinfo, oid: u32, value: &str) -> PgResult<Datum> {
     Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), value.as_bytes())?))
 }
 
+pub fn rvbbit_last_actual(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let text = rvbbit_cost::last_actual_text();
+    Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), text.as_bytes())?))
+}
+
 pub fn rvbbit_call_log(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     rvbbit_resolve::ensure()?;
     let urls = rvbbit_catalog::hutch_urls()?;
@@ -718,6 +724,14 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: false,
         retset: false,
         func: rvbbit_call_log as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: LAST_ACTUAL_OID,
+        name: LAST_ACTUAL_NAME,
+        nargs: 0,
+        strict: false,
+        retset: false,
+        func: rvbbit_last_actual as PGFunction,
     },
     FmgrBuiltin {
         foid: DECIDE_OID,

@@ -425,6 +425,7 @@ fn mock_meter(op: Operation, role: &str) -> CallMeter {
         cache: "miss".into(),
         items: 1,
         tenant: if role.is_empty() { "mock".into() } else { role.to_string() },
+        role: role.to_string(),
         timestamp: "1970-01-01T00:00:00.000Z".into(),
         generation_id: None,
         identical: None,

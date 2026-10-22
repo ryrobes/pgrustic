@@ -65,11 +65,53 @@ CREATE TABLE IF NOT EXISTS rvbbit.mcp_audit (
     semantic_calls double precision
 );
 
-ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS status text;
-ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS error text;
-ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS cost_usd double precision;
-ALTER TABLE rvbbit.mcp_audit ADD COLUMN IF NOT EXISTS semantic_calls double precision;
+-- ADD COLUMN IF NOT EXISTS notices "column ... already exists, skipping"
+-- on every re-run. Add the column only when pg_attribute does not have it.
+DO $rvbbit_audit_cols$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rvbbit' AND c.relname = 'mcp_audit'
+          AND a.attname = 'status' AND NOT a.attisdropped
+    ) THEN
+        ALTER TABLE rvbbit.mcp_audit ADD COLUMN status text;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rvbbit' AND c.relname = 'mcp_audit'
+          AND a.attname = 'error' AND NOT a.attisdropped
+    ) THEN
+        ALTER TABLE rvbbit.mcp_audit ADD COLUMN error text;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rvbbit' AND c.relname = 'mcp_audit'
+          AND a.attname = 'cost_usd' AND NOT a.attisdropped
+    ) THEN
+        ALTER TABLE rvbbit.mcp_audit ADD COLUMN cost_usd double precision;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rvbbit' AND c.relname = 'mcp_audit'
+          AND a.attname = 'semantic_calls' AND NOT a.attisdropped
+    ) THEN
+        ALTER TABLE rvbbit.mcp_audit ADD COLUMN semantic_calls double precision;
+    END IF;
+END
+$rvbbit_audit_cols$;
 
+-- Future tables created by this role (rvbbit setup after this script)
+-- are granted too. ALL TABLES only covers relations that exist now.
+ALTER DEFAULT PRIVILEGES IN SCHEMA rvbbit GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO rvbbit_auth;
+ALTER DEFAULT PRIVILEGES IN SCHEMA rvbbit GRANT USAGE, SELECT ON SEQUENCES TO rvbbit_auth;
 GRANT USAGE ON SCHEMA rvbbit TO rvbbit_auth;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA rvbbit TO rvbbit_auth;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA rvbbit TO rvbbit_auth;

@@ -80,13 +80,33 @@ pub fn load() -> PgResult<()> {
         rvbbit_resolve::install_mcp_tools(Vec::new());
         return Ok(());
     }
-    // mcp.server holds command lines and headers. A mapped semantic role
-    // can run MEANS without being granted that schema. Leave the process
-    // cache as it is; a role that can read mcp refreshes it.
+    // mcp.server holds command lines and headers. A mapped role is not
+    // granted that schema. Read the rows as the table owner so the planner
+    // can still batch the tool, and restore the session user before return.
+    // An empty cache here leaves count(*) over the tool on the serial path.
     let usage = scalar("SELECT has_schema_privilege(current_user, 'mcp', 'USAGE')")?;
-    if !matches!(usage.as_deref(), Some("t") | Some("true") | Some("on")) {
+    if matches!(usage.as_deref(), Some("t") | Some("true") | Some("on")) {
+        return load_rows();
+    }
+    let Some(owner) = scalar(
+        "SELECT c.relowner::text FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'mcp' AND c.relname = 'server'",
+    )?
+    else {
+        return Ok(());
+    };
+    let oid: u32 = owner.parse().unwrap_or(0);
+    if oid == 0 {
         return Ok(());
     }
+    let guard = miscinit::SecContextGuard::security_restricted(oid);
+    let result = load_rows();
+    guard.restore();
+    result
+}
+
+fn load_rows() -> PgResult<()> {
     let rows = query(
         "SELECT t.nsp, t.name, t.server, t.tool, COALESCE(t.procoid::text, '0'), \
                 COALESCE(t.argtypes, '[]'), COALESCE(t.argkeys, '[]'), \

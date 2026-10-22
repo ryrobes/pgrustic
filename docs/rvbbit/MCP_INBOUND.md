@@ -47,9 +47,12 @@ grants it to every role inserted into `rvbbit.users` (a trigger covers
 rows added later). Once the catalog tables exist, that role has `USAGE`
 on schema `rvbbit` and `SELECT` on `semop`, `semfn`, `backend`, `model`,
 `decision_tree`, and `workflow`. `rvbbit.my_calls` is a security-barrier
-view of `rvbbit.calls` filtered to `tenant = current_user`. Mapped roles
-read their own rows there. The full `rvbbit.calls` log stays with the
-owner.
+view of `rvbbit.calls` filtered to `tenant = current_user`. The call log
+stores that role in both `tenant` and `role`. Mapped roles read their
+own rows there. The full `rvbbit.calls` log stays with the owner.
+`rvbbit_auth` receives `ALTER DEFAULT PRIVILEGES` plus explicit grants
+when the catalog is set up, so either bootstrap order can read the
+tables. OAuth statements do not load the semantic catalog.
 
 `RVBBIT_PG_CONNINFO` is the authenticator connection, usually a local
 socket as `rvbbit_auth`. Login is a separate TCP connection as the

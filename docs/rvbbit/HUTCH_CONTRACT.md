@@ -381,7 +381,8 @@ Generation fallback (`data` object):
 | `latency_ms` | hutch time for this call, including a generation GET |
 | `cache` | `hit`, `miss`, or `single-flight` |
 | `items` | 1. Hutch-lite fans a batch out to one provider call per item |
-| `tenant` | blake3 hex of the bearer, or `HUTCH_TENANT` |
+| `tenant` | SQL role from `X-Rvbbit-Role` when the client sent one, otherwise the cache tenant (blake3 hex of the bearer, or `HUTCH_TENANT`). Cache keys stay on the cache tenant |
+| `role` | the same SQL role, empty when the header was absent |
 | `timestamp` (SQL column `ts`) | UTC RFC3339 |
 | `generation_id` | provider `id`, including on a hit so the avoided call can be found |
 | `node` | tree node `{id}:{question}` when the call came from `rvbbit.decide`; null for MEANS, classify, and extract. SQL column `node` |

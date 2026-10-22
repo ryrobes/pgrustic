@@ -145,12 +145,23 @@ pub fn ensure_and_load() -> PgResult<()> {
 /// Planner refresh. Selects the catalog when it is already installed and
 /// does not take an advisory lock or run DDL.
 pub fn load_installed() -> PgResult<()> {
-    if CATALOG_LOADED.with(|loaded| loaded.get()) {
-        return Ok(());
-    }
     let Some(_guard) = CatalogGuard::enter() else {
         return Ok(());
     };
+    // OAuth runs as rvbbit_auth. It only touches the auth tables, and a
+    // catalog read of semfn fails when bootstrap ran before the tables
+    // were granted. Do not mark the cache loaded: this backend may SET
+    // ROLE and plan a semantic statement next.
+    if scalar("SELECT current_user")?.as_deref() == Some("rvbbit_auth") {
+        return Ok(());
+    }
+    if CATALOG_LOADED.with(|loaded| loaded.get()) {
+        // IMPORT FOREIGN TOOLS can land after the first plan. Refresh the
+        // tool cache every statement so count(*) under an aggregate still
+        // sees the new oid. Semantic rows stay as they were.
+        note_call_role()?;
+        return mcp::load();
+    }
     note_call_role()?;
     // `semfn` is created before `semop`. A plan started between those two
     // statements must not reload: the join targets `semop`.
@@ -1322,7 +1333,7 @@ fn ensure_schema() -> PgResult<()> {
     if !catalog_writes_allowed()? {
         return require_core_tables();
     }
-    if schema_current()? && !pending_user_grants()? {
+    if schema_current()? && !pending_user_grants()? && !pending_auth_grants()? {
         return Ok(());
     }
     // Advisory xact locks fail on a hot standby. Writers only.
@@ -1339,16 +1350,16 @@ fn ensure_schema() -> PgResult<()> {
            AND a.attname = 'labels' AND NOT a.attisdropped",
     )?;
     if have_labels.is_none() {
-        exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS labels text")?;
+        exec("ALTER TABLE rvbbit.semfn ADD COLUMN labels text")?;
     }
     if !catalog_column("semfn", "threshold")? {
-        exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS threshold float8")?;
+        exec("ALTER TABLE rvbbit.semfn ADD COLUMN threshold float8")?;
     }
     if !catalog_column("semop", "threshold")? {
-        exec("ALTER TABLE rvbbit.semop ADD COLUMN IF NOT EXISTS threshold float8")?;
+        exec("ALTER TABLE rvbbit.semop ADD COLUMN threshold float8")?;
     }
     if !catalog_column("semfn", "clauses")? {
-        exec("ALTER TABLE rvbbit.semfn ADD COLUMN IF NOT EXISTS clauses text")?;
+        exec("ALTER TABLE rvbbit.semfn ADD COLUMN clauses text")?;
     }
     // rvbbit.calls is a view over the live hutch log. Clusters created
     // before it already have dump_sql, so this is not part of FUNCTION_DDL.
@@ -1374,8 +1385,15 @@ fn ensure_schema() -> PgResult<()> {
         || !catalog_column("calls", "score")?
         || !catalog_column("calls", "identical")?
         || !catalog_column("calls", "server")?
+        || !catalog_column("calls", "role")?
     {
         exec(CALLS_VIEW)?;
+    }
+    if proc_missing("last_actual", "rvbbit_last_actual", 0)? {
+        exec(
+            "CREATE FUNCTION rvbbit.last_actual() RETURNS text \
+             LANGUAGE internal VOLATILE PARALLEL UNSAFE AS 'rvbbit_last_actual'",
+        )?;
     }
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
@@ -1470,9 +1488,22 @@ fn schema_current() -> PgResult<bool> {
         && relation_exists("mcp", "tool")?
         && catalog_column("semfn", "clauses")?
         && catalog_column("calls", "server")?
+        && catalog_column("calls", "role")?
         && scalar("SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_semantic_user'")?.is_some()
         && !proc_missing("flow", "rvbbit_flow", 3)?
-        && !proc_missing("mcp_invoke_text", "rvbbit_mcp_invoke_text", 5)?)
+        && !proc_missing("mcp_invoke_text", "rvbbit_mcp_invoke_text", 5)?
+        && !proc_missing("last_actual", "rvbbit_last_actual", 0)?)
+}
+
+fn pending_auth_grants() -> PgResult<bool> {
+    if scalar("SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_auth'")?.is_none() {
+        return Ok(false);
+    }
+    if !relation_exists("rvbbit", "semfn")? {
+        return Ok(false);
+    }
+    let privs = scalar("SELECT has_table_privilege('rvbbit_auth', 'rvbbit.semfn', 'SELECT')")?;
+    Ok(!matches!(privs.as_deref(), Some("t") | Some("true") | Some("on")))
 }
 
 fn pending_user_grants() -> PgResult<bool> {
@@ -1531,7 +1562,7 @@ fn relation_exists(nsp: &str, rel: &str) -> PgResult<bool> {
 
 const MY_CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.my_calls WITH (security_barrier = true) AS \
     SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
-           latency_ms, provider_latency_ms, cache, items, tenant, \
+           latency_ms, provider_latency_ms, cache, items, tenant, role, \
            generation_id, node, score, identical, server, tool, status, ts \
     FROM rvbbit.calls \
     WHERE tenant = current_user";
@@ -1554,6 +1585,24 @@ fn ensure_grants() -> PgResult<()> {
     }
     exec(MY_CALLS_VIEW)?;
     exec("GRANT SELECT ON rvbbit.my_calls TO rvbbit_semantic_user")?;
+    // bootstrap.sql's GRANT ALL TABLES runs before these relations exist.
+    // Default privileges cover objects this role creates later. Explicit
+    // grants cover objects that already exist, either order.
+    if scalar("SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_auth'")?.is_some() {
+        exec(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA rvbbit \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO rvbbit_auth",
+        )?;
+        exec(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA rvbbit \
+             GRANT USAGE, SELECT ON SEQUENCES TO rvbbit_auth",
+        )?;
+        exec("GRANT USAGE ON SCHEMA rvbbit TO rvbbit_auth")?;
+        exec(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA rvbbit TO rvbbit_auth",
+        )?;
+        exec("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA rvbbit TO rvbbit_auth")?;
+    }
     if !relation_exists("rvbbit", "users")? {
         return Ok(());
     }
@@ -1742,14 +1791,14 @@ const SCHEMA_DDL: &[&str] = &[
 
 const CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.calls AS \
     SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
-           latency_ms, provider_latency_ms, cache, items, tenant, \
+           latency_ms, provider_latency_ms, cache, items, tenant, role, \
            generation_id, node, score, identical, server, tool, status, \
            ts::timestamptz AS ts \
     FROM json_to_recordset(rvbbit.call_log()::json) AS r( \
         op text, model text, tokens_in bigint, tokens_out bigint, \
         cost float8, cost_saved float8, latency_ms float8, \
         provider_latency_ms float8, cache text, items int, \
-        tenant text, generation_id text, node text, score float8, \
+        tenant text, role text, generation_id text, node text, score float8, \
         identical boolean, server text, tool text, status text, ts text)";
 
 const FUNCTION_DDL: &[&str] = &[

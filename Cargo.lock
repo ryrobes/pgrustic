@@ -18018,6 +18018,7 @@ version = "0.0.0"
 dependencies = [
  "datum",
  "rvbbit_catalog",
+ "rvbbit_cost",
  "rvbbit_dispatch",
  "rvbbit_oids",
  "rvbbit_resolve",
@@ -18033,6 +18034,7 @@ version = "0.0.0"
 dependencies = [
  "mcp_core",
  "mcx",
+ "miscinit",
  "rvbbit_contract",
  "rvbbit_dispatch",
  "rvbbit_oids",

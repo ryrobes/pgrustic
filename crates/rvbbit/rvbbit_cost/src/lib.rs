@@ -855,6 +855,8 @@ pub fn disarm_query() {
 
 std::thread_local! {
     static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LAST_ACTUAL: std::cell::RefCell<Actual> = std::cell::RefCell::new(Actual::default());
     /// Plan node that owns an MCP tool in its target list. The tool's SQL
     /// function is its own Result, and that inner `charge_scope` used to
     /// steal the actuals from the scan or Result the user sees.
@@ -932,6 +934,13 @@ pub fn begin_query() {
     if prev > 0 {
         return;
     }
+    // The inbound audit arms this for the user statement only. Nested SPI
+    // (catalog preload of the following read) must not replace the snapshot.
+    CAPTURE.with(|flag| {
+        flag.set(guc("semantic.capture_actual").is_some_and(|value| {
+            matches!(value.as_str(), "on" | "true" | "t" | "1")
+        }))
+    });
     clear_mcp_batches();
     let mut q = query();
     q.checked = false;
@@ -944,7 +953,25 @@ pub fn begin_query() {
 /// The next statement's planner may arm a new estimate once this thread's
 /// outermost execution has finished.
 pub fn end_query() {
-    EXEC_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    let left = EXEC_DEPTH.with(|d| {
+        let prev = d.get();
+        let next = prev.saturating_sub(1);
+        d.set(next);
+        next
+    });
+    if left == 0 && CAPTURE.with(|flag| flag.replace(false)) {
+        let total = query().total.clone();
+        LAST_ACTUAL.with(|slot| *slot.borrow_mut() = total);
+    }
+}
+
+/// `calls,usd` from the last statement that ran with
+/// `semantic.capture_actual` on. A later catalog read does not replace it.
+pub fn last_actual_text() -> String {
+    LAST_ACTUAL.with(|slot| {
+        let act = slot.borrow();
+        format!("{},{:.10}", act.calls, act.usd)
+    })
 }
 
 pub struct ChargeScope {

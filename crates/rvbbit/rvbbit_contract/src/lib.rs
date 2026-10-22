@@ -258,7 +258,14 @@ pub struct CallMeter {
     /// Items covered by this provider call. Hutch-lite fans a batch out,
     /// so this is 1.
     pub items: u32,
+    /// Call-log tenant. The SQL role from `X-Rvbbit-Role` when the client
+    /// sent one, otherwise the cache tenant. Cache keys do not use this.
     pub tenant: String,
+    /// SQL role from `X-Rvbbit-Role` (`SET LOCAL ROLE` / `current_user`).
+    /// Empty when the client did not send the header. `rvbbit.my_calls`
+    /// exposes this beside `tenant`.
+    #[serde(default)]
+    pub role: String,
     /// UTC RFC3339 with milliseconds.
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
