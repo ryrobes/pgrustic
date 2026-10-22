@@ -13,6 +13,11 @@ mod embedding;
 pub use embedding::{cosine, mock_embedding, normalize_embed_text, ABOUT_THRESHOLD, EMBED_MODEL, EMBED_USD_PER_MILLION};
 
 pub const CONTRACT_VERSION: &str = "rvbbit-hutch-v1";
+
+/// Call-meter rows kept by hutch, and the largest `GET /v1/calls` read.
+/// `rvbbit.calls` asks for this many. 1024 truncated a scale run; the
+/// ledger and the query share one cap.
+pub const CALL_LOG_CAP: usize = 1_048_576;
 pub const CACHE_KEY_VERSION: &str = "rvbbit-cache-v2";
 
 pub const HEADER_CONTRACT: &str = "X-Rvbbit-Contract";

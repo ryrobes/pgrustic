@@ -70,7 +70,7 @@ Manifests (dependency lines only):
 | `crates/rvbbit/rvbbit_resolve` | Process-local catalog cache and the function pointers `seams_init` installs. Breaks the parser → SPI cycle. |
 | `crates/rvbbit/rvbbit_catalog` | Schema `rvbbit`, DDL, `pg_depend`, grants, comments, `dump_sql` / `restore_sql`. |
 | `crates/rvbbit/hutch_mock` | HTTP stand-in for `rvbbit-hutch-v1`. `POST /v1/means` is an alias of `/v1/predict` and accepts the batch body, not the spike's JSON array. |
-| `crates/rvbbit/rvbbit_hutch_lite` | Early real hutch. MEANS and fixed-label classify call the OpenRouter Decisions API (Jev). Extract and open-ended classify stay on chat. In-memory cache, single-flight. `TAKES` / `PICK` are still a parser error. Embed and rerank are stubbed. |
+| `crates/rvbbit/rvbbit_hutch_lite` | Early real hutch. MEANS and fixed-label classify call the OpenRouter Decisions API (Jev). Extract and open-ended classify stay on chat. In-memory cache, single-flight. `TAKES` / `PICK` are still a parser error. `/v1/embed` calls OpenRouter embeddings. Rerank calls a dedicated reranker or the Jev noul fallback. Transient transport errors are retried. |
 | `crates/rvbbit/grammar/rvbbit.y` | Standalone bison grammar. Not linked into the engine. |
 
 ## Syntax

@@ -322,10 +322,14 @@ The operator value wins when both are set. An absent operator uses the
 function threshold. Both absent means the server default.
 
 `ABOUT` does not use that noul cutoff. It embeds the row and the
-criterion (`POST /v1/embed`, model `openai/text-embedding-3-small`) and
-keeps the row when cosine similarity is at least 0.40. That default is
-the gap on the mock embedding fixtures: a biped note against `biped`
-scores about 0.54, and an invoice against `biped` scores about 0.26.
+criterion (`POST /v1/embed` on hutch-lite, which calls OpenRouter
+`POST {base}/embeddings` with model `openai/text-embedding-3-small`) and
+keeps the row when cosine similarity is at least 0.30. Live scores for
+a relevant note sit around 0.40–0.65, and an irrelevant note stays at
+or below 0.27. The mock geometry still straddles the same line: a biped
+note against `biped` scores about 0.54, and an invoice against `biped`
+scores about 0.26. A catalog row that stored the old 0.40 default is
+updated to 0.30; a different threshold is left as written.
 `rvbbit.semantic_similarity(a, b)` returns the cosine. An inner join
 `WHERE a.body ABOUT b.note` is batched the same way as a scan filter.
 Vectors are cached per normalized text and model, so the criterion is

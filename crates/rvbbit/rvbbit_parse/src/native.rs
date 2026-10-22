@@ -409,6 +409,12 @@ fn rewrite_pipe(sql: &str, pipe: usize, out: &mut String) -> Option<usize> {
 
 fn pipe_user(sql: &str, at: usize, left: &str, name: &str) -> Option<(usize, String)> {
     let b = sql.as_bytes();
+    // `body |> fn p` is a column alias. `AS p` already stops the scan and
+    // stays in the source. A comma, a string, or a parenthesized expression
+    // is still an argument (`|> mentions 'biped'`, `|> fn (other)`).
+    if let Some((alias_end, alias)) = bare_pipe_alias(sql, skip_ws(b, at)) {
+        return Some((alias_end, format!("rvbbit.{name}(({left})) AS {alias}")));
+    }
     let mut end = at;
     let mut extras = Vec::new();
     loop {
@@ -451,6 +457,29 @@ fn pipe_user(sql: &str, at: usize, left: &str, name: &str) -> Option<(usize, Str
     }
     call.push(')');
     Some((end, call))
+}
+
+/// One bare identifier that is not a clause word and not the start of a
+/// larger expression (`col(`, `col.field`, `col::type`).
+fn bare_pipe_alias(sql: &str, at: usize) -> Option<(usize, String)> {
+    let b = sql.as_bytes();
+    if at >= b.len() || !is_ident_start(b[at]) {
+        return None;
+    }
+    let word_end = ident_end(b, at)?;
+    let word = &sql[at..word_end];
+    let lower = word.to_ascii_lowercase();
+    if is_clause_stop(&lower) || matches!(lower.as_str(), "with" | "on" | "fetch") {
+        return None;
+    }
+    let next = skip_ws(b, word_end);
+    if next < b.len() && matches!(b[next], b'(' | b'.' | b'[' | b'\'') {
+        return None;
+    }
+    if next + 1 < b.len() && b[next] == b':' && b[next + 1] == b':' {
+        return None;
+    }
+    Some((word_end, word.to_string()))
 }
 
 fn pipe_means(sql: &str, at: usize, left: &str, op: &str) -> Option<(usize, String)> {
@@ -1293,7 +1322,17 @@ fn split_classify(body: &str) -> Option<(String, Vec<String>, Option<String>)> {
         return None;
     }
     if mode == "as" {
-        let name = unquote_one(rest.trim())?;
+        let trimmed = rest.trim();
+        // `CLASSIFY(expr AS ('a','b'))` is the label list, same as INTO.
+        // `CLASSIFY(expr AS enumname)` stays an enum lookup.
+        if trimmed.starts_with('(') {
+            let labels = split_labels(trimmed);
+            if labels.len() < 2 {
+                return None;
+            }
+            return Some((expr, labels, None));
+        }
+        let name = unquote_one(trimmed)?;
         if name.is_empty() {
             return None;
         }
@@ -1722,8 +1761,32 @@ mod tests {
         assert!(out.contains("FROM t"), "{out}");
         let extra = rewrite_native_semantic("SELECT notes |> mentions 'biped'").unwrap();
         assert!(extra.contains("rvbbit.mentions((notes), ('biped'))"), "{extra}");
+        let aliased = rewrite_native_semantic("SELECT notes |> is_biped p FROM t").unwrap();
+        assert!(
+            aliased.contains("rvbbit.is_biped((notes)) AS p"),
+            "{aliased}"
+        );
+        assert!(aliased.contains("FROM t"), "{aliased}");
+        assert!(!aliased.contains("(p)"), "{aliased}");
+        let paren = rewrite_native_semantic("SELECT notes |> mentions (other)").unwrap();
+        assert!(paren.contains("rvbbit.mentions((notes)"), "{paren}");
+        assert!(paren.contains("(other)"), "{paren}");
+        assert!(!paren.to_ascii_lowercase().contains("as other"), "{paren}");
         let geo = "SELECT p |>> q";
         assert!(rewrite_native_semantic(geo).is_none());
+    }
+
+    #[test]
+    fn classify_as_label_list_matches_into() {
+        let sql = "SELECT CLASSIFY(notes AS ('bigfoot', 'known animal'))";
+        let out = rewrite_native_semantic(sql).unwrap();
+        let into = rewrite_native_semantic(
+            "SELECT CLASSIFY(notes INTO 'bigfoot', 'known animal')",
+        )
+        .unwrap();
+        assert_eq!(out, into, "{out}");
+        assert!(out.contains("rvbbit.classify("), "{out}");
+        assert!(!out.contains("classify_enum"), "{out}");
     }
 
     #[test]

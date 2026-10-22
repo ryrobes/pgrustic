@@ -20,7 +20,7 @@ function of that name is already there.
 | Call | What it runs |
 | --- | --- |
 | `expr MEANS 'criterion'` | Decision. True when the yes-probability clears the cutoff (server default 0.5, or the function or operator `THRESHOLD`). |
-| `expr ABOUT 'criterion'` | Cosine of the two embeddings. Default cutoff 0.40. Not a MEANS decision. |
+| `expr ABOUT 'criterion'` | Cosine of the two embeddings. Default cutoff 0.30. Not a MEANS decision. |
 | `NOT (expr ABOUT 'criterion')` | The predicate negated. There is no catalog negator named `ABOUT`. |
 
 `MEANS` and `ABOUT` are the words the lexer treats as operators. A
@@ -45,7 +45,7 @@ expression. A name the user has already created is not replaced.
 | `rvbbit.summarize(expr, clauses)` | `SUMMARIZE`. `clauses` is the tail (`WITH TAKES 3`), or `''` |
 | `rvbbit.consensus(expr, 'criterion', clauses)` | `CONSENSUS` |
 | `rvbbit.rerank(expr, 'query')` | `expr \|> rerank 'query'` |
-| `rvbbit.semantic_similarity(a, b)` | the cosine `ABOUT` compares to 0.40 |
+| `rvbbit.semantic_similarity(a, b)` | the cosine `ABOUT` compares to 0.30 |
 
 A catalog `CREATE SEMANTIC FUNCTION … RETURNS text LABELS (...)` still
 returns JSON `{"label","score","scores"}`. Native `CLASSIFY` and

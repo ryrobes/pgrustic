@@ -28,11 +28,7 @@ pub struct Shown {
 
 pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
     let plan = node.as_plan()?;
-    let rows = if node.node_tag() == NodeTag::T_Agg {
-        plan.plan_rows
-    } else {
-        child_rows(node).unwrap_or(plan.plan_rows)
-    };
+    let rows = input_rows(node);
     let mut works = Vec::new();
     if node.node_tag() == NodeTag::T_Result || node.node_tag() == NodeTag::T_Agg {
         collect(node, &plan.qual, &mut works);
@@ -439,8 +435,54 @@ unsafe fn text_bytes(ptr: *const u8) -> Option<Vec<u8>> {
     }
 }
 
-fn child_rows(node: Node<'_>) -> Option<f64> {
-    node.as_plan().and_then(|p| p.lefttree).and_then(|c| c.as_plan()).map(|p| p.plan_rows)
+/// Rows the semantic node will read.
+///
+/// An Agg prices its own group count. A scan with no leftover qual returns
+/// the whole table: when that table is small or still un-analyzed, the
+/// planner's 10-page floor is replaced by the counted row count stashed
+/// for that scan. A scan that still has a cheap qual keeps `plan_rows`,
+/// which already includes that qual. The scan node's own `plan_rows` is
+/// not rewritten.
+fn input_rows(node: Node<'_>) -> f64 {
+    let Some(plan) = node.as_plan() else {
+        return 0.0;
+    };
+    if node.node_tag() == NodeTag::T_Agg {
+        return plan.plan_rows;
+    }
+    let Some(child) = plan.lefttree.and_then(|c| c.as_plan()) else {
+        return plan.plan_rows;
+    };
+    if child.qual.is_nil() {
+        if let Some(rows) = counted_scan_rows(child.plan_node_id) {
+            return rows;
+        }
+    }
+    child.plan_rows
+}
+
+thread_local! {
+    static SCAN_ROWS: std::cell::RefCell<std::collections::HashMap<i32, f64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn clear_scan_rows() {
+    SCAN_ROWS.with(|rows| rows.borrow_mut().clear());
+}
+
+/// `plan_node_id` of a base scan → counted rows. Ignored when the count
+/// is missing or not finite.
+pub fn remember_scan_rows(plan_node_id: i32, rows: f64) {
+    if !rows.is_finite() || rows < 0.0 {
+        return;
+    }
+    SCAN_ROWS.with(|slot| {
+        slot.borrow_mut().insert(plan_node_id, rows);
+    });
+}
+
+fn counted_scan_rows(plan_node_id: i32) -> Option<f64> {
+    SCAN_ROWS.with(|slot| slot.borrow().get(&plan_node_id).copied())
 }
 
 pub fn apply_costs(node: Node<'_>) {
@@ -450,7 +492,7 @@ pub fn apply_costs(node: Node<'_>) {
     if let Some(est) = node_estimate(node) {
         let added = est.usd * 1.0e8;
         let rows = if est.filters {
-            child_rows(node).unwrap_or(plan.plan_rows) * est.selectivity
+            input_rows(node) * est.selectivity
         } else {
             plan.plan_rows
         };
@@ -511,7 +553,24 @@ pub fn begin_statement_cost() {
         a.skip += 1;
         return;
     }
+    clear_scan_rows();
     a.frames.push(Frame { usd: 0.0, budget: None });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counted_scan_rows_round_trip_and_clear() {
+        clear_scan_rows();
+        remember_scan_rows(7, 12.0);
+        remember_scan_rows(8, f64::NAN);
+        assert_eq!(counted_scan_rows(7), Some(12.0));
+        assert_eq!(counted_scan_rows(8), None);
+        clear_scan_rows();
+        assert_eq!(counted_scan_rows(7), None);
+    }
 }
 
 pub fn commit_statement_cost() {

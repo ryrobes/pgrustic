@@ -4,6 +4,11 @@
 # function returns the leaf, and a pipe function inlines into Semantic
 # Project. No OpenRouter key.
 #
+# Live, against hutch-lite (spends provider calls):
+#   RVBBIT_USER_FN_LIVE=1 bash scripts/rvbbit_user_fn_demo.sh
+# Requires OPENROUTER_API_KEY. The key is not printed. Mock match counts
+# are not required in live mode; the queries and the batching checks are.
+#
 # Ports: Postgres 55441, mock 8105. The spike on 55432 / 8099 is not used.
 set -euo pipefail
 
@@ -30,6 +35,17 @@ if [[ "$PGPORT" == "55432" || "$HUTCH_PORT" == "8099" ]]; then
   exit 1
 fi
 
+HUTCH_CRATE=hutch_mock
+HUTCH_BIN=hutch_mock
+if [[ "${RVBBIT_USER_FN_LIVE:-}" == "1" ]]; then
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "RVBBIT_USER_FN_LIVE=1 needs OPENROUTER_API_KEY" >&2
+    exit 1
+  fi
+  HUTCH_CRATE=rvbbit_hutch_lite
+  HUTCH_BIN=hutch_lite
+fi
+
 for cmd in gcc g++ curl initdb psql cargo python3; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing command: $cmd" >&2
@@ -51,7 +67,7 @@ if [[ -S "$PGHOST/.s.PGSQL.$PGPORT" ]]; then
 fi
 
 echo "=== build (CC=$CC CXX=$CXX) ==="
-cargo build -p main_main -p hutch_mock --profile fast-profile
+cargo build -p main_main -p "$HUTCH_CRATE" --profile fast-profile
 
 mkdir -p "$RUNDIR"
 MOCK_LOG=$RUNDIR/mock.log
@@ -69,9 +85,9 @@ trap cleanup EXIT
 
 rm -rf "$PGDATA"
 
-echo "=== hutch_mock on 127.0.0.1:$HUTCH_PORT ==="
+echo "=== $HUTCH_BIN on 127.0.0.1:$HUTCH_PORT ==="
 : >"$MOCK_LOG"
-./target/fast-profile/hutch_mock "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
+./target/fast-profile/"$HUTCH_BIN" "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
 
 echo "=== initdb $PGDATA ==="
@@ -161,8 +177,9 @@ rows = int(os.environ["ROWS"])
 calls = stats["calls"]
 got = int(os.environ["FILTER_N"])
 expect = rows - rows // 5
+live = os.environ.get("RVBBIT_USER_FN_LIVE") == "1"
 print(f"filter calls={calls} rows={stats['rows']} max_batch={stats['max_batch']} matches={got}")
-if got != expect:
+if not live and got != expect:
     sys.exit(f"expected {expect} biped rows, got {got}")
 if calls >= rows:
     sys.exit(f"filter was not batched: {calls} calls for {rows} rows")
@@ -189,8 +206,9 @@ rows = int(os.environ["ROWS"])
 calls = stats["calls"]
 got = int(os.environ["PROJ_N"])
 expect = rows - rows // 5
+live = os.environ.get("RVBBIT_USER_FN_LIVE") == "1"
 print(f"project calls={calls} rows={stats['rows']} max_batch={stats['max_batch']} trues={got}")
-if got != expect:
+if not live and got != expect:
     sys.exit(f"expected {expect} true projections, got {got}")
 if calls >= rows:
     sys.exit(f"project was not batched: {calls} calls for {rows} rows")
@@ -213,8 +231,9 @@ rows = int(os.environ["ROWS"])
 got = int(os.environ["TREE_N"])
 expect = rows - rows // 5
 calls = stats["calls"]
+live = os.environ.get("RVBBIT_USER_FN_LIVE") == "1"
 print(f"tree calls={calls} cryptid={got}")
-if got != expect:
+if not live and got != expect:
     sys.exit(f"expected {expect} cryptid leaves, got {got}")
 if calls >= rows:
     sys.exit(f"tree was not batched: {calls} calls for {rows} rows")

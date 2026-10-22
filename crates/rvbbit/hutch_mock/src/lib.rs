@@ -93,7 +93,7 @@ impl Stats {
     fn push_calls(&self, meters: &[CallMeter]) {
         let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
         log.extend(meters.iter().cloned());
-        let extra = log.len().saturating_sub(1024);
+        let extra = log.len().saturating_sub(rvbbit_contract::CALL_LOG_CAP);
         if extra > 0 {
             log.drain(0..extra);
         }
@@ -280,6 +280,22 @@ fn path_only(path: &str) -> &str {
     path.split('?').next().unwrap_or(path)
 }
 
+fn calls_limit(path: &str) -> usize {
+    let cap = rvbbit_contract::CALL_LOG_CAP;
+    let Some(query) = path.split_once('?').map(|(_, q)| q) else {
+        return cap;
+    };
+    for part in query.split('&') {
+        let Some(value) = part.strip_prefix("limit=") else {
+            continue;
+        };
+        if let Ok(n) = value.parse::<usize>() {
+            return n.clamp(1, cap);
+        }
+    }
+    cap
+}
+
 fn route(
     is_post: bool,
     path: &str,
@@ -288,12 +304,13 @@ fn route(
     cfg: &Config,
     stats: &Stats,
 ) -> (u16, String, String) {
+    let raw = path;
     let path = path_only(path);
     if path.starts_with("/stats") {
         return (200, String::new(), stats.json());
     }
     if path == "/v1/calls" {
-        return (200, String::new(), stats.calls_json(1024));
+        return (200, String::new(), stats.calls_json(calls_limit(raw)));
     }
     if path.starts_with("/reset") {
         stats.reset();

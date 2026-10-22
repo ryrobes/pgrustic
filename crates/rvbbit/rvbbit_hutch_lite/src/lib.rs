@@ -43,7 +43,14 @@ use cost::{
     summarize_produced, usage_from_body, ProviderUsage,
 };
 
-const CALL_LOG_CAP: usize = 1024;
+/// Latency samples kept per op and model. The call ledger uses
+/// [`rvbbit_contract::CALL_LOG_CAP`], which is much larger.
+const LATENCY_SAMPLE_CAP: usize = 1024;
+
+/// Attempts for one OpenRouter POST or GET. The first try plus two
+/// retries. Sleeps between them are 50ms then 200ms.
+const TRANSPORT_ATTEMPTS: u32 = 3;
+const TRANSPORT_BACKOFF_MS: [u64; 2] = [50, 200];
 
 thread_local! {
     static AUDIT_SNIP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -281,7 +288,7 @@ struct Cache {
     calls: VecDeque<CallMeter>,
     total_cost_usd: f64,
     cost_saved_usd: f64,
-    /// Provider latency of misses, last [`CALL_LOG_CAP`] per op+model.
+    /// Provider latency of misses, last [`LATENCY_SAMPLE_CAP`] per op+model.
     latency_samples: HashMap<(String, String), VecDeque<u64>>,
     /// Decision-memo and contract-cache hits per op+model. Same reuse
     /// that `rvbbit.calls` records as `cache=hit`.
@@ -2329,7 +2336,7 @@ fn record_call(server: &Server, meter: &CallMeter) {
                 .latency_samples
                 .entry((meter.op.clone(), meter.model.clone()))
                 .or_default();
-            if samples.len() == CALL_LOG_CAP {
+            if samples.len() == LATENCY_SAMPLE_CAP {
                 samples.pop_front();
             }
             samples.push_back(ms);
@@ -2340,7 +2347,7 @@ fn record_call(server: &Server, meter: &CallMeter) {
             .entry((meter.op.clone(), meter.model.clone()))
             .or_default() += 1;
     }
-    if cache.calls.len() == CALL_LOG_CAP {
+    if cache.calls.len() == rvbbit_contract::CALL_LOG_CAP {
         cache.calls.pop_front();
     }
     cache.calls.push_back(meter.clone());
@@ -2389,6 +2396,35 @@ fn fill_generation(server: &Server, usage: &mut ProviderUsage) {
 }
 
 fn post_json(cfg: &Config, agent: &ureq::Agent, url: &str, payload: &str) -> Result<String, String> {
+    with_transport_retry(|| post_json_once(cfg, agent, url, payload))
+}
+
+fn get_json(cfg: &Config, agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    with_transport_retry(|| get_json_once(cfg, agent, url))
+}
+
+/// Retry a dropped TLS session or a reset connection. An HTTP status,
+/// including 4xx, is the provider's answer and is not retried.
+fn with_transport_retry(mut once: impl FnMut() -> Result<String, String>) -> Result<String, String> {
+    let mut attempt = 0u32;
+    loop {
+        match once() {
+            Ok(body) => return Ok(body),
+            Err(message) if retryable_transport(&message) && attempt + 1 < TRANSPORT_ATTEMPTS => {
+                let pause = TRANSPORT_BACKOFF_MS[attempt as usize];
+                attempt += 1;
+                thread::sleep(Duration::from_millis(pause));
+            }
+            Err(message) => return Err(message),
+        }
+    }
+}
+
+fn retryable_transport(message: &str) -> bool {
+    message.starts_with("upstream transport")
+}
+
+fn post_json_once(cfg: &Config, agent: &ureq::Agent, url: &str, payload: &str) -> Result<String, String> {
     let key = cfg.api_key.as_deref().unwrap_or("");
     let send = agent
         .post(url)
@@ -2406,7 +2442,7 @@ fn post_json(cfg: &Config, agent: &ureq::Agent, url: &str, payload: &str) -> Res
     }
 }
 
-fn get_json(cfg: &Config, agent: &ureq::Agent, url: &str) -> Result<String, String> {
+fn get_json_once(cfg: &Config, agent: &ureq::Agent, url: &str) -> Result<String, String> {
     let key = cfg.api_key.as_deref().unwrap_or("");
     let send = agent
         .get(url)
@@ -3003,7 +3039,7 @@ fn calls_limit(query: &str) -> usize {
             continue;
         };
         if let Ok(n) = value.parse::<usize>() {
-            limit = n.clamp(1, CALL_LOG_CAP);
+            limit = n.clamp(1, rvbbit_contract::CALL_LOG_CAP);
         }
     }
     limit
@@ -3107,6 +3143,17 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_errors_retry_and_http_status_does_not() {
+        assert!(retryable_transport(
+            "upstream transport: connection closed via TLS"
+        ));
+        assert!(retryable_transport("upstream transport: tls handshake eof"));
+        assert!(!retryable_transport("upstream HTTP 400: bad request"));
+        assert!(!retryable_transport("upstream HTTP 429: rate limit"));
+        assert!(!retryable_transport("upstream error: connection closed"));
+    }
 
     #[test]
     fn extract_many_keeps_only_strings_and_allows_an_empty_list() {

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # ABOUT on embeddings, against hutch_mock.
-# Cosine of a cached vector, default threshold 0.40, semantic_similarity,
+# Cosine of a cached vector, default threshold 0.30, semantic_similarity,
 # and an inner-join form of the same predicate. No OpenRouter key.
+#
+# Live, against hutch-lite (spends embedding calls):
+#   RVBBIT_ABOUT_LIVE=1 bash scripts/rvbbit_about_embed_demo.sh
+# Requires OPENROUTER_API_KEY. The key is not printed.
 #
 # Ports: Postgres 55442, mock 8106. The spike on 55432 / 8099 is not used.
 set -euo pipefail
@@ -29,6 +33,17 @@ if [[ "$PGPORT" == "55432" || "$HUTCH_PORT" == "8099" ]]; then
   exit 1
 fi
 
+HUTCH_CRATE=hutch_mock
+HUTCH_BIN=hutch_mock
+if [[ "${RVBBIT_ABOUT_LIVE:-}" == "1" ]]; then
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "RVBBIT_ABOUT_LIVE=1 needs OPENROUTER_API_KEY" >&2
+    exit 1
+  fi
+  HUTCH_CRATE=rvbbit_hutch_lite
+  HUTCH_BIN=hutch_lite
+fi
+
 for cmd in gcc g++ curl initdb psql cargo python3; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing command: $cmd" >&2
@@ -50,7 +65,7 @@ if [[ -S "$PGHOST/.s.PGSQL.$PGPORT" ]]; then
 fi
 
 echo "=== build (CC=$CC CXX=$CXX) ==="
-cargo build -p main_main -p hutch_mock --profile fast-profile
+cargo build -p main_main -p "$HUTCH_CRATE" --profile fast-profile
 
 mkdir -p "$RUNDIR"
 MOCK_LOG=$RUNDIR/mock.log
@@ -68,9 +83,9 @@ trap cleanup EXIT
 
 rm -rf "$PGDATA"
 
-echo "=== hutch_mock on 127.0.0.1:$HUTCH_PORT ==="
+echo "=== $HUTCH_BIN on 127.0.0.1:$HUTCH_PORT ==="
 : >"$MOCK_LOG"
-./target/fast-profile/hutch_mock "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
+./target/fast-profile/"$HUTCH_BIN" "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
 
 echo "=== initdb $PGDATA ==="
@@ -163,10 +178,10 @@ echo "biped score=$SIM invoice score=$INV"
 python3 - <<PY
 sim = float("$SIM")
 inv = float("$INV")
-if sim < 0.40:
-    raise SystemExit(f"related cosine {sim} is below 0.40")
-if inv >= 0.40:
-    raise SystemExit(f"invoice cosine {inv} is not below 0.40")
+if sim < 0.30:
+    raise SystemExit(f"related cosine {sim} is below 0.30")
+if inv >= 0.30:
+    raise SystemExit(f"invoice cosine {inv} is not below 0.30")
 PY
 
 echo "=== EXPLAIN similarity project ==="
