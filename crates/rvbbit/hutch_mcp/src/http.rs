@@ -171,7 +171,7 @@ fn call_one(body: &Value) -> Value {
     let tool = body.get("tool").and_then(|v| v.as_str()).unwrap_or("");
     let arguments = body.get("arguments").cloned().unwrap_or(json!({}));
     let opts = opts_of(body, &spec);
-    json!(invoke(&spec, tool, arguments, &opts))
+    json!(invoke(&spec, tool, arguments, &opts, opts.cost_usd))
 }
 
 fn call_batch(body: &Value) -> Value {
@@ -186,27 +186,28 @@ fn call_batch(body: &Value) -> Value {
     for (i, call) in calls.iter().enumerate() {
         let tool = call.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let arguments = call.get("arguments").cloned().unwrap_or(json!({}));
-        if let Some(hit) = cache_get(&spec, &tool, &arguments, &opts) {
+        let price = call_price(call, &opts);
+        if let Some(hit) = cache_get(&spec, &tool, &arguments, &opts, price) {
             results[i] = hit;
             continue;
         }
         if let Err(message) = cost_gate(&opts) {
-            results[i] = error_row(&spec, &tool, &message, 0, "miss", &opts.role);
+            results[i] = error_row(&spec, &tool, &message, 0, "miss", &opts.role, 0.0);
             continue;
         }
-        pending.push((i, tool, arguments));
+        pending.push((i, tool, arguments, price));
     }
     if !pending.is_empty() {
-        let batch = pending.iter().map(|(_, tool, args)| (tool.clone(), args.clone())).collect();
+        let batch = pending.iter().map(|(_, tool, args, _)| (tool.clone(), args.clone())).collect();
         match client::call_many_timed(&spec, batch, Duration::from_millis(opts.timeout_ms), opts.concurrency) {
             Ok(values) => {
-                for ((idx, tool, arguments), timed) in pending.into_iter().zip(values) {
-                    results[idx] = finish(&spec, &tool, &arguments, &opts, timed.result, timed.latency_ms);
+                for ((idx, tool, arguments, price), timed) in pending.into_iter().zip(values) {
+                    results[idx] = finish(&spec, &tool, &arguments, &opts, timed.result, timed.latency_ms, price);
                 }
             }
             Err(message) => {
-                for (idx, tool, _) in pending {
-                    results[idx] = error_row(&spec, &tool, &message, 0, "miss", &opts.role);
+                for (idx, tool, _, price) in pending {
+                    results[idx] = error_row(&spec, &tool, &message, 0, "miss", &opts.role, price);
                 }
             }
         }
@@ -222,6 +223,7 @@ struct Opts {
     max_cost: Option<f64>,
     concurrency: usize,
     role: String,
+    cost_usd: f64,
 }
 
 fn opts_of(body: &Value, spec: &ServerSpec) -> Opts {
@@ -233,19 +235,28 @@ fn opts_of(body: &Value, spec: &ServerSpec) -> Opts {
         max_cost: body.get("max_cost").and_then(|v| v.as_f64()),
         concurrency: body.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
         role: body.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        cost_usd: nonneg(body.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0)),
     }
+}
+
+fn nonneg(price: f64) -> f64 {
+    if price.is_finite() && price > 0.0 { price } else { 0.0 }
+}
+
+fn call_price(call: &Value, opts: &Opts) -> f64 {
+    call.get("cost_usd").and_then(|v| v.as_f64()).map(nonneg).unwrap_or(opts.cost_usd)
 }
 
 fn spec_of(value: &Value) -> Result<ServerSpec, String> {
     serde_json::from_value(value.clone()).map_err(|e| format!("server spec: {e}"))
 }
 
-fn invoke(spec: &ServerSpec, tool: &str, arguments: Value, opts: &Opts) -> Value {
-    if let Some(hit) = cache_get(spec, tool, &arguments, opts) {
+fn invoke(spec: &ServerSpec, tool: &str, arguments: Value, opts: &Opts, price: f64) -> Value {
+    if let Some(hit) = cache_get(spec, tool, &arguments, opts, price) {
         return hit;
     }
     if let Err(message) = cost_gate(opts) {
-        return error_row(spec, tool, &message, 0, "miss", &opts.role);
+        return error_row(spec, tool, &message, 0, "miss", &opts.role, 0.0);
     }
     let mut last = String::new();
     let started = Instant::now();
@@ -253,7 +264,7 @@ fn invoke(spec: &ServerSpec, tool: &str, arguments: Value, opts: &Opts) -> Value
         match client::call_tool(spec, tool, arguments.clone(), Duration::from_millis(opts.timeout_ms)) {
             Ok(value) => {
                 let latency = started.elapsed().as_millis() as u64;
-                return finish(spec, tool, &arguments, opts, Ok(value), latency);
+                return finish(spec, tool, &arguments, opts, Ok(value), latency, price);
             }
             Err(message) => {
                 let tool_error = message.starts_with("mcp-tool:");
@@ -265,7 +276,7 @@ fn invoke(spec: &ServerSpec, tool: &str, arguments: Value, opts: &Opts) -> Value
         }
     }
     let latency = started.elapsed().as_millis() as u64;
-    error_row(spec, tool, &last, latency, "miss", &opts.role)
+    error_row(spec, tool, &last, latency, "miss", &opts.role, price)
 }
 
 fn finish(
@@ -275,6 +286,7 @@ fn finish(
     opts: &Opts,
     value: Result<Value, String>,
     latency_ms: u64,
+    price: f64,
 ) -> Value {
     match value {
         Ok(value) => {
@@ -287,13 +299,13 @@ fn finish(
                     Instant::now(),
                 );
             }
-            ok_row(spec, tool, value, latency_ms, "miss", &opts.role)
+            ok_row(spec, tool, value, latency_ms, "miss", &opts.role, price)
         }
-        Err(message) => error_row(spec, tool, &display_error(&message), latency_ms, "miss", &opts.role),
+        Err(message) => error_row(spec, tool, &display_error(&message), latency_ms, "miss", &opts.role, price),
     }
 }
 
-fn cache_get(spec: &ServerSpec, tool: &str, arguments: &Value, opts: &Opts) -> Option<Value> {
+fn cache_get(spec: &ServerSpec, tool: &str, arguments: &Value, opts: &Opts, price: f64) -> Option<Value> {
     if !opts.read_only || opts.cache_ttl_ms == 0 {
         return None;
     }
@@ -301,7 +313,7 @@ fn cache_get(spec: &ServerSpec, tool: &str, arguments: &Value, opts: &Opts) -> O
     let hit = guard.cache.get(&cache_key(spec, tool, arguments), Instant::now())?;
     drop(guard);
     let value = serde_json::from_str(&hit).unwrap_or(Value::String(hit));
-    Some(ok_row(spec, tool, value, 0, "hit", &opts.role))
+    Some(ok_row(spec, tool, value, 0, "hit", &opts.role, price))
 }
 
 fn cache_key(spec: &ServerSpec, tool: &str, arguments: &Value) -> String {
@@ -320,8 +332,8 @@ fn cost_gate(opts: &Opts) -> Result<(), String> {
     }
 }
 
-fn ok_row(spec: &ServerSpec, tool: &str, value: Value, latency_ms: u64, cache: &str, role: &str) -> Value {
-    let meter = meter(spec, tool, latency_ms, cache, "ok", role);
+fn ok_row(spec: &ServerSpec, tool: &str, value: Value, latency_ms: u64, cache: &str, role: &str, price: f64) -> Value {
+    let meter = meter(spec, tool, latency_ms, cache, "ok", role, price);
     json!({
         "value": value,
         "error": null,
@@ -332,8 +344,8 @@ fn ok_row(spec: &ServerSpec, tool: &str, value: Value, latency_ms: u64, cache: &
     })
 }
 
-fn error_row(spec: &ServerSpec, tool: &str, message: &str, latency_ms: u64, cache: &str, role: &str) -> Value {
-    let meter = meter(spec, tool, latency_ms, cache, "error", role);
+fn error_row(spec: &ServerSpec, tool: &str, message: &str, latency_ms: u64, cache: &str, role: &str, price: f64) -> Value {
+    let meter = meter(spec, tool, latency_ms, cache, "error", role, price);
     json!({
         "value": null,
         "error": message,
@@ -344,14 +356,16 @@ fn error_row(spec: &ServerSpec, tool: &str, message: &str, latency_ms: u64, cach
     })
 }
 
-fn meter(spec: &ServerSpec, tool: &str, latency_ms: u64, cache: &str, status: &str, role: &str) -> CallMeter {
+fn meter(spec: &ServerSpec, tool: &str, latency_ms: u64, cache: &str, status: &str, role: &str, price: f64) -> CallMeter {
+    let price = nonneg(price);
+    let hit = cache == "hit";
     let row = CallMeter {
         op: "mcp".into(),
         model: format!("mcp:{}/{}", spec.name, tool),
         tokens_in: None,
         tokens_out: None,
-        cost_usd: Some(0.0),
-        cost_saved_usd: if cache == "hit" { Some(0.0) } else { None },
+        cost_usd: Some(if hit { 0.0 } else { price }),
+        cost_saved_usd: Some(if hit { price } else { 0.0 }),
         provider_latency_ms: if cache == "hit" { None } else { Some(latency_ms) },
         latency_ms,
         cache: cache.into(),

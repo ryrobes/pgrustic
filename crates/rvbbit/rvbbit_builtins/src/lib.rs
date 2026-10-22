@@ -605,7 +605,12 @@ pub fn rvbbit_mcp_invoke(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) ->
         if !delivery {
             if let rvbbit_dispatch::ScalarHit::Value(_) = &hit {
                 if let Some(tool) = rvbbit_resolve::mcp_tool(&nsp, &name) {
-                    rvbbit_dispatch::note_mcp_memo_hit(&tool.server, &tool.tool, true);
+                    rvbbit_dispatch::note_mcp_memo_hit(
+                        &tool.server,
+                        &tool.tool,
+                        true,
+                        tool.cost_usd.unwrap_or(0.0),
+                    );
                 }
             }
         }

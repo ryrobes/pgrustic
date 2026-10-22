@@ -14,6 +14,8 @@ pub struct McpCallOpts {
     pub read_only: bool,
     pub max_cost: Option<f64>,
     pub concurrency: usize,
+    /// USD charged for a miss. A cache hit records 0 and this value as saved.
+    pub cost_usd: f64,
 }
 
 impl Default for McpCallOpts {
@@ -25,6 +27,7 @@ impl Default for McpCallOpts {
             read_only: false,
             max_cost: None,
             concurrency: 4,
+            cost_usd: 0.0,
         }
     }
 }
@@ -43,6 +46,9 @@ pub fn mcp_list(spec: &ServerSpec) -> Result<Vec<ListedTool>, String> {
 }
 
 pub fn mcp_invoke_tool(tool: &rvbbit_resolve::McpTool, positional_json: &str) -> Result<Value, String> {
+    let model = format!("mcp:{}/{}", tool.server, tool.tool);
+    rvbbit_cost::preflight()?;
+    rvbbit_cost::reject_unpriced_mcp(&model, tool.cost_usd.is_some())?;
     let spec = spec_from_tool(tool);
     let arguments = mcp_arguments(&tool.arg_keys, positional_json)?;
     mcp_call(&spec, &tool.tool, arguments, &opts_from_tool(tool))
@@ -70,6 +76,7 @@ fn opts_from_tool(tool: &rvbbit_resolve::McpTool) -> McpCallOpts {
         read_only: tool.read_only,
         max_cost: tool.max_cost,
         concurrency: 4,
+        cost_usd: tool.cost_usd.unwrap_or(0.0),
     }
 }
 
@@ -83,17 +90,19 @@ pub fn mcp_call(spec: &ServerSpec, tool: &str, arguments: Value, opts: &McpCallO
 
 pub fn mcp_batch_for_tool(
     tool: &rvbbit_resolve::McpTool,
-    calls: Vec<(String, Value)>,
+    calls: Vec<(String, Value, f64)>,
     opts: &McpCallOpts,
 ) -> Result<Vec<Result<Value, String>>, String> {
+    rvbbit_cost::preflight()?;
     mcp_batch(&spec_from_tool(tool), calls, opts)
 }
 
 pub fn mcp_batch(
     spec: &ServerSpec,
-    calls: Vec<(String, Value)>,
+    calls: Vec<(String, Value, f64)>,
     opts: &McpCallOpts,
 ) -> Result<Vec<Result<Value, String>>, String> {
+    rvbbit_cost::preflight()?;
     let body = json!({
         "server": spec,
         "concurrency": opts.concurrency.max(1),
@@ -102,8 +111,9 @@ pub fn mcp_batch(
         "cache_ttl_ms": opts.cache_ttl_ms,
         "read_only": opts.read_only,
         "max_cost": opts.max_cost,
+        "cost_usd": opts.cost_usd,
         "role": crate::call_role(),
-        "calls": calls.into_iter().map(|(tool, arguments)| json!({"tool": tool, "arguments": arguments})).collect::<Vec<_>>(),
+        "calls": calls.into_iter().map(|(tool, arguments, cost_usd)| json!({"tool": tool, "arguments": arguments, "cost_usd": cost_usd})).collect::<Vec<_>>(),
     });
     let text = post("/v1/mcp/batch", &body.to_string(), budget_secs(opts))?;
     let parsed: Value = serde_json::from_str(&text).map_err(|e| format!("mcp batch json: {e}"))?;
@@ -155,6 +165,7 @@ fn call_body(spec: &ServerSpec, tool: &str, arguments: Value, opts: &McpCallOpts
         "cache_ttl_ms": opts.cache_ttl_ms,
         "read_only": opts.read_only,
         "max_cost": opts.max_cost,
+        "cost_usd": opts.cost_usd,
         "role": crate::call_role(),
     })
 }
@@ -162,16 +173,17 @@ fn call_body(spec: &ServerSpec, tool: &str, arguments: Value, opts: &McpCallOpts
 /// A memo the builtin kept from an earlier statement. The gateway never
 /// saw this call, so the row is recorded locally and the analyze counters
 /// still see a cache hit.
-pub fn note_mcp_memo_hit(server: &str, tool: &str, ok: bool) {
+pub fn note_mcp_memo_hit(server: &str, tool: &str, ok: bool, price_usd: f64) {
     let status = if ok { "ok" } else { "error" };
     let model = format!("mcp:{server}/{tool}");
+    let saved = if price_usd.is_finite() && price_usd > 0.0 { price_usd } else { 0.0 };
     crate::push_local_mcp_call(json!({
         "op": "mcp",
         "model": model,
         "tokens_in": null,
         "tokens_out": null,
         "cost": 0.0,
-        "cost_saved": 0.0,
+        "cost_saved": saved,
         "latency_ms": 0,
         "provider_latency_ms": null,
         "cache": "hit",

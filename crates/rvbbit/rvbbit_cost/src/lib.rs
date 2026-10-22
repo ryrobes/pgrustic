@@ -61,7 +61,8 @@ pub enum Op {
     Summarize,
     Decide,
     Embed,
-    /// An outbound MCP tool call. Unpriced: the seed is 0 USD.
+    /// An outbound MCP tool call. The catalog price is the USD seed.
+    /// Unpriced stays 0. A call-log row does not invent a price.
     Mcp,
 }
 
@@ -592,8 +593,10 @@ pub fn estimate(work: &Work) -> Estimate {
         }
     }
     if work.op == Op::Mcp {
-        // Per-tool p50 from rvbbit.calls. The 50ms seed stays when the
-        // tool has not been called.
+        // The catalog price is authoritative. History still supplies the
+        // per-tool latency. An unpriced tool stays at 0 even when an
+        // older call row has a cost.
+        usd_per_item = mcp_unit_usd().unwrap_or(0.0).max(0.0);
         if let Some(ms) = p50_miss(&history_samples(Op::Mcp, &model)) {
             latency_per = ms;
         }
@@ -787,6 +790,8 @@ fn wall_ms(misses: &[MissSample], concurrency: u32) -> f64 {
 struct QueryState {
     armed_usd: Option<f64>,
     clause_budget: Option<f64>,
+    /// MCP models in this statement that have no catalog price.
+    unpriced_mcp: Vec<String>,
     checked: bool,
     node: Option<i32>,
     by_node: HashMap<i32, Actual>,
@@ -798,6 +803,7 @@ impl QueryState {
         Self {
             armed_usd: None,
             clause_budget: None,
+            unpriced_mcp: Vec::new(),
             checked: false,
             node: None,
             by_node: HashMap::new(),
@@ -850,10 +856,47 @@ pub fn disarm_query() {
     let mut q = query();
     q.armed_usd = None;
     q.clause_budget = None;
+    q.unpriced_mcp.clear();
     q.checked = false;
 }
 
+/// Replace the unpriced-tool list for the statement that was just planned.
+pub fn set_mcp_unpriced(tools: Vec<String>) {
+    let mut q = query();
+    q.unpriced_mcp = tools;
+    q.checked = false;
+}
+
+/// Catalog USD for the MCP `estimate` on this thread. `None` means unpriced.
+pub fn with_mcp_unit_usd<T>(price: Option<f64>, f: impl FnOnce() -> T) -> T {
+    MCP_UNIT_USD.with(|slot| {
+        let prev = slot.replace(price);
+        let out = f();
+        slot.set(prev);
+        out
+    })
+}
+
+fn mcp_unit_usd() -> Option<f64> {
+    MCP_UNIT_USD.with(|slot| slot.get())
+}
+
+pub fn mcp_price_required() -> bool {
+    guc("semantic.mcp_require_price").is_some_and(|v| {
+        matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")
+    })
+}
+
+/// Error when `semantic.mcp_require_price` is on and this tool has no price.
+pub fn reject_unpriced_mcp(model: &str, priced: bool) -> Result<(), String> {
+    if priced || !mcp_price_required() {
+        return Ok(());
+    }
+    Err(format!("MCP tool {model} has no cost_usd"))
+}
+
 std::thread_local! {
+    static MCP_UNIT_USD: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
     static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAST_ACTUAL: std::cell::RefCell<Actual> = std::cell::RefCell::new(Actual::default());
@@ -1092,13 +1135,18 @@ pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
 /// `semantic.cost_check = off` skips the check. `semantic.budget` is a third cap.
 /// A failure stays armed, so a later call in the same execution still errors.
 pub fn preflight() -> Result<(), String> {
-    let (usd, clause) = {
+    let (usd, clause, unpriced) = {
         let q = query();
         if q.checked {
             return Ok(());
         }
-        (q.armed_usd.unwrap_or(0.0), q.clause_budget)
+        (q.armed_usd.unwrap_or(0.0), q.clause_budget, q.unpriced_mcp.clone())
     };
+    if mcp_price_required() {
+        if let Some(tool) = unpriced.first() {
+            return Err(format!("MCP tool {tool} has no cost_usd"));
+        }
+    }
     if guc("semantic.cost_check").is_some_and(|v| v.eq_ignore_ascii_case("off")) {
         query().checked = true;
         return Ok(());
@@ -1658,12 +1706,46 @@ mod tests {
         };
         let cold = estimate(&work);
         assert!((cold.latency_ms - 150.0).abs() < 1e-9, "{}", cold.latency_ms);
+        assert!((cold.usd).abs() < 1e-12, "{}", cold.usd);
         let n = ingest_calls_json(
             r#"[{"op":"mcp","model":"mcp:demo/convert_time","cost_usd":0,"latency_ms":900,"cache":"miss"}]"#,
         );
         assert_eq!(n, 1);
         let warm = estimate(&work);
         assert!((warm.latency_ms - 2700.0).abs() < 1e-9, "{}", warm.latency_ms);
+        // A logged cost does not become the price. The catalog does.
+        assert!((warm.usd).abs() < 1e-12, "{}", warm.usd);
+        let priced = with_mcp_unit_usd(Some(0.001), || estimate(&work));
+        assert!((priced.usd - 0.01).abs() < 1e-12, "{}", priced.usd);
+        assert_eq!(priced.calls, 1.0);
+        let still = estimate(&work);
+        assert!((still.usd).abs() < 1e-12, "{}", still.usd);
         reset_history();
+    }
+
+    #[test]
+    fn preflight_rejects_an_unpriced_mcp_tool_when_required() {
+        disarm_query();
+        set_guc_reader(|name| match name {
+            "semantic.mcp_require_price" => Some("on".into()),
+            "semantic.cost_check" => Some("off".into()),
+            _ => None,
+        });
+        set_mcp_unpriced(vec!["mcp:demo/slow".into()]);
+        let err = preflight().unwrap_err();
+        assert!(err.contains("mcp:demo/slow"), "{err}");
+        assert!(err.contains("no cost_usd"), "{err}");
+        set_mcp_unpriced(Vec::new());
+        assert!(preflight().is_ok());
+        disarm_query();
+        set_guc_reader(guc_off);
+        assert!(reject_unpriced_mcp("mcp:demo/slow", false).is_ok());
+        set_guc_reader(|name| {
+            (name == "semantic.mcp_require_price").then(|| "on".into())
+        });
+        let err = reject_unpriced_mcp("mcp:demo/slow", false).unwrap_err();
+        assert!(err.contains("no cost_usd"), "{err}");
+        assert!(reject_unpriced_mcp("mcp:demo/slow", true).is_ok());
+        set_guc_reader(guc_off);
     }
 }

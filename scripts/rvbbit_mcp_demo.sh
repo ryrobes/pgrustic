@@ -251,6 +251,27 @@ SQL
 grep -q 'MCP Provider Calls' "$RUNDIR/aggnow.out"
 grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/aggnow.out"
 
+echo "=== MCP cost_usd is on EXPLAIN before any slow() call ==="
+# No call history yet, so the hit rate is 0 and the total is rows * price.
+# A server default applies until the tool sets its own.
+"${PSQL[@]}" -c "ANALYZE mcp_agg;"
+"${PSQL[@]}" <<SQL
+CREATE OR REPLACE SERVER demo FOREIGN DATA WRAPPER mcp OPTIONS (
+  transport 'stdio',
+  command '${HUTCH_BIN}',
+  args '--mock-stdio',
+  cost_usd '0.002'
+);
+ALTER FOREIGN TOOL mcp_demo.slow OPTIONS (cost_usd 'default');
+SQL
+"${PSQL[@]}" -c "EXPLAIN SELECT count(mcp_demo.slow(x)) FROM mcp_agg;" | tee "$RUNDIR/price-server.out"
+server_usd=$(awk '/MCP Total USD/ {print $NF}' "$RUNDIR/price-server.out")
+python3 -c "import sys; v=float(sys.argv[1]); assert abs(v-0.016)<1e-6, v" "$server_usd"
+"${PSQL[@]}" -c "ALTER FOREIGN TOOL mcp_demo.slow OPTIONS (cost_usd '0.001');"
+"${PSQL[@]}" -c "EXPLAIN SELECT count(mcp_demo.slow(x)) FROM mcp_agg;" | tee "$RUNDIR/price-tool.out"
+tool_usd=$(awk '/MCP Total USD/ {print $NF}' "$RUNDIR/price-tool.out")
+python3 -c "import sys; v=float(sys.argv[1]); assert abs(v-0.008)<1e-6, v" "$tool_usd"
+
 echo "=== slow stdio under count(*) overlaps ==="
 # 8 rows * 200ms is 1600ms when each row opens its own process. Concurrency 4
 # is two waves, plus one process start. The plan must show the MCP Result
@@ -295,6 +316,48 @@ for label in filter count direct; do
   test "$GOT" = "8"
   test "$MS" -lt 1200
 done
+
+echo "=== MCP cost_usd feeds max_cost and the call log ==="
+# slow() is already priced at 0.001. The cap sees that estimate.
+set +e
+CAP_OUT=$("${PSQL[@]}" -c "BEGIN; SET LOCAL semantic.max_cost = '0.0001'; SELECT count(mcp_demo.slow(x)) FROM mcp_agg; COMMIT;" 2>&1)
+CAP_CODE=$?
+set -e
+echo "$CAP_OUT" | tee "$RUNDIR/price-cap.out"
+test "$CAP_CODE" -ne 0
+echo "$CAP_OUT" | grep -q 'exceeds budget'
+"${PSQL[@]}" <<'SQL'
+ALTER FOREIGN TOOL mcp_demo.echo OPTIONS (read_only 'true', cache_ttl '60s', cost_usd '0.001');
+SELECT mcp_demo.echo('price-gate');
+SELECT mcp_demo.echo('price-gate');
+SQL
+MISS=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM rvbbit.my_calls WHERE tool = 'echo' AND cache = 'miss' AND cost >= 0.0009;")
+HIT=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM rvbbit.my_calls WHERE tool = 'echo' AND cache = 'hit' AND cost = 0 AND cost_saved >= 0.0009;")
+echo "priced miss=$MISS hit=$HIT"
+test "$MISS" -ge 1
+test "$HIT" -ge 1
+"${PSQL[@]}" <<SQL
+ALTER FOREIGN TOOL mcp_demo.slow OPTIONS (cost_usd 'default');
+CREATE OR REPLACE SERVER demo FOREIGN DATA WRAPPER mcp OPTIONS (
+  transport 'stdio',
+  command '${HUTCH_BIN}',
+  args '--mock-stdio'
+);
+SQL
+"${PSQL[@]}" -c "EXPLAIN SELECT count(mcp_demo.slow(x)) FROM mcp_agg;" | tee "$RUNDIR/price-zero.out"
+zero_usd=$(awk '/MCP Total USD/ {print $NF}' "$RUNDIR/price-zero.out")
+python3 -c "import sys; v=float(sys.argv[1]); assert abs(v)<1e-9, v" "$zero_usd"
+set +e
+REQ_OUT=$("${PSQL[@]}" -c "BEGIN; SET LOCAL semantic.mcp_require_price = 'on'; SELECT count(mcp_demo.slow(x)) FROM mcp_agg; COMMIT;" 2>&1)
+REQ_CODE=$?
+set -e
+echo "$REQ_OUT" | tee "$RUNDIR/price-require.out"
+test "$REQ_CODE" -ne 0
+echo "$REQ_OUT" | grep -q 'no cost_usd'
+"${PSQL[@]}" -c "ALTER FOREIGN TOOL mcp_demo.slow OPTIONS (cost_usd '0.001');"
+REQ_OK=$("${PSQL[@]}" -tA -c "BEGIN; SET LOCAL semantic.mcp_require_price = 'on'; SELECT count(mcp_demo.slow(x)) FROM mcp_agg; COMMIT;" | grep -E '^[0-9]+$' | head -1)
+echo "require priced count=$REQ_OK"
+test "$REQ_OK" = "8"
 
 echo "=== uvx mcp-server-time: STABLE jsonb named args under an aggregate ==="
 # convert_time is imported STABLE (readOnlyHint) and returns jsonb. One

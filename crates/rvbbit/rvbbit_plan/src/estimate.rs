@@ -55,17 +55,22 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
     };
     let mut est = Estimate::zero();
     for work in &works {
-        let one = rvbbit_cost::estimate(&Work {
-            op: work.op,
-            model: work.model.clone(),
-            rows,
-            per_row: work.per_row,
-            knobs: work.knobs.clone(),
-            grouping: work.grouping,
-            batch_rows: rvbbit_resolve::batch_rows().max(1) as u32,
-            concurrency: rvbbit_resolve::max_concurrent().max(1) as u32,
-            threshold: work.knobs.threshold,
-            filters: work.filters,
+        if work.op == Op::Mcp && work.unit_usd.is_none() {
+            note_unpriced(&work.model);
+        }
+        let one = rvbbit_cost::with_mcp_unit_usd(work.unit_usd, || {
+            rvbbit_cost::estimate(&Work {
+                op: work.op,
+                model: work.model.clone(),
+                rows,
+                per_row: work.per_row,
+                knobs: work.knobs.clone(),
+                grouping: work.grouping,
+                batch_rows: rvbbit_resolve::batch_rows().max(1) as u32,
+                concurrency: rvbbit_resolve::max_concurrent().max(1) as u32,
+                threshold: work.knobs.threshold,
+                filters: work.filters,
+            })
         });
         est.add(&one);
         if work.filters {
@@ -151,6 +156,8 @@ struct Found {
     knobs: Knobs,
     grouping: Grouping,
     filters: bool,
+    /// MCP USD per call. `None` is unpriced (charged as 0).
+    unit_usd: Option<f64>,
 }
 
 fn collect(node: Node<'_>, qual: &types_nodes::list::NodeList<'_>, out: &mut Vec<Found>) {
@@ -240,6 +247,7 @@ fn found_agg(oid: u32) -> Option<Found> {
         knobs: Knobs::default(),
         grouping: Grouping::PerGroup,
         filters: op == Op::Predict,
+        unit_usd: None,
     })
 }
 
@@ -253,6 +261,7 @@ fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found>
             knobs: Knobs::default(),
             grouping: if tool.returns_table || in_agg { Grouping::PerGroup } else { Grouping::Batched },
             filters: false,
+            unit_usd: tool.cost_usd,
         });
     }
     let name = proc_name(oid);
@@ -266,6 +275,7 @@ fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found>
             knobs: Knobs::default(),
             grouping: if func.funcretset || in_agg { Grouping::PerGroup } else { Grouping::Batched },
             filters: false,
+            unit_usd: None,
         });
     }
     let tail = clause_tail(func);
@@ -298,7 +308,7 @@ fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found>
             }
         }
     }
-    Some(Found { op, model, per_row, knobs, grouping, filters })
+    Some(Found { op, model, per_row, knobs, grouping, filters, unit_usd: None })
 }
 
 fn rerank_slug(text: &str) -> bool {
@@ -634,6 +644,7 @@ pub fn apply_costs(node: Node<'_>) {
 struct Frame {
     usd: f64,
     budget: Option<f64>,
+    unpriced: Vec<String>,
 }
 
 struct Acc {
@@ -660,7 +671,7 @@ pub fn begin_statement_cost() {
         return;
     }
     clear_scan_rows();
-    a.frames.push(Frame { usd: 0.0, budget: None });
+    a.frames.push(Frame { usd: 0.0, budget: None, unpriced: Vec::new() });
 }
 
 #[cfg(test)]
@@ -715,6 +726,21 @@ pub fn commit_statement_cost() {
     } else {
         rvbbit_cost::disarm_query();
     }
+    rvbbit_cost::set_mcp_unpriced(frame.unpriced);
+}
+
+fn note_unpriced(model: &str) {
+    let mut a = acc();
+    if a.skip > 0 {
+        return;
+    }
+    let Some(frame) = a.frames.last_mut() else {
+        return;
+    };
+    if frame.unpriced.iter().any(|kept| kept == model) {
+        return;
+    }
+    frame.unpriced.push(model.to_string());
 }
 
 fn account(est: &Shown) {

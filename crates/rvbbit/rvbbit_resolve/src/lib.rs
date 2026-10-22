@@ -91,6 +91,10 @@ pub struct McpTool {
     pub timeout_ms: u64,
     pub cache_ttl_ms: u64,
     pub max_cost: Option<f64>,
+    /// Effective USD per call. Tool `cost_usd` wins, then the server
+    /// default. `None` is unpriced and charges 0 unless
+    /// `semantic.mcp_require_price` is on.
+    pub cost_usd: Option<f64>,
     pub retries: u32,
     pub transport: String,
     pub url: Option<String>,

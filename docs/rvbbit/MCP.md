@@ -66,13 +66,24 @@ the tool's schema hash.
 `readOnlyHint` initializes `read_only`. A tool without the hint is
 `VOLATILE`. A read-only tool is `STABLE`. Results are cached only when
 `read_only` is set and `cache_ttl` is greater than 0. `ALTER` can set
-`timeout`, `cache_ttl`, `max_cost`, and `read_only` or `side_effects`.
-Those last two cannot be set together. `side_effects 'true'` clears
-`read_only` and switches the function to `VOLATILE`.
+`timeout`, `cache_ttl`, `max_cost`, `cost_usd`, and `read_only` or
+`side_effects`. Those last two cannot be set together.
+`side_effects 'true'` clears `read_only` and switches the function to
+`VOLATILE`.
+
+`cost_usd` is USD per tool call. A tool value overrides the server
+default from `CREATE SERVER ... OPTIONS (cost_usd '0.001')`.
+`cost_usd 'default'` clears the tool price so the server default
+applies again. Unpriced tools cost 0. `SET semantic.mcp_require_price
+= 'on'` rejects a call that has neither price. A cache hit costs 0 and
+records the avoided charge in `cost_saved`. `semantic.max_cost` and an
+inbound token cap include this estimate: `EXPLAIN` shows `MCP USD`, and
+a statement whose estimate is over the cap errors before the tool runs.
 
 `REFRESH` lists the server again and raises a notice with
 `unchanged`, `added`, `changed`, and `removed`. A changed hash drops
-and recreates the function and resets its options. A removed tool is
+and recreates the function and resets its options, except `cost_usd`,
+which is kept. A removed tool is
 dropped. New tools are created in every schema that already imported
 that server. `IMPORT` does not drop tools that disappeared.
 
@@ -128,9 +139,9 @@ semantic labels. A tool projected by a scan, including `VALUES`, is
 costed on that scan. The call log is `rvbbit.calls` with `op = 'mcp'`,
 `server`, `tool`, `latency_ms`, and `status`. `rvbbit.call_log()` reads
 each hutch backend and the MCP gateway once. A backend that does not
-answer is skipped. MCP calls are unpriced
-(USD 0). `max_cost '0'` rejects the call. A positive `max_cost` is
-stored and does not bill tokens.
+answer is skipped. A miss records `cost_usd` from the catalog.
+A hit records 0. `max_cost '0'` rejects the call. A positive
+`max_cost` is stored and does not bill tokens.
 
 ## Demo
 
@@ -156,8 +167,8 @@ Postgres. Live mode is not part of the mock gate.
 - Inbound MCP is a separate mode of this binary. See
   [MCP_INBOUND.md](MCP_INBOUND.md). The outbound gateway still does not
   accept MCP clients.
-- MCP calls are unpriced. `max_cost 0` disables a tool. A positive
-  `max_cost` is not a token budget.
+- `max_cost 0` disables a tool. A positive `max_cost` is not a token
+  budget. The billed amount is `cost_usd`.
 - `RETURNS TABLE` only when the output schema is an array of objects
   with `properties`. A `$ref` or a bare array stays `jsonb`.
 - `ON ERROR` on a set-returning tool is not rewritten. Named arguments
