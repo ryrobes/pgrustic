@@ -9,6 +9,9 @@
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+mod embedding;
+pub use embedding::{cosine, mock_embedding, normalize_embed_text, ABOUT_THRESHOLD, EMBED_MODEL, EMBED_USD_PER_MILLION};
+
 pub const CONTRACT_VERSION: &str = "rvbbit-hutch-v1";
 pub const CACHE_KEY_VERSION: &str = "rvbbit-cache-v2";
 

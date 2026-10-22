@@ -43,7 +43,9 @@ to these expressions.
    FuncExpr. There is no new keyword and no new gram.y production.
    `SELECT expr means FROM t` is still not an alias; write `AS means`.
    `NOT (x ABOUT 'y')` works because `ABOUT` is the same FuncExpr.
-   There is no catalog negator named `ABOUT`.
+   There is no catalog negator named `ABOUT`. The predicate is cosine
+   similarity of the two embeddings, not a MEANS decision. The default
+   cutoff is 0.40. `rvbbit.semantic_similarity(a, b)` returns the cosine.
 
 2. **`CLASSIFY` and typed `EXTRACT`.** `parser_driver` calls
    `rewrite_native_semantic` only in `RAW_PARSE_DEFAULT`, and only when

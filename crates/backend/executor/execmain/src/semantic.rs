@@ -416,6 +416,22 @@ impl<'mcx> SemanticState<'mcx> {
             self.enqueue_ready(rows, &BatchReply { matched, http_calls: reply.http_calls });
             return Ok(());
         }
+        if ep.fn_name.eq_ignore_ascii_case("about") {
+            let reply = rvbbit_dispatch::about_batch(self.func_oid, &sent)?;
+            if reply.matched.len() != sent.len() {
+                return Err(err(format!(
+                    "embed returned {} results for {} items",
+                    reply.matched.len(),
+                    sent.len()
+                )));
+            }
+            self.http_calls += reply.http_calls as u64;
+            for (pair, bit) in sent.iter().zip(reply.matched.iter()) {
+                self.memo.insert(pair.clone(), *bit);
+            }
+            self.enqueue_ready(rows, &reply);
+            return Ok(());
+        }
         let ticket = rvbbit_dispatch::submit(self.func_oid, &sent)?;
         self.inflight.push_back(Inflight {
             rows,

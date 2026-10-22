@@ -61,6 +61,7 @@ pub struct Stats {
     pub rows: AtomicU64,
     pub max_batch: AtomicU64,
     pub batches: Mutex<Vec<usize>>,
+    log: Mutex<Vec<CallMeter>>,
 }
 
 impl Stats {
@@ -70,6 +71,7 @@ impl Stats {
             rows: AtomicU64::new(0),
             max_batch: AtomicU64::new(0),
             batches: Mutex::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
         }
     }
 
@@ -85,6 +87,22 @@ impl Stats {
         self.rows.store(0, Ordering::Relaxed);
         self.max_batch.store(0, Ordering::Relaxed);
         self.batches.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    fn push_calls(&self, meters: &[CallMeter]) {
+        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        log.extend(meters.iter().cloned());
+        let extra = log.len().saturating_sub(1024);
+        if extra > 0 {
+            log.drain(0..extra);
+        }
+    }
+
+    fn calls_json(&self, limit: usize) -> String {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let start = log.len().saturating_sub(limit);
+        serde_json::json!({ "calls": &log[start..] }).to_string()
     }
 
     fn json(&self) -> String {
@@ -274,6 +292,9 @@ fn route(
     if path.starts_with("/stats") {
         return (200, String::new(), stats.json());
     }
+    if path == "/v1/calls" {
+        return (200, String::new(), stats.calls_json(1024));
+    }
     if path.starts_with("/reset") {
         stats.reset();
         return (200, String::new(), "{\"ok\":true}".to_string());
@@ -320,22 +341,26 @@ fn route(
         };
         stats.record(req.items.len());
         let op = operation_of(path).unwrap_or(req.operation);
+        let mut logged = Vec::new();
         let outputs = req
             .items
             .iter()
             .map(|item| {
                 let (value, score) = mock_scored(op, item);
+                let meter = mock_meter(op);
+                logged.push(meter.clone());
                 ItemResponse {
                     key: item.key.clone(),
                     value: Some(value),
                     score,
                     scores: None,
-                    calls: Some(vec![mock_meter(op)]),
+                    calls: Some(vec![meter]),
                     error: None,
                     identical_takes: None,
                 }
             })
             .collect();
+        stats.push_calls(&logged);
         let resp = BatchResponse {
             contract: CONTRACT_VERSION.to_string(),
             outputs,
@@ -360,12 +385,19 @@ fn mock_meter(op: Operation) -> CallMeter {
         Operation::Rerank => "rerank",
         Operation::Decide => "decide",
     };
+    // Embeddings are priced at the published text-embedding-3-small rate
+    // (32 input tokens at $0.02 per million). Other ops stay on the jev seed.
+    let (model, tokens, usd_per_million) = if op == Operation::Embed {
+        (rvbbit_contract::EMBED_MODEL, 32u64, rvbbit_contract::EMBED_USD_PER_MILLION)
+    } else {
+        ("jev", 300u64, 0.042)
+    };
     CallMeter {
         op: name.into(),
-        model: "jev".into(),
-        tokens_in: Some(300),
+        model: model.into(),
+        tokens_in: Some(tokens),
         tokens_out: None,
-        cost_usd: Some(300.0 * 0.042 / 1_000_000.0),
+        cost_usd: Some(tokens as f64 * usd_per_million / 1_000_000.0),
         cost_saved_usd: None,
         provider_latency_ms: Some(1),
         latency_ms: 1,
@@ -435,7 +467,10 @@ fn mock_scored(op: Operation, item: &rvbbit_contract::ItemRequest) -> (serde_jso
                 (serde_json::json!({}), None)
             }
         }
-        Operation::Embed => (serde_json::json!([0.0]), None),
+        Operation::Embed => {
+            let vector = rvbbit_contract::mock_embedding(&input);
+            (serde_json::json!(vector), None)
+        }
         Operation::Rerank => {
             let score = if folded.contains("logging") { 0.91 } else { 0.12 };
             (serde_json::json!(score), Some(score))

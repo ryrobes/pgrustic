@@ -29,6 +29,13 @@ const MINI_LATENCY_MS: f64 = 280.0;
 const SUMMARIZE_LATENCY_MS: f64 = 1000.0;
 /// Live SUMMARIZE USD ran at 5/8 of the shared mini seed (1.6x high).
 const SUMMARIZE_USD_FACTOR: f64 = 5.0 / 8.0;
+/// OpenRouter list price for `openai/text-embedding-3-small`.
+const EMBED_USD_PER_MILLION: f64 = 0.02;
+/// Seed tokens for one short note, until `rvbbit.calls` replaces it.
+const EMBED_TOKENS_PER_TEXT: f64 = 32.0;
+/// Seed latency for one embeddings POST. A measured p50 replaces it.
+const EMBED_LATENCY_MS: f64 = 120.0;
+const EMBED_MODEL: &str = "openai/text-embedding-3-small";
 const VOYAGE_LATENCY_MS: f64 = 120.0;
 
 /// A configured `FALLBACK` is assumed to fire on a quarter of the rows.
@@ -44,6 +51,7 @@ pub enum Op {
     Rerank,
     Summarize,
     Decide,
+    Embed,
 }
 
 impl Op {
@@ -55,6 +63,7 @@ impl Op {
             Op::Rerank => "rerank",
             Op::Summarize => "summarize",
             Op::Decide => "decide",
+            Op::Embed => "embed",
         }
     }
 
@@ -66,6 +75,7 @@ impl Op {
             "rerank" | "rerank_for" => Some(Op::Rerank),
             "summarize" | "summary" => Some(Op::Summarize),
             "decide" => Some(Op::Decide),
+            "embed" | "about" | "semantic_similarity" => Some(Op::Embed),
             _ => None,
         }
     }
@@ -354,6 +364,12 @@ fn seed_for(model: &str, op: Op) -> Seed {
             latency_ms: VOYAGE_LATENCY_MS,
         };
     }
+    if op == Op::Embed {
+        return Seed {
+            usd_per_item: EMBED_TOKENS_PER_TEXT * EMBED_USD_PER_MILLION / 1_000_000.0,
+            latency_ms: EMBED_LATENCY_MS,
+        };
+    }
     Seed {
         usd_per_item: JEV_BILLED_TOKENS * JEV_USD_PER_MILLION / 1_000_000.0,
         latency_ms: JEV_LATENCY_MS,
@@ -491,6 +507,14 @@ fn priced_model(op: Op, model: &str) -> String {
     let blank = m.is_empty() || m.eq_ignore_ascii_case("mock") || m.eq_ignore_ascii_case("default");
     match op {
         Op::Extract | Op::Summarize if blank => "openai/gpt-4o-mini".to_string(),
+        Op::Embed => {
+            let low = m.to_ascii_lowercase();
+            if blank || low == "jev" || low == "mock" || low == "default" {
+                EMBED_MODEL.to_string()
+            } else {
+                m.to_string()
+            }
+        }
         Op::Rerank => {
             let low = m.to_ascii_lowercase();
             if low.contains("voyage") || low.contains("rerank-3") {
@@ -509,7 +533,7 @@ fn priced_model(op: Op, model: &str) -> String {
 /// Dedicated rerank is one provider request for the whole HTTP batch.
 /// Jev and chat calls fan out, one provider call per charged item.
 fn one_shot_rerank(op: Op, model: &str) -> bool {
-    op == Op::Rerank && model != "jev"
+    op == Op::Embed || (op == Op::Rerank && model != "jev")
 }
 
 pub fn estimate(work: &Work) -> Estimate {
@@ -1000,6 +1024,25 @@ mod tests {
         assert_eq!(one.calls, 1.0);
         assert!((one.selectivity - 0.5).abs() < 1e-12);
         assert_eq!(one.model, "typesafe/jev-1.14");
+
+        reset_history();
+        let embedded = estimate(&Work {
+            op: Op::Embed,
+            model: "openai/text-embedding-3-small".into(),
+            rows: 32.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: Some(0.40),
+            filters: true,
+        });
+        let embed_per = EMBED_TOKENS_PER_TEXT * EMBED_USD_PER_MILLION / 1_000_000.0;
+        assert!((embedded.usd - 32.0 * embed_per).abs() < 1e-12, "{}", embedded.usd);
+        assert_eq!(embedded.calls, 1.0);
+        assert!((embedded.latency_ms - EMBED_LATENCY_MS).abs() < 1e-9);
+        assert_eq!(embedded.model, "openai/text-embedding-3-small");
 
         let mut knobs = Knobs::default();
         knobs.takes = 3;

@@ -107,7 +107,7 @@ Mock values, deterministic, no network:
 | predict | bool, case-insensitive substring of `inputs.input` against `inputs.criterion` or `item.criterion` |
 | classify | the criterion string |
 | extract | `{}` |
-| embed | `[0.0]` |
+| embed | JSON array of floats, one vector for `inputs.input`. Cached per normalized text and model. |
 | rerank | `0.0` |
 | decide | `{"label": "<criterion or empty>", "status": "mock"}` |
 
@@ -426,7 +426,7 @@ Uncertain:
 What it stubs:
 
 - A clause tail is rewritten before gram.y. `WITH TAKES`, `PICK BY`, `RETRY`, `CHECK`, `FALLBACK`, `BUDGET`, `CACHE`, and `TIMEOUT` become `rvbbit.clause_bool`, `rvbbit.clause_score`, or `rvbbit.clause_text`. `REPORT` keeps `rvbbit.apply_clauses`. Plain `MEANS` and datetime `EXTRACT` stay. Take index on a single MEANS cache key is 0; a stacked tree puts `takes` and `phrasings` in the cache opts. The `decision` object is the stack hook
-- `embed` returns a per-item error `code=unsupported` and does not call the provider. Default `rerank` is a Jev `noul`: the document is `state`, the query is the criterion, and `score` is the relevance. `USING MODEL`, `semantic.rerank_model`, or `HUTCH_RERANK_MODEL` posts one OpenRouter `{base}/rerank` for the query's documents (`documents`, `model`, `query`, `top_n`) and reads `results[].index` plus `relevance_score`. Explicit `jev` stays on noul. For pure ranking, `voyageai/rerank-3` is the recommended model. `nvidia/nemotron-3.5-rerank-8b:free` is limited to 20 requests per minute and returns compressed scores. `SUMMARIZE` and `EXTRACT MANY` are chat (`extract_mode` `summary` or `many`)
+- `embed` posts one OpenRouter `{base}/embeddings` for the cache misses (`model`, `input` as a string array). The default slug is `openai/text-embedding-3-small` (`HUTCH_EMBED_MODEL`). `usage.cost` is recorded; if the provider omits it, hutch uses `prompt_tokens` times the published $0.02 per million. The same normalized text and model is not embedded twice. Default `rerank` is a Jev `noul`: the document is `state`, the query is the criterion, and `score` is the relevance. `USING MODEL`, `semantic.rerank_model`, or `HUTCH_RERANK_MODEL` posts one OpenRouter `{base}/rerank` for the query's documents (`documents`, `model`, `query`, `top_n`) and reads `results[].index` plus `relevance_score`. Explicit `jev` stays on noul. For pure ranking, `voyageai/rerank-3` is the recommended model. `nvidia/nemotron-3.5-rerank-8b:free` is limited to 20 requests per minute and returns compressed scores. `SUMMARIZE` and `EXTRACT MANY` are chat (`extract_mode` `summary` or `many`)
 - a wrong or missing `X-Rvbbit-Contract` is accepted, same as the mock
 - client disconnect does not cancel an in-flight provider call
 - `POST /reset` clears the process cache and the decision memo. That route is for tests and the demo
