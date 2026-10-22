@@ -1,9 +1,7 @@
-//! PostgreSQL session preamble for a later inbound MCP server.
+//! PostgreSQL session preamble for an inbound MCP call.
 //!
-//! M11 will open a connection, run [`SessionPreamble::sql`], then serve
-//! read-only statements under `SET LOCAL ROLE`. M10 only defines the
-//! preamble and a recording stand-in so the same binary can grow that
-//! path without a second config or auth stack.
+//! The warehouse opens a transaction, runs [`SessionPreamble::sql`], then
+//! serves the tool. `RecordingPg` is the stand-in used by tests.
 
 use crate::auth::PgRole;
 
@@ -12,6 +10,7 @@ pub struct SessionPreamble {
     pub role: String,
     pub read_only: bool,
     pub max_cost: Option<f64>,
+    pub statement_timeout_ms: u64,
 }
 
 impl SessionPreamble {
@@ -20,14 +19,24 @@ impl SessionPreamble {
             role: role.role.clone(),
             read_only: role.read_only,
             max_cost: role.max_cost,
+            statement_timeout_ms: role.statement_timeout_ms,
         }
     }
 
-    /// Statements applied at the start of an inbound session.
+    /// Statements applied inside the inbound transaction, after `BEGIN`.
+    /// `SET LOCAL ROLE` is what GRANTs and RLS see. `transaction_read_only`
+    /// rejects writes. `statement_timeout` and `semantic.max_cost` come
+    /// from the token's role.
     pub fn sql(&self) -> String {
         let mut out = format!("SET LOCAL ROLE {}", quote_ident(&self.role));
         if self.read_only {
-            out.push_str("; SET LOCAL default_transaction_read_only = on");
+            out.push_str("; SET LOCAL transaction_read_only = on");
+        }
+        if self.statement_timeout_ms > 0 {
+            out.push_str(&format!(
+                "; SET LOCAL statement_timeout = '{}ms'",
+                self.statement_timeout_ms
+            ));
         }
         if let Some(cost) = self.max_cost {
             out.push_str(&format!("; SET LOCAL semantic.max_cost = '{cost}'"));
@@ -73,16 +82,19 @@ mod tests {
             role: "analyst".into(),
             read_only: true,
             max_cost: Some(0.25),
+            statement_timeout_ms: 5000,
         }
         .sql();
         assert!(sql.contains("SET LOCAL ROLE \"analyst\""), "{sql}");
-        assert!(sql.contains("default_transaction_read_only = on"), "{sql}");
+        assert!(sql.contains("transaction_read_only = on"), "{sql}");
+        assert!(sql.contains("statement_timeout = '5000ms'"), "{sql}");
         assert!(sql.contains("semantic.max_cost = '0.25'"), "{sql}");
         let mut pg = RecordingPg::default();
         pg.apply(&SessionPreamble {
             role: "analyst".into(),
             read_only: true,
             max_cost: None,
+            statement_timeout_ms: 0,
         })
         .unwrap();
         assert_eq!(pg.log.len(), 1);

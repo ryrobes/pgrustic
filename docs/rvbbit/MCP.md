@@ -4,10 +4,10 @@
 over HTTP, the same way it talks to hutch. The binary is the only crate
 that links `rmcp`. `mcp_core` holds the catalog types, JSON Schema to SQL
 mapping, secret references, the read-only tool cache, and the session
-pieces a later inbound server will reuse: a token mapped to a Postgres
-role, `SET LOCAL ROLE`, a read-only transaction, and `semantic.max_cost`.
-Those inbound pieces are not wired. Every token is rejected with
-`inbound MCP auth is not configured`.
+pieces the inbound server reuses: a token mapped to a Postgres role,
+`SET LOCAL ROLE`, a read-only transaction, and `semantic.max_cost`.
+That server is `hutch-mcp --inbound`. See [MCP_INBOUND.md](MCP_INBOUND.md).
+`UnconfiguredAuth` is only the stand-in for a process with no token store.
 
 ## DDL
 
@@ -153,9 +153,9 @@ Postgres. Live mode is not part of the mock gate.
 
 ## Known gaps
 
-- No inbound MCP server. No OAuth 2.1, PKCE, or dynamic client
-  registration. `UnconfiguredAuth` and `SessionPreamble` are the hooks
-  for that server. There is no libpq client.
+- Inbound MCP is a separate mode of this binary. See
+  [MCP_INBOUND.md](MCP_INBOUND.md). The outbound gateway still does not
+  accept MCP clients.
 - MCP calls are unpriced. `max_cost 0` disables a tool. A positive
   `max_cost` is not a token budget.
 - `RETURNS TABLE` only when the output schema is an array of objects
