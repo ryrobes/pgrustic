@@ -66,7 +66,8 @@ pub fn lift_semantic_filters<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult
 }
 
 pub use estimate::{
-    apply_costs, begin_statement_cost, commit_statement_cost, node_estimate, tree_estimate, Shown,
+    apply_costs, begin_statement_cost, commit_statement_cost, node_estimate, remember_scan_rows,
+    tree_estimate, Shown,
 };
 pub use rvbbit_cost::{node_actual, query_actual};
 
@@ -512,21 +513,17 @@ fn tlist_without_decide<'mcx>(
     mcx: Mcx<'mcx>,
     tlist: &NodeList<'mcx>,
 ) -> PgResult<NodeList<'mcx>> {
-    let cloned = tlist.clone_in(mcx)?;
     let mut kept = NodeList::nil();
     let mut decide_exprs = NodeList::nil();
-    for tle_node in cloned.iter() {
+    let mut resno = 1i16;
+    for tle_node in tlist.iter() {
         let tle = tle_node.as_target_entry().expect("TargetEntry");
         if expr_contains_decide(tle.expr) {
             decide_exprs.lappend(mcx, tle.expr)?;
         } else {
-            kept.lappend(mcx, tle_node)?;
+            kept.lappend(mcx, copy_target_entry(mcx, tle, resno)?)?;
+            resno = resno.saturating_add(1);
         }
-    }
-    let mut resno = 1i16;
-    for tle_node in kept.iter() {
-        unsafe { tle_node.with_mut::<TargetEntry, _>(|te| te.resno = resno) }.expect("TargetEntry");
-        resno = resno.saturating_add(1);
     }
     add_junk_inputs(mcx, &decide_exprs, &mut kept)?;
     Ok(kept)
@@ -643,28 +640,52 @@ pub(crate) fn tlist_contains_project(tlist: &NodeList<'_>) -> bool {
     })
 }
 
+/// Scan target list with project calls removed.
+///
+/// `NodeList::clone_in` is shallow, so renumbering a cloned entry also
+/// renumbers the Result list that still owns that node. Projection writes
+/// by `resno` and the tuple descriptor is positional, so a kept column
+/// then lands on a semantic column (the label shows the row text, or a
+/// numeric slot is read as text). The scan gets new `TargetEntry` nodes.
+/// The Result keeps the original resnos. The expression pointer is shared;
+/// setrefs builds a fresh tree for the Result before it fixes the scan.
 fn tlist_without_project<'mcx>(
     mcx: Mcx<'mcx>,
     tlist: &NodeList<'mcx>,
 ) -> PgResult<NodeList<'mcx>> {
-    let cloned = tlist.clone_in(mcx)?;
     let mut kept = NodeList::nil();
     let mut project_exprs = NodeList::nil();
-    for tle_node in cloned.iter() {
+    let mut resno = 1i16;
+    for tle_node in tlist.iter() {
         let tle = tle_node.as_target_entry().expect("TargetEntry");
         if expr_contains_project(tle.expr) {
             project_exprs.lappend(mcx, tle.expr)?;
         } else {
-            kept.lappend(mcx, tle_node)?;
+            kept.lappend(mcx, copy_target_entry(mcx, tle, resno)?)?;
+            resno = resno.saturating_add(1);
         }
-    }
-    let mut resno = 1i16;
-    for tle_node in kept.iter() {
-        unsafe { tle_node.with_mut::<TargetEntry, _>(|te| te.resno = resno) }.expect("TargetEntry");
-        resno = resno.saturating_add(1);
     }
     add_junk_inputs(mcx, &project_exprs, &mut kept)?;
     Ok(kept)
+}
+
+fn copy_target_entry<'mcx>(
+    mcx: Mcx<'mcx>,
+    src: &TargetEntry<'mcx>,
+    resno: i16,
+) -> PgResult<Node<'mcx>> {
+    Node::mk(
+        mcx,
+        TargetEntry {
+            expr: src.expr,
+            resno,
+            resname: src.resname,
+            ressortgroupref: src.ressortgroupref,
+            resorigtbl: src.resorigtbl,
+            resorigcol: src.resorigcol,
+            resjunk: src.resjunk,
+        },
+    )
 }
 
 fn wrap_project<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {

@@ -2002,13 +2002,14 @@ fn parsed_batch(text: &str) -> Result<BatchResponse, String> {
     serde_json::from_str(text).map_err(|e| format!("hutch decode: {e}: {text}"))
 }
 
-/// `GET {base}/v1/calls?limit=1024`. The `rvbbit.calls` view reads this.
-/// It does not use the dispatch pool, so a stats read cannot wait behind
-/// a predict batch.
+/// `GET {base}/v1/calls?limit={CALL_LOG_CAP}`. The `rvbbit.calls` view
+/// reads this. It does not use the dispatch pool, so a stats read cannot
+/// wait behind a predict batch. The same cap bounds the hutch ledger.
 pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
     let url = format!(
-        "{}/v1/calls?limit=1024",
-        base_url.trim_end_matches('/')
+        "{}/v1/calls?limit={}",
+        base_url.trim_end_matches('/'),
+        rvbbit_contract::CALL_LOG_CAP,
     );
     let resp = ureq::get(&url)
         .timeout(Duration::from_secs(5))

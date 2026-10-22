@@ -45,7 +45,7 @@ to these expressions.
    `NOT (x ABOUT 'y')` works because `ABOUT` is the same FuncExpr.
    There is no catalog negator named `ABOUT`. The predicate is cosine
    similarity of the two embeddings, not a MEANS decision. The default
-   cutoff is 0.40. `rvbbit.semantic_similarity(a, b)` returns the cosine.
+   cutoff is 0.30. `rvbbit.semantic_similarity(a, b)` returns the cosine.
 
 2. **`CLASSIFY` and typed `EXTRACT`.** `parser_driver` calls
    `rewrite_native_semantic` only in `RAW_PARSE_DEFAULT`, and only when
@@ -54,6 +54,7 @@ to these expressions.
    ordinary function calls:
    - `CLASSIFY(expr INTO 'a', 'b', ...)` →
      `rvbbit.classify((expr), '<labels joined by U+001F>', fallback)`
+   - `CLASSIFY(expr AS ('a', 'b', ...))` is the same label list.
    - `CLASSIFY(expr AS enumname)` →
      `rvbbit.classify_enum((expr), 'enumname', fallback)`
    - `EXTRACT(kind FROM expr)` →
@@ -88,7 +89,9 @@ to these expressions.
    function whose body is the native rewrite (`{{arg}}` becomes the
    argument). Volatility matches the inner call so the planner can inline
    it, and Semantic Project batches that call. `|> name` after an expression is `rvbbit.name(left, ...)`.
-   `|>>` stays the geometric operator. Native `CLASSIFY` returns the bare
+   A bare identifier after that call is a column alias (`body |> fn p`
+   is `rvbbit.fn((body)) AS p`). `AS` still works. A string or a
+   parenthesized expression stays an argument. `|>>` stays the geometric operator. Native `CLASSIFY` returns the bare
    label and does not need a predeclared function. It uses the `means`
    backend and the decision model (default `typesafe/jev-1.14`). Native
    `EXTRACT` uses that backend's URL but sends model `mock`, which

@@ -322,8 +322,8 @@ What it implements:
 - single-flight for concurrent misses of the same storage key and of the same decision body
 - `POST /v1/cache/lookup`, `/put`, `/purge`, `/stats` in memory. Put is inline, not a background writer queue
 - `GET /stats` is lite instrumentation. It adds `provider_calls`, `requests`, `total_cost_usd`, `cost_saved_usd`, and `latency_by_op_model` (`p50_ms`, `p95_ms`, `calls` = misses, `hits`) on top of the cache counters. `p50_ms` and `p95_ms` are provider latency of misses. `GET` or `POST /v1/cache/stats` stays the contract shape and does not include those fields
-- `GET /v1/calls?limit=N` returns the recent call log (`limit` default 50, max 1024), oldest of that window first. `POST /reset` clears it. The log keeps the last 1024 calls
-- Each item may include `calls`, one object per provider call or cache hit that produced it. SQL does not insert those rows. `rvbbit.calls` is a view: `rvbbit.call_log()` GETs `{backend}/v1/calls?limit=1024` from every `TYPE hutch` backend and `json_to_recordset` expands it. The view is not part of `rvbbit.dump_sql`
+- `GET /v1/calls?limit=N` returns the recent call log (`limit` default 50, max 1048576), oldest of that window first. `POST /reset` clears it. The log keeps the last 1048576 calls. `rvbbit.calls` requests that maximum. Latency samples stay at 1024 per op and model
+- Each item may include `calls`, one object per provider call or cache hit that produced it. SQL does not insert those rows. `rvbbit.calls` is a view: `rvbbit.call_log()` GETs `{backend}/v1/calls` with the shared call-log cap (1048576) from every `TYPE hutch` backend and `json_to_recordset` expands it. The hutch ledger uses that same cap. The view is not part of `rvbbit.dump_sql`
 
 Decision calls:
 

@@ -3264,6 +3264,64 @@ fn relation_nblocks(rel: &Relation<'_>) -> PgResult<BlockNumber> {
     bufmgr_seams::relation_get_number_of_blocks_in_fork::call(rel, ForkNumber::MAIN_FORKNUM)
 }
 
+/// Live row count for a small or still-unanalyzed table.
+///
+/// `None` leaves the planner estimate in place. A heap is counted when it
+/// has at most 10 blocks, or when `reltuples` is still unknown and it has
+/// at most 64 blocks. An empty heap is 0. A parent with children is left
+/// to the planner. Columnar tables use the footer row count, which does
+/// not walk pages. The 10-page floor in
+/// [`block_relation_estimate_size_math`] is unchanged.
+pub fn count_small_relation_tuples(rel: &Relation<'_>) -> PgResult<Option<f64>> {
+    if rel.rd_rel.relhassubclass {
+        return Ok(None);
+    }
+    match tableam_vocab::TableAm::of(rel) {
+        Some(tableam_vocab::TableAm::Pgrcolumnar) => {
+            return Ok(::pgrcolumnar::footer_rows(rel)?.map(|n| n as f64));
+        }
+        Some(tableam_vocab::TableAm::Pgrcolumnar2) => {
+            return Ok(::pgrc2_am::footer::footer_size(rel)?.map(|(rows, _)| rows as f64));
+        }
+        Some(tableam_vocab::TableAm::Heap) => {}
+        None => return Ok(None),
+    }
+    if !bufmgr_seams::read_buffer::is_installed()
+        || !bufmgr_seams::relation_get_number_of_blocks_in_fork::is_installed()
+    {
+        return Ok(None);
+    }
+    let nblocks = relation_nblocks(rel)?;
+    if nblocks == 0 {
+        return Ok(Some(0.0));
+    }
+    let unanalyzed = (rel.rd_rel.reltuples as f64) <= 0.0;
+    if nblocks > 10 && !(unanalyzed && nblocks <= 64) {
+        return Ok(None);
+    }
+    let mut count = 0u64;
+    for blk in 0..nblocks {
+        let buf = bufmgr_seams::read_buffer::call(rel, blk)?;
+        let Some(pin) = bufmgr_seams::BufferPin::adopt(buf) else {
+            continue;
+        };
+        let lock = pin.lock_share()?;
+        let page = lock.page();
+        if page.is_new() {
+            continue;
+        }
+        let maxoff = page.max_offset_number();
+        let mut off = 1u32;
+        while off <= u32::from(maxoff) {
+            if page.item_id(off as _).is_normal() {
+                count += 1;
+            }
+            off += 1;
+        }
+    }
+    Ok(Some(count as f64))
+}
+
 fn nbuffers() -> PgResult<i32> {
     Ok(init_small::globals::NBuffers())
 }

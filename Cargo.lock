@@ -17137,6 +17137,7 @@ name = "rvbbit_catalog"
 version = "0.0.0"
 dependencies = [
  "mcx",
+ "rvbbit_contract",
  "rvbbit_oids",
  "rvbbit_parse",
  "rvbbit_resolve",

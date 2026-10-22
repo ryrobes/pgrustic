@@ -4,6 +4,12 @@
 # rvbbit.extract, rvbbit.semantic_similarity, rvbbit.rerank, rvbbit.decide,
 # and a stored workflow all resolve. No OpenRouter key.
 #
+# Live, against hutch-lite (spends provider calls):
+#   RVBBIT_M9_LIVE=1 bash scripts/rvbbit_m9_shim.sh
+# Requires OPENROUTER_API_KEY. The key is not printed. Live mode still
+# requires every statement to succeed. It does not require the mock's
+# true/false vector.
+#
 # Ports: Postgres 55443, mock 8107. The spike on 55432 / 8099 is not used.
 # Run with `env -u PGPORT -u HUTCH_PORT` so a leftover spike port is not picked up.
 set -euo pipefail
@@ -30,6 +36,17 @@ if [[ "$PGPORT" == "55432" || "$HUTCH_PORT" == "8099" ]]; then
   exit 1
 fi
 
+HUTCH_CRATE=hutch_mock
+HUTCH_BIN=hutch_mock
+if [[ "${RVBBIT_M9_LIVE:-}" == "1" ]]; then
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "RVBBIT_M9_LIVE=1 needs OPENROUTER_API_KEY" >&2
+    exit 1
+  fi
+  HUTCH_CRATE=rvbbit_hutch_lite
+  HUTCH_BIN=hutch_lite
+fi
+
 for cmd in gcc g++ curl initdb psql cargo python3; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing command: $cmd" >&2
@@ -51,7 +68,7 @@ if [[ -S "$PGHOST/.s.PGSQL.$PGPORT" ]]; then
 fi
 
 echo "=== build (CC=$CC CXX=$CXX) ==="
-cargo build -p main_main -p hutch_mock --profile fast-profile
+cargo build -p main_main -p "$HUTCH_CRATE" --profile fast-profile
 
 mkdir -p "$RUNDIR"
 MOCK_LOG=$RUNDIR/mock.log
@@ -69,9 +86,9 @@ trap cleanup EXIT
 
 rm -rf "$PGDATA"
 
-echo "=== hutch_mock on 127.0.0.1:$HUTCH_PORT ==="
+echo "=== $HUTCH_BIN on 127.0.0.1:$HUTCH_PORT ==="
 : >"$MOCK_LOG"
-./target/fast-profile/hutch_mock "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
+./target/fast-profile/"$HUTCH_BIN" "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
 
 echo "=== initdb $PGDATA ==="
@@ -139,7 +156,7 @@ echo "=== results ==="
 cat "$RUNDIR/out.txt"
 
 python3 - "$RUNDIR/out.txt" <<'PY'
-import sys
+import os, sys
 lines = [ln.strip() for ln in open(sys.argv[1]) if ln.strip()]
 print("lines", lines)
 # Latest workflow version is 2, so the unqualified flow call returns v2.
@@ -147,7 +164,10 @@ print("lines", lines)
 # means, means_score, extract, classify x2, decide, summarize, consensus,
 # rerank, semantic_similarity, flow x2.
 expected = ["t", "t", "f", "t", "t", "biped", "t", "t", "t", "kept", "v2", "biped", "v2", "t"]
-if lines[:-1] != expected:
+live = os.environ.get("RVBBIT_M9_LIVE") == "1"
+if live:
+    print("live mode: shim statements succeeded; mock vector is not required")
+elif lines[:-1] != expected:
     sys.exit(f"shim rows:\n  got {lines[:-1]}\n  want {expected}")
 count = int(lines[-1])
 if count < 12:

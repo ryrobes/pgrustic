@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # Load N rows from a large CSV and run MEANS, CLASSIFY, and EXTRACT.
-# Prints hutch /stats and rvbbit.calls (cache and cost) after each statement.
-# MEANS is run twice. The filter memo is per query, and hutch_mock does not
-# keep a decision cache, so the second run posts again. The delta is printed.
+# Prints rows/sec, hutch /stats, and rvbbit.calls (cache and cost) after
+# each statement. MEANS is run twice. The filter memo is per query, and
+# hutch_mock does not keep a decision cache, so the second run posts
+# again. The delta is printed. hutch-lite may serve the second run from
+# its cache.
 #
 # The Enron emails CSV is about 1.4GB and is not in this tree. Point CSV
 # at it. The usual Kaggle export has columns `file` and `message`.
 #   CSV=/path/to/emails.csv N=5000 bash scripts/rvbbit_enron_scale.sh
 #
-# Ports: Postgres 55444, mock 8108. The spike on 55432 / 8099 is not used.
+# Live, against hutch-lite (spends provider calls):
+#   RVBBIT_ENRON_LIVE=1 CSV=/path/to/emails.csv N=5000 bash scripts/rvbbit_enron_scale.sh
+# Requires OPENROUTER_API_KEY. The key is not printed.
+#
+# Ports: Postgres 55444, hutch 8108. The spike on 55432 / 8099 is not used.
 # Run with `env -u PGPORT -u HUTCH_PORT` so a leftover spike port is not picked up.
-# No OpenRouter key. This script uses hutch_mock.
+# The default path uses hutch_mock and does not need a key.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,6 +48,32 @@ if [[ "$PGPORT" == "55432" || "$HUTCH_PORT" == "8099" ]]; then
   echo "Refusing spike ports 55432 / 8099. Use the defaults (55444 / 8108)." >&2
   exit 1
 fi
+
+HUTCH_CRATE=hutch_mock
+HUTCH_BIN=hutch_mock
+if [[ "${RVBBIT_ENRON_LIVE:-}" == "1" ]]; then
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "RVBBIT_ENRON_LIVE=1 needs OPENROUTER_API_KEY" >&2
+    exit 1
+  fi
+  HUTCH_CRATE=rvbbit_hutch_lite
+  HUTCH_BIN=hutch_lite
+fi
+
+rows_per_sec() {
+  local title=$1
+  local rows=$2
+  local start=$3
+  local end
+  end=$(date +%s.%N)
+  python3 - "$title" "$rows" "$start" "$end" <<'PY'
+import sys
+title, rows, start, end = sys.argv[1:]
+elapsed = float(end) - float(start)
+rate = 0.0 if elapsed <= 0 else float(rows) / elapsed
+print(f"{title}: {rows} rows in {elapsed:.3f}s ({rate:.1f} rows/sec)")
+PY
+}
 if [[ -z "$CSV" || ! -f "$CSV" ]]; then
   echo "Set CSV to the emails file (about 1.4GB). It is not in this tree." >&2
   echo "  CSV=/path/to/emails.csv N=5000 bash scripts/rvbbit_enron_scale.sh" >&2
@@ -127,7 +159,7 @@ if [[ -z "$INTO" || "$INTO" != *","* ]]; then
 fi
 
 echo "=== build (CC=$CC CXX=$CXX) ==="
-cargo build -p main_main -p hutch_mock --profile fast-profile
+cargo build -p main_main -p "$HUTCH_CRATE" --profile fast-profile
 
 MOCK_LOG=$RUNDIR/mock.log
 PG_LOG=$RUNDIR/postgres.log
@@ -144,9 +176,9 @@ trap cleanup EXIT
 
 rm -rf "$PGDATA"
 
-echo "=== hutch_mock on 127.0.0.1:$HUTCH_PORT ==="
+echo "=== $HUTCH_BIN on 127.0.0.1:$HUTCH_PORT ==="
 : >"$MOCK_LOG"
-./target/fast-profile/hutch_mock "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
+./target/fast-profile/"$HUTCH_BIN" "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
 
 echo "=== initdb $PGDATA ==="
@@ -178,9 +210,12 @@ curl -sf -X POST "http://127.0.0.1:$HUTCH_PORT/reset" >/dev/null
 
 PSQL=(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -v ON_ERROR_STOP=1 -X)
 echo "=== load ==="
+LOAD_START=$(date +%s.%N)
 "${PSQL[@]}" -c "DROP TABLE IF EXISTS enron" -c "CREATE TABLE enron (id text, body text)"
 "${PSQL[@]}" -c "COPY enron (id, body) FROM '$SLICE' WITH (FORMAT csv, HEADER true)"
-"${PSQL[@]}" -c "SELECT count(*) AS loaded FROM enron"
+LOADED=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM enron")
+echo "loaded $LOADED"
+rows_per_sec "load" "$LOADED" "$LOAD_START"
 
 report() {
   local title=$1
@@ -193,22 +228,30 @@ report() {
 
 crit=${CRITERION//\'/\'\'}
 echo "=== MEANS ==="
+STEP_START=$(date +%s.%N)
 "${PSQL[@]}" -c "SELECT count(*) AS means_rows FROM enron WHERE body MEANS '${crit}'"
+rows_per_sec "MEANS" "$LOADED" "$STEP_START"
 report "after MEANS"
 MEANS_CALLS=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["calls"])')
 
 echo "=== MEANS again ==="
+STEP_START=$(date +%s.%N)
 "${PSQL[@]}" -c "SELECT count(*) AS means_rows FROM enron WHERE body MEANS '${crit}'"
+rows_per_sec "MEANS again" "$LOADED" "$STEP_START"
 report "after second MEANS"
 MEANS_CALLS_2=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["calls"])')
 echo "MEANS provider calls: ${MEANS_CALLS} then ${MEANS_CALLS_2}"
 
 echo "=== CLASSIFY ==="
+STEP_START=$(date +%s.%N)
 "${PSQL[@]}" -c "SELECT class, count(*) FROM (SELECT CLASSIFY(body INTO $INTO) AS class FROM enron) s GROUP BY class ORDER BY class"
+rows_per_sec "CLASSIFY" "$LOADED" "$STEP_START"
 report "after CLASSIFY"
 
 echo "=== EXTRACT ==="
+STEP_START=$(date +%s.%N)
 "${PSQL[@]}" -c "SELECT count(*) AS extract_rows FROM (SELECT EXTRACT($KIND FROM body) ON ERROR '' AS found FROM enron) s"
+rows_per_sec "EXTRACT" "$LOADED" "$STEP_START"
 report "after EXTRACT"
 
 if [[ -n "$EXPECT_MEANS" ]]; then

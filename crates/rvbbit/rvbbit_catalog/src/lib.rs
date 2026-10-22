@@ -10,6 +10,7 @@
 //! name. The value is read at dispatch and is never written to the catalog.
 
 use mcx::MemoryContext;
+use rvbbit_contract::ABOUT_THRESHOLD;
 use rvbbit_parse::{Arg, Command, FnClauses, ObjKind, WithOpts};
 use rvbbit_resolve::{Endpoint, Resolved};
 use types_error::{PgError, PgResult};
@@ -2050,11 +2051,12 @@ pub fn hutch_urls() -> PgResult<Vec<String>> {
 }
 
 /// `about` embeds both sides and keeps a row when cosine similarity is at
-/// least 0.40. That cutoff is the gap measured on the mock embedding
-/// fixtures (`rvbbit_contract::ABOUT_THRESHOLD`): related notes sit above
-/// it and invoices sit below it. A row that already uses an embedding
-/// model is left alone, so a changed threshold sticks. A leftover noul
-/// copy (the old 0.9 means clone) is replaced.
+/// least [`ABOUT_THRESHOLD`] (0.30). Mock fixtures still straddle that
+/// line. Live `text-embedding-3-small` relevant scores are about 0.40–0.65
+/// and irrelevant scores stay at or below 0.27. A row that already uses
+/// an embedding model keeps a custom threshold. `NULL` or the previous
+/// default 0.40 is moved to 0.30. A leftover noul copy (the old 0.9 means
+/// clone) is replaced.
 fn ensure_about() -> PgResult<()> {
     if let Some(kind) = scalar(
         "SELECT COALESCE(m.kind, '') FROM rvbbit.semfn f \
@@ -2062,7 +2064,7 @@ fn ensure_about() -> PgResult<()> {
          WHERE f.nsp = 'rvbbit' AND f.name = 'about'",
     )? {
         if kind == "embedding" {
-            return Ok(());
+            return refresh_about_default_threshold();
         }
     }
     if scalar("SELECT 1 FROM rvbbit.backend WHERE name = 'hutch'")?.is_none() {
@@ -2084,7 +2086,7 @@ fn ensure_about() -> PgResult<()> {
     clauses.model = Some("embed".into());
     clauses.temperature = Some(0.0);
     clauses.cache = Some("memoize".into());
-    clauses.threshold = Some(0.40);
+    clauses.threshold = Some(ABOUT_THRESHOLD);
     apply(Command::CreateFunction {
         or_replace: true,
         name: "about".into(),
@@ -2107,6 +2109,17 @@ fn ensure_about() -> PgResult<()> {
         threshold: None,
     })?;
     Ok(())
+}
+
+/// Move a stored default of 0.40, or a missing threshold, onto
+/// [`ABOUT_THRESHOLD`]. Any other number was chosen on purpose.
+fn refresh_about_default_threshold() -> PgResult<()> {
+    exec(&format!(
+        "UPDATE rvbbit.semfn SET threshold = {new} \
+         WHERE nsp = 'rvbbit' AND name = 'about' \
+           AND (threshold IS NULL OR abs(threshold - 0.40) < 0.0000001)",
+        new = ABOUT_THRESHOLD,
+    ))
 }
 
 fn pg(message: impl Into<String>) -> Box<PgError> {

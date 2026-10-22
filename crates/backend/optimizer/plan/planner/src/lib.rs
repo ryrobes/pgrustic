@@ -454,6 +454,10 @@ pub fn standard_planner<'mcx>(
     let top_plan = set_plan_references(&mut run, top_plan)?;
     // Cost after setrefs. Clause tails are Const text only once the
     // plan is in final form, and the pre-flight arm reads that text.
+    // Count small and un-analyzed scans while this root is current, so
+    // the semantic estimate can use that row count. Scan plan_rows stay
+    // as the planner left them.
+    note_small_scans(&run, top_plan);
     rvbbit_plan::apply_costs(top_plan);
     // ... and the subplans, each under its own root (C's forboth over
     // glob->subplans/glob->subroots, planner.c:561-567). A cell NULLed by an
@@ -471,6 +475,11 @@ pub fn standard_planner<'mcx>(
                 None => None,
             };
             let fixed = crate::setrefs::set_plan_references_opt(&mut run, subplan);
+            if let Ok(slot) = fixed.as_ref() {
+                if let Some(plan) = *slot {
+                    note_small_scans(&run, plan);
+                }
+            }
             core::mem::swap(&mut run.subroots[i].root, &mut run.root);
             run.processed_tlist = top_tlist;
             let fixed = fixed?;
@@ -545,6 +554,76 @@ pub fn standard_planner<'mcx>(
 
 fn is_parallel_worker() -> bool {
     parallel_seams::is_parallel_worker::call()
+}
+
+/// Stash a counted row total on each small or un-analyzed base scan.
+/// Semantic costing reads it later. A missing buffer manager, or a
+/// non-relation RTE, leaves the planner estimate alone.
+fn note_small_scans<'mcx>(run: &PlannerRun<'mcx>, plan: Node<'mcx>) {
+    if let Some(relid) = base_scan_relid(plan) {
+        if let Some(rows) = small_scan_rows(run, relid) {
+            if let Some(p) = plan.as_plan() {
+                rvbbit_plan::remember_scan_rows(p.plan_node_id, rows);
+            }
+        }
+    }
+    let Some(base) = plan.as_plan() else {
+        return;
+    };
+    if let Some(left) = base.lefttree {
+        note_small_scans(run, left);
+    }
+    if let Some(right) = base.righttree {
+        note_small_scans(run, right);
+    }
+    if let Some(append) = plan.as_append() {
+        for child in append.appendplans.iter() {
+            note_small_scans(run, child);
+        }
+    }
+    if let Some(merge) = plan.as_merge_append() {
+        for child in merge.mergeplans.iter() {
+            note_small_scans(run, child);
+        }
+    }
+}
+
+fn base_scan_relid(plan: Node<'_>) -> Option<u32> {
+    let id = if let Some(s) = plan.as_seq_scan() {
+        s.scan.scanrelid
+    } else if let Some(s) = plan.as_sample_scan() {
+        s.scan.scanrelid
+    } else if let Some(s) = plan.as_tid_scan() {
+        s.scan.scanrelid
+    } else if let Some(s) = plan.as_index_scan() {
+        s.scan.scanrelid
+    } else if let Some(s) = plan.as_index_only_scan() {
+        s.scan.scanrelid
+    } else if let Some(s) = plan.as_bitmap_heap_scan() {
+        s.scan.scanrelid
+    } else {
+        return None;
+    };
+    (id > 0).then_some(id)
+}
+
+fn small_scan_rows<'mcx>(run: &PlannerRun<'mcx>, scanrelid: u32) -> Option<f64> {
+    let idx = scanrelid as usize;
+    if idx >= run.root.simple_rte_array.len() {
+        return None;
+    }
+    if !matches!(
+        run.root.simple_rte_array[idx],
+        types_pathnodes::RangeTblEntryId::Parse { .. }
+    ) {
+        return None;
+    }
+    let rte = run.rte(idx);
+    if rte.rtekind != types_nodes::parsenodes::RTEKind::RTE_RELATION || rte.relid == 0 {
+        return None;
+    }
+    let rel = table::table_open(run.mcx, rte.relid, types_rel::NoLock).ok()?;
+    tableam::count_small_relation_tuples(&rel).ok().flatten()
 }
 
 pub(crate) use clauses::{is_parallel_safe_exprs, is_parallel_safe_opt};
