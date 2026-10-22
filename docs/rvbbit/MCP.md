@@ -49,10 +49,13 @@ are not secrets.
 
 `IMPORT` creates one SQL function per tool. JSON Schema scalars become
 `text`, `bigint`, `double precision`, or `boolean`. Objects and arrays
-become `jsonb`. Defaults in the schema become SQL defaults. Required
-arguments come first, then arguments that have a default. Each group
-keeps the schema's property order, so a required argument is never
-placed after a defaulted one. A tool Postgres rejects is skipped with
+become `jsonb`. A union that includes `string` (`anyOf`, `oneOf`, or a
+`type` array such as `string|array`) becomes `text`. Defaults in the
+schema become SQL defaults. Required arguments come first, then
+arguments that have a default. Each group keeps the schema's property
+order. When that order was lost (the property keys are sorted and
+`required` is a different permutation), the `required` array supplies
+it. A required argument is never placed after a defaulted one. A tool Postgres rejects is skipped with
 a `WARNING`, stored in `mcp.tool` with a null function oid and
 `import_error`, and does not abort the rest of the import. An output schema that is an
 array of objects with properties becomes `RETURNS TABLE`; anything else
@@ -98,21 +101,27 @@ The rewrite does not apply to `classify`, `extract`, `summarize`,
 `consensus`, `rerank`, or `means`. It always yields `jsonb`, so `ON ERROR`
 on a `RETURNS TABLE` tool is left as a SQL error.
 
-Scalar tools in a `Result` target list are batched. A qual-free `Seq Scan`
-or `Values Scan` whose projection is the same kind of scalar tool is
-batched the same way. The batch width is the semantic batch size (32).
-Calls overlap up to 4 on one session for both HTTP and stdio (MCP allows
-concurrent request ids). `jsonb` arguments, set-returning tools, a scan
-that still has a qual, and a `Result` that the semantic project batcher
-already owns stay one call per row. A call outside a batch starts a
-process for that call. A value the builtin memoized from an earlier
-statement is a `cache = hit` row in `rvbbit.calls` even when the gateway
-cache ttl is 0. A value the batcher just prefetched is not logged twice.
+Scalar tools are lifted onto a `Result` the same way native project calls
+are, including under a subquery scan or an aggregate. A qual-free `Seq Scan`,
+`Values Scan`, or `Subquery Scan` that still projects the tool is batched
+too. The batch width is the semantic batch size (32). Calls overlap up to 4
+on one session for both HTTP and stdio (MCP allows concurrent request ids).
+`jsonb` arguments, set-returning tools, a scan that still has a qual, and a
+`Result` that the semantic project batcher already owns stay one call per
+row. A call outside a batch starts a process for that call. A successful
+value the builtin memoized from an earlier statement is a `cache = hit` row
+in `rvbbit.calls` even when the gateway cache ttl is 0. A failed call
+(tool `isError` or a transport error) is not memoized and is not a hit.
+A value the batcher just prefetched is not logged twice.
 
 `EXPLAIN` prints `MCP Provider Calls`, `MCP Latency`, `MCP Server`, and
 `MCP Tool` when the node's model is only `mcp:<server>/<tool>`.
 A qual-free scan prices those calls from the planner's live tuple count
-when it has one, instead of the 10-page floor. `EXPLAIN ANALYZE` adds
+when it has one, instead of the 10-page floor. That count replaces the
+scan's `rows=` estimate, and the `COST 1000000` total is scaled by the
+same ratio so an un-analyzed table is not costed as 1360 rows. MCP latency uses the per-tool p50 from
+`rvbbit.calls` when that tool has been called; otherwise the seed is 50 ms
+per wave. `EXPLAIN ANALYZE` adds
 `Actual MCP Calls`, `Actual Cache Hits`, `Actual MCP Latency`, and
 `MCP Batches` when a batch ran. A plan that also has a semantic call keeps the
 semantic labels. A tool projected by a scan, including `VALUES`, is
@@ -163,8 +172,8 @@ Postgres. Live mode is not part of the mock gate.
   A call outside a batch spawns a process per call. There is no
   cross-statement session pool.
 - One HTTP batch shares one timeout, cache ttl, and `read_only` flag.
-  Tools that differ on those options are separate batches. Each call in
-  the batch is charged an equal share of the batch wall time.
+  Tools that differ on those options are separate batches. Each call
+  records its own elapsed time.
 - Streamable HTTP only. No legacy SSE. Tools only: no resources, prompts,
   or sampling.
 - SQL names are sanitized. A collision gets `_2`, `_3`, and so on.

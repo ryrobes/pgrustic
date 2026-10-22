@@ -348,6 +348,7 @@ pub fn exec_re_scan<'mcx>(
         // ExecReScanSubqueryScan: subplan rescanned (chgParam always NULL).
         PlanStateNode::SubqueryScan(s) => {
             let s = &mut **s;
+            crate::mcpbatch::rescan_scan(s.plan_node_id);
             ::execscan::exec_scan_rescan(&mut s.ss, estate);
             exec_re_scan(&mut s.subplan, estate)
         }
@@ -886,6 +887,7 @@ fn rescan_chg_forced_walk<'mcx>(
         }
         PlanStateNode::SubqueryScan(s) => {
             let s = &mut **s;
+            crate::mcpbatch::rescan_scan(s.plan_node_id);
             ::execscan::exec_scan_rescan(&mut s.ss, estate);
             let sub_plan = plan
                 .as_subquery_scan()

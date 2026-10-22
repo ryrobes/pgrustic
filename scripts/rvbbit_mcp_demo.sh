@@ -75,10 +75,23 @@ HUTCH_BIN="$ROOT/target/fast-profile/hutch-mcp"
 cleanup() {
   if [[ -n "${MCP_PID:-}" ]]; then
     kill "$MCP_PID" >/dev/null 2>&1 || true
+    wait "$MCP_PID" 2>/dev/null || true
   fi
-  if [[ -f "$PGDATA/postmaster.pid" ]]; then
-    kill "$(head -n 1 "$PGDATA/postmaster.pid")" >/dev/null 2>&1 || true
+  if [[ -n "${PG_PID:-}" ]]; then
+    if [[ -x "$PG_BIN/pg_ctl" && -f "$PGDATA/postmaster.pid" ]]; then
+      "$PG_BIN/pg_ctl" -D "$PGDATA" -m fast -w stop >/dev/null 2>&1 || true
+    fi
+    if [[ -f "$PGDATA/postmaster.pid" ]]; then
+      kill "$(head -n 1 "$PGDATA/postmaster.pid")" >/dev/null 2>&1 || true
+    fi
+    wait "$PG_PID" 2>/dev/null || true
   fi
+  for _ in $(seq 1 50); do
+    if ! port_open "$HUTCH_MCP_PORT" && [[ ! -S "$PGHOST/.s.PGSQL.$PGPORT" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
 }
 trap cleanup EXIT
 
@@ -102,6 +115,7 @@ env -u PGPORT -u HUTCH_PORT \
   -D "$PGDATA" -k "$PGHOST" -p "$PGPORT" \
   -c listen_addresses= -c io_method=sync -c max_stack_depth=60000 \
   >"$PG_LOG" 2>&1 &
+PG_PID=$!
 
 ready=0
 for _ in $(seq 1 80); do
@@ -178,7 +192,11 @@ EXCEPTION WHEN OTHERS THEN
   END IF;
 END $$;
 SELECT mcp_demo.fail() ON ERROR NULL IS NULL;
+SELECT mcp_demo.fail() ON ERROR NULL IS NULL;
 SQL
+FAIL_HITS=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM rvbbit.calls WHERE op = 'mcp' AND tool = 'fail' AND cache = 'hit';")
+echo "fail hits=$FAIL_HITS"
+test "$FAIL_HITS" = "0"
 
 echo "=== cache a read-only echo ==="
 "${PSQL[@]}" <<'SQL'
@@ -207,6 +225,23 @@ SQL
 grep -q 'MCP Provider Calls' "$RUNDIR/explain.out"
 grep -E -q 'Actual MCP Calls: [1-9]' "$RUNDIR/explain.out"
 grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/explain.out"
+# count(*) drops a STABLE target it does not read. now() is volatile, so
+# the aggregate still has to run it, the same shape as the live
+# convert_time subquery.
+"${PSQL[@]}" <<'SQL' | tee "$RUNDIR/subquery.out"
+EXPLAIN (ANALYZE, COSTS ON) SELECT count(*) FROM (SELECT mcp_demo.now() AS r FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) v(x)) s;
+SQL
+grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/subquery.out"
+"${PSQL[@]}" <<'SQL' | tee "$RUNDIR/rows.out"
+CREATE TABLE mcp_rows (x text);
+INSERT INTO mcp_rows SELECT 'a' FROM generate_series(1, 10);
+EXPLAIN SELECT mcp_demo.now() FROM mcp_rows;
+SQL
+grep -q 'rows=10' "$RUNDIR/rows.out"
+if grep -q 'rows=1360' "$RUNDIR/rows.out"; then
+  echo "scan still estimates the 10-page floor" >&2
+  exit 1
+fi
 "${PSQL[@]}" -c "REFRESH FOREIGN TOOLS FROM SERVER demo;" 2>&1 | tee "$RUNDIR/refresh.out"
 grep -q 'unchanged' "$RUNDIR/refresh.out"
 

@@ -120,6 +120,7 @@ pub struct MergeAppendNode<'mcx> {
 pub struct SubqueryScanNode<'mcx> {
     pub ss: ::execscan::ScanState<'mcx>,
     pub subplan: PgBox<'mcx, PlanStateNode<'mcx>>,
+    pub plan_node_id: i32,
 }
 
 impl<'mcx> ::execscan::ScanNode<'mcx> for SubqueryScanNode<'mcx> {
@@ -1508,6 +1509,10 @@ pub fn exec_init_node<'mcx>(
                     let sub_node = sq_plan.subplan.unwrap_or_else(|| {
                 panic!("ExecInitSubqueryScan (nodeSubqueryscan.c): SubqueryScan without a subplan")
             });
+                    crate::mcpbatch::register_scan_tlist(
+                        sq_plan.scan.plan.plan_node_id,
+                        &sq_plan.scan.plan.targetlist,
+                    );
                     let subplan = exec_init_node(Some(sub_node), estate, eflags)?
                         .expect("SubqueryScan subplan initialized");
                     let scan_desc = subplan.exec_get_result_type(sub_node.as_plan().unwrap())?;
@@ -1555,6 +1560,7 @@ pub fn exec_init_node<'mcx>(
                         SubqueryScanNode {
                             ss,
                             subplan: ::mcx::alloc_in(mcx, subplan)?,
+                            plan_node_id: sq_plan.scan.plan.plan_node_id,
                         },
                     )?)
                 })
@@ -2903,6 +2909,10 @@ fn subquery_scan_arm<'mcx>(
     s: &mut PgBox<'mcx, SubqueryScanNode<'mcx>>,
     estate: &mut EStateData<'mcx>,
 ) -> ProcResult {
+    let _mcp = crate::mcpbatch::arm_registered(s.plan_node_id, estate.es_query_cxt)?;
+    if let Some(slot) = crate::mcpbatch::scan_pull(s.plan_node_id, &mut **s, estate)? {
+        return Ok(slot);
+    }
     ::execscan::exec_scan(&mut **s, estate)
 }
 
@@ -4101,6 +4111,7 @@ pub fn exec_set_tuple_bound<'mcx>(tuples_needed: i64, node: &mut PlanStateNode<'
         PlanStateNode::ValuesScan(vs) => crate::mcpbatch::note_scan_bound(vs.plan_node_id, tuples_needed),
         PlanStateNode::SubqueryScan(s) => {
             let s = &mut **s;
+            crate::mcpbatch::note_scan_bound(s.plan_node_id, tuples_needed);
             if s.ss.qual.is_none() {
                 exec_set_tuple_bound(tuples_needed, &mut s.subplan);
             }
@@ -4368,7 +4379,7 @@ pub(crate) fn with_eval_slots_outer<'mcx, R>(
     IncrementalSortNode<'_> { state, outer },
     AppendNode<'_> { state, substates, subplan_origin, pending_chg, lane_fusible },
     MergeAppendNode<'_> { state, substates, subplan_origin },
-    SubqueryScanNode<'_> { ss, subplan },
+    SubqueryScanNode<'_> { ss, subplan, plan_node_id },
     SetOpNode<'_> { state, outer, inner, outer_chg, inner_chg },
     RecursiveUnionNode<'_> { state, outer, inner },
     LockRowsNode<'_> { state, outer, epq },

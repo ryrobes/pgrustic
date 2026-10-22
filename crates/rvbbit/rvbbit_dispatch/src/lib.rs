@@ -286,30 +286,40 @@ fn pull_remote_history() {
     if LOADED.load(Ordering::Relaxed) {
         return;
     }
-    let Ok(url) = std::env::var("RVBBIT_HUTCH_URL") else {
-        return;
-    };
-    let base = url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return;
-    }
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(750))
         .build();
-    let calls = match agent.get(&format!("{base}/v1/calls?limit=256")).call() {
-        Ok(resp) => resp.into_string().map(|text| rvbbit_cost::ingest_calls_json(&text)).unwrap_or(0),
-        Err(_) => 0,
-    };
-    if calls > 0 {
-        LOADED.store(true, Ordering::Relaxed);
-        return;
-    }
-    if let Ok(resp) = agent.get(&format!("{base}/stats")).call() {
-        if let Ok(text) = resp.into_string() {
-            if rvbbit_cost::ingest_stats_json(&text) > 0 {
-                LOADED.store(true, Ordering::Relaxed);
+    let mut loaded = 0usize;
+    if let Ok(url) = std::env::var("RVBBIT_HUTCH_URL") {
+        let base = url.trim().trim_end_matches('/').to_string();
+        if !base.is_empty() {
+            loaded += pull_calls(&agent, &base);
+            if loaded == 0 {
+                if let Ok(resp) = agent.get(&format!("{base}/stats")).call() {
+                    if let Ok(text) = resp.into_string() {
+                        loaded += rvbbit_cost::ingest_stats_json(&text);
+                    }
+                }
             }
         }
+    }
+    // MCP tool latency lives on the gateway, not the hutch backend.
+    // `rvbbit.calls` reads the same log. A down gateway is ignored.
+    let mcp = mcp_url();
+    let mcp = mcp.trim().trim_end_matches('/');
+    loaded += pull_calls(&agent, mcp);
+    if loaded > 0 {
+        LOADED.store(true, Ordering::Relaxed);
+    }
+}
+
+fn pull_calls(agent: &ureq::Agent, base: &str) -> usize {
+    if base.is_empty() {
+        return 0;
+    }
+    match agent.get(&format!("{base}/v1/calls?limit=256")).call() {
+        Ok(resp) => resp.into_string().map(|text| rvbbit_cost::ingest_calls_json(&text)).unwrap_or(0),
+        Err(_) => 0,
     }
 }
 

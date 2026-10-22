@@ -92,12 +92,40 @@ fn object_fields(schema: &Value) -> Vec<ArgSpec> {
     let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
         return Vec::new();
     };
+    let prop_order: Vec<String> = props.keys().cloned().collect();
+    let required_names = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .filter(|name| props.contains_key(name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // A BTreeMap (or any parse that sorted the keys) loses the tool's
+    // declared order. The `required` array still has it.
+    let names = if properties_order_lost(&prop_order, &required_names) {
+        let mut names = required_names.clone();
+        for name in &prop_order {
+            if !names.iter().any(|have| have == name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    } else {
+        prop_order
+    };
     let mut required = Vec::new();
     let mut defaulted = Vec::new();
-    for (name, spec) in props {
+    for name in names {
+        let Some(spec) = props.get(&name) else {
+            continue;
+        };
         let arg = ArgSpec {
-            name: sql_ident(name),
-            json_name: name.clone(),
+            name: sql_ident(&name),
+            json_name: name,
             sql_type: json_type_to_sql(spec),
             default_sql: spec.get("default").map(json_default_sql),
         };
@@ -109,6 +137,21 @@ fn object_fields(schema: &Value) -> Vec<ArgSpec> {
     }
     required.extend(defaulted);
     required
+}
+
+/// Alphabetical property keys and a `required` array in a different order
+/// means the object lost insertion order.
+fn properties_order_lost(props: &[String], required: &[String]) -> bool {
+    if required.len() < 2 || !is_sorted(props) {
+        return false;
+    }
+    let in_props: Vec<&String> = props.iter().filter(|name| required.iter().any(|req| req == *name)).collect();
+    let required_known: Vec<&String> = required.iter().filter(|name| props.iter().any(|prop| prop == *name)).collect();
+    in_props != required_known
+}
+
+fn is_sorted(names: &[String]) -> bool {
+    names.windows(2).all(|pair| pair[0] <= pair[1])
 }
 
 fn table_columns(schema: &Value) -> (bool, Vec<ArgSpec>) {
@@ -129,6 +172,11 @@ fn table_columns(schema: &Value) -> (bool, Vec<ArgSpec>) {
 }
 
 fn json_type_to_sql(spec: &Value) -> String {
+    // A union that includes string (`string|array` on DeepWiki's
+    // `reponame`) is text. Callers pass one repository name positionally.
+    if union_includes_string(spec) {
+        return "text".into();
+    }
     match spec.get("type").and_then(|t| t.as_str()) {
         Some("string") => "text".into(),
         Some("integer") => "bigint".into(),
@@ -137,6 +185,25 @@ fn json_type_to_sql(spec: &Value) -> String {
         Some("object") | Some("array") => "jsonb".into(),
         _ => "jsonb".into(),
     }
+}
+
+fn union_includes_string(spec: &Value) -> bool {
+    if let Some(kinds) = spec.get("type").and_then(|t| t.as_array()) {
+        if kinds.iter().any(|kind| kind.as_str() == Some("string")) && kinds.len() > 1 {
+            return true;
+        }
+    }
+    for key in ["anyOf", "oneOf"] {
+        let Some(branches) = spec.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if branches.iter().any(|branch| {
+            branch.get("type").and_then(|t| t.as_str()) == Some("string") || union_includes_string(branch)
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn json_default_sql(value: &Value) -> String {
@@ -287,5 +354,74 @@ mod tests {
         let mango = body.find("mango").expect("mango");
         let banana = body.find("banana").expect("banana");
         assert!(zebra < apple && apple < mango && mango < banana, "{body}");
+    }
+
+    /// mcp-server-time `convert_time`. Properties and `required` are
+    /// source_timezone, time, target_timezone. `time` is a reserved word;
+    /// the SQL signature quotes it and does not move it.
+    #[test]
+    fn convert_time_keeps_the_declared_property_order() {
+        let input = serde_json::from_str::<Value>(
+            r#"{
+                "type": "object",
+                "properties": {
+                    "source_timezone": {"type": "string", "description": "Source IANA timezone name"},
+                    "time": {"type": "string", "description": "Time to convert in 24-hour format (HH:MM)"},
+                    "target_timezone": {"type": "string", "description": "Target IANA timezone name"}
+                },
+                "required": ["source_timezone", "time", "target_timezone"]
+            }"#,
+        )
+        .unwrap();
+        let shape = sql_args(&input, &Value::Null);
+        let names: Vec<&str> = shape.args.iter().map(|arg| arg.json_name.as_str()).collect();
+        assert_eq!(names, vec!["source_timezone", "time", "target_timezone"]);
+        assert!(shape.args.iter().all(|arg| arg.sql_type == "text" && arg.default_sql.is_none()));
+    }
+
+    /// The same schema after a sorted-map parse. `required` restores
+    /// source_timezone, time, target_timezone instead of alphabetical
+    /// source_timezone, target_timezone, time.
+    #[test]
+    fn convert_time_uses_required_order_when_properties_were_sorted() {
+        let mut props = serde_json::Map::new();
+        props.insert("source_timezone".into(), json!({"type": "string"}));
+        props.insert("target_timezone".into(), json!({"type": "string"}));
+        props.insert("time".into(), json!({"type": "string"}));
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".into(), json!("object"));
+        obj.insert("properties".into(), Value::Object(props));
+        obj.insert(
+            "required".into(),
+            json!(["source_timezone", "time", "target_timezone"]),
+        );
+        let shape = sql_args(&Value::Object(obj), &Value::Null);
+        let names: Vec<&str> = shape.args.iter().map(|arg| arg.json_name.as_str()).collect();
+        assert_eq!(names, vec!["source_timezone", "time", "target_timezone"]);
+    }
+
+    #[test]
+    fn string_or_array_union_is_text() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "reponame": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}}
+                    ]
+                }
+            },
+            "required": ["reponame"]
+        });
+        let shape = sql_args(&input, &Value::Null);
+        assert_eq!(shape.args[0].sql_type, "text");
+        let listed = json!({
+            "type": "object",
+            "properties": {
+                "reponame": {"type": ["string", "array"]}
+            }
+        });
+        assert_eq!(sql_args(&listed, &Value::Null).args[0].sql_type, "text");
     }
 }
