@@ -269,7 +269,8 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
         let ok = serde_json::from_str::<serde_json::Value>(text).ok();
         let temperature_zero = ok.as_ref().is_some_and(|v| v.get("temperature").and_then(|t| t.as_f64()) == Some(0.0));
         let has_schema = ok.as_ref().is_some_and(|v| v.get("response_format").and_then(|f| f.get("type")).and_then(|t| t.as_str()) == Some("json_schema"));
-        if !temperature_zero || !has_schema {
+        let seed_zero = ok.as_ref().is_some_and(|v| v.get("seed").and_then(|s| s.as_u64()) == Some(0));
+        if !temperature_zero || !has_schema || !seed_zero {
             return (
                 400,
                 r#"{"error":{"message":"response_format json_schema required"}}"#.into(),

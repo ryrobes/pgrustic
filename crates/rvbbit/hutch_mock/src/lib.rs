@@ -109,10 +109,10 @@ pub fn matches(input: &str, criterion: &str) -> bool {
     input.contains(&criterion)
 }
 
-/// Predict, including the EXTRACT MANY check `is <candidate> a <kind>?`.
-/// That question is not a substring of the source text, so the mock
-/// answers true when the candidate itself appears in the text. A live
-/// jev call is what drops "night" or "animal".
+/// Predict, including the EXTRACT MANY check. The question is not a
+/// substring of the source text, so the mock answers true when the
+/// candidate itself appears in the text. A live jev call is what decides
+/// a specific name versus a generic word.
 pub fn predict_yes(input: &str, criterion: &str) -> bool {
     if let Some(candidate) = confirm_candidate(criterion) {
         return input.to_ascii_lowercase().contains(&candidate.to_ascii_lowercase());
@@ -123,6 +123,15 @@ pub fn predict_yes(input: &str, criterion: &str) -> bool {
 fn confirm_candidate(criterion: &str) -> Option<&str> {
     let text = criterion.trim();
     let lower = text.to_ascii_lowercase();
+    if let Some(start) = lower.find("does \"") {
+        let rest = &text[start + "does \"".len()..];
+        let end = rest.find('"')?;
+        let candidate = rest[..end].trim();
+        if candidate.is_empty() {
+            return None;
+        }
+        return Some(candidate);
+    }
     if !lower.starts_with("is ") || !lower.ends_with('?') {
         return None;
     }
@@ -436,6 +445,10 @@ mod tests {
         assert!(!predict_yes(road, "is aircraft a color?"));
         assert!(predict_yes("Large gray triangular aircraft", "is gray a color?"));
         assert!(!predict_yes("Large gray triangular aircraft", "is night a color?"));
+        let dog = "A black dog crossed the road";
+        let q = "Text: A black dog crossed the road. In this text, does \"black dog\" name a specific creature, rather than a generic word for the kind itself?";
+        assert!(predict_yes(dog, q));
+        assert!(!predict_yes(dog, "Text: A black dog crossed the road. In this text, does \"aircraft\" name a specific creature, rather than a generic word for the kind itself?"));
         assert!(matches(road, "biped"));
         assert!(!matches(road, "is biped a creature?"));
     }

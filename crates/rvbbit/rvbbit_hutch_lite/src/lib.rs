@@ -944,6 +944,7 @@ fn provider_call(
         &user,
         item.node.clone(),
         item.response_schema.as_ref(),
+        chat_seed(item.extract_mode.as_deref()),
     )
         .map_err(|message| item_err("provider", &message))?;
     // SUMMARIZE shares the extract route. The call log has to say
@@ -978,7 +979,9 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                 }
                 Some("summary") => "Summarize the notes in one or two sentences. No markdown.".into(),
                 Some("many") => {
-                    "Return JSON {\"mentions\":[...]} and no markdown. \
+                    "Return JSON {\"mentions\":[{\"mention\",\"category\"}]} and no markdown. \
+                     category is specific_instance_of_kind, generic_kind_word, attribute_or_part, place, sound_or_event, or other. \
+                     Copy the whole noun phrase (\"black dog\", not \"dog\"). \
                      Examples, do not copy: creature in \"My story of Bigfoot\" is Bigfoot; \
                      color in \"Large gray triangular aircraft\" is gray; \
                      creature in \"a sasquatch crossed the road\" is sasquatch. \
@@ -1007,7 +1010,8 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                 input
             } else if item.extract_mode.as_deref() == Some("many") {
                 format!(
-                    "List every mention of the requested kind. Proper nouns, descriptive phrases, and synonyms count. \
+                    "List every mention of the requested kind. Copy the whole noun phrase. \
+                     Set category to specific_instance_of_kind, generic_kind_word, attribute_or_part, place, sound_or_event, or other. \
                      Leave out anything that is not that kind. If there are none, mentions is [].\n{input}"
                 )
             } else if item.extract_mode.as_deref() == Some("scalar") {
@@ -1668,6 +1672,16 @@ pub struct ChoiceAnswer {
     pub probabilities: HashMap<String, f64>,
 }
 
+/// EXTRACT MANY is sampled at seed 0. Temperature 0 alone still moved
+/// between `black dog` and `dog` across two cache-off passes.
+fn chat_seed(extract_mode: Option<&str>) -> Option<u32> {
+    if extract_mode == Some("many") {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 fn chat(
     server: &Server,
     operation: Operation,
@@ -1679,6 +1693,7 @@ fn chat(
     user: &str,
     node: Option<String>,
     response_schema: Option<&serde_json::Value>,
+    seed: Option<u32>,
 ) -> Result<(String, CallMeter), String> {
     match chat_once(
         server,
@@ -1691,6 +1706,7 @@ fn chat(
         user,
         node.clone(),
         response_schema,
+        seed,
     ) {
         Err(message) if response_schema.is_some() && schema_rejected(&message) => chat_once(
             server,
@@ -1703,6 +1719,7 @@ fn chat(
             user,
             node,
             None,
+            seed,
         ),
         other => other,
     }
@@ -1726,6 +1743,7 @@ fn chat_payload(
     system: &str,
     user: &str,
     response_schema: Option<&serde_json::Value>,
+    seed: Option<u32>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -1737,6 +1755,9 @@ fn chat_payload(
     });
     if let Some(n) = max_tokens {
         body["max_tokens"] = serde_json::json!(n);
+    }
+    if let Some(seed) = seed {
+        body["seed"] = serde_json::json!(seed);
     }
     if let Some(schema) = response_schema {
         body["response_format"] = serde_json::json!({
@@ -1762,6 +1783,7 @@ fn chat_once(
     user: &str,
     node: Option<String>,
     response_schema: Option<&serde_json::Value>,
+    seed: Option<u32>,
 ) -> Result<(String, CallMeter), String> {
     let cfg = &server.cfg;
     let key = cfg.api_key.as_deref().unwrap_or("");
@@ -1769,7 +1791,7 @@ fn chat_once(
         "{}/chat/completions",
         cfg.openai_base.trim_end_matches('/')
     );
-    let body = chat_payload(model, temperature, max_tokens, system, user, response_schema);
+    let body = chat_payload(model, temperature, max_tokens, system, user, response_schema, seed);
     let payload = match serde_json::to_string(&body) {
         Ok(s) => s,
         Err(e) => return Err(redact(&e.to_string(), key)),
@@ -2100,7 +2122,28 @@ fn parse_extract(text: &str, mode: Option<&str>) -> Result<serde_json::Value, St
                             out.push(serde_json::Value::String(s.to_string()));
                         }
                     }
-                    _ => return Err("extract many items must be strings".into()),
+                    serde_json::Value::Object(map) => {
+                        let mention = map
+                            .get("mention")
+                            .and_then(|t| t.as_str())
+                            .or_else(|| map.get("text").and_then(|t| t.as_str()))
+                            .unwrap_or("")
+                            .trim();
+                        if mention.is_empty() {
+                            continue;
+                        }
+                        match map.get("category").and_then(|c| c.as_str()).map(str::trim) {
+                            Some(category) if !category.is_empty() => {
+                                out.push(serde_json::json!({ "mention": mention, "category": category }));
+                            }
+                            _ => out.push(serde_json::Value::String(mention.to_string())),
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "extract many items must be strings or {mention, category} objects".into(),
+                        )
+                    }
                 }
             }
             Ok(serde_json::Value::Array(out))
@@ -2173,6 +2216,7 @@ fn extract_fanout(
                     &user,
                     item.node.clone(),
                     item.response_schema.as_ref(),
+                    chat_seed(item.extract_mode.as_deref()),
                 )
                 .map_err(|message| item_err("provider", &message))?;
                 let _ = memo;
@@ -2711,6 +2755,32 @@ mod tests {
             parse_extract("{\"mentions\":[]}", Some("many")).unwrap(),
             serde_json::json!([])
         );
+        assert_eq!(
+            parse_extract(
+                "{\"mentions\":[{\"text\":\"Bigfoot\",\"proper\":true},{\"text\":\"animal\",\"proper\":false}]}",
+                Some("many")
+            )
+            .unwrap(),
+            serde_json::json!(["Bigfoot", "animal"])
+        );
+        assert_eq!(
+            parse_extract(
+                "{\"mentions\":[\
+                    {\"mention\":\"Bigfoot\",\"category\":\"specific_instance_of_kind\"},\
+                    {\"mention\":\"hair\",\"category\":\"attribute_or_part\"},\
+                    {\"mention\":\"Alabama\",\"category\":\"place\"},\
+                    {\"mention\":\"growl type high pitch yell\",\"category\":\"sound_or_event\"}\
+                ]}",
+                Some("many")
+            )
+            .unwrap(),
+            serde_json::json!([
+                {"mention":"Bigfoot","category":"specific_instance_of_kind"},
+                {"mention":"hair","category":"attribute_or_part"},
+                {"mention":"Alabama","category":"place"},
+                {"mention":"growl type high pitch yell","category":"sound_or_event"}
+            ])
+        );
     }
 
     #[test]
@@ -2728,14 +2798,19 @@ mod tests {
             "extract",
             "text",
             Some(&schema),
+            Some(0),
         );
         assert_eq!(body["temperature"].as_f64(), Some(0.0));
+        assert_eq!(body["seed"].as_u64(), Some(0));
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(body["response_format"]["json_schema"]["name"], "extract_many");
         assert_eq!(body["response_format"]["json_schema"]["schema"]["required"][0], "mentions");
-        let plain = chat_payload("openai/gpt-4o-mini", 0.0, None, "extract", "text", None);
+        let plain = chat_payload("openai/gpt-4o-mini", 0.0, None, "extract", "text", None, None);
         assert!(plain.get("response_format").is_none());
+        assert!(plain.get("seed").is_none());
+        assert_eq!(chat_seed(Some("many")), Some(0));
+        assert_eq!(chat_seed(Some("summary")), None);
     }
 
     #[test]
