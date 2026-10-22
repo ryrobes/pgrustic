@@ -8509,6 +8509,7 @@ dependencies = [
  "futures",
  "http",
  "mcp_core",
+ "pg_sha2",
  "rmcp",
  "rvbbit_contract",
  "schemars",

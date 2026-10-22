@@ -1,10 +1,9 @@
-//! Shared MCP types for outbound `hutch-mcp` and a later inbound server.
+//! Shared MCP types for the outbound gateway and the inbound warehouse.
 //!
-//! M10 uses this crate as the catalog and client contract: server specs,
-//! JSON Schema to SQL, secret references, a read-only tool cache, and the
-//! session pieces M11 will reuse (token to role, `SET LOCAL ROLE`,
-//! read-only, `semantic.max_cost`). No tokio and no `rmcp` here, so the
-//! Postgres backend does not link the MCP SDK.
+//! Server specs, JSON Schema to SQL, secret references, the read-only tool
+//! cache, and the session preamble (`SET LOCAL ROLE`, read-only,
+//! `semantic.max_cost`) live here. No tokio and no `rmcp`, so the Postgres
+//! backend does not link the MCP SDK.
 
 mod auth;
 mod cache;

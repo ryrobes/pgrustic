@@ -1,6 +1,6 @@
-//! Inbound session auth. M10 does not accept MCP clients. M11 maps an
-//! OAuth 2.1 access token (PKCE, dynamic client registration) through
-//! [`SessionAuth`] onto a PostgreSQL role.
+//! Role applied to one inbound call. The warehouse server checks the
+//! bearer itself. [`UnconfiguredAuth`] is the stand-in for a process
+//! that has no token store.
 
 /// Role applied for one inbound MCP session.
 #[derive(Clone, Debug, PartialEq)]
@@ -8,13 +8,16 @@ pub struct PgRole {
     pub role: String,
     pub read_only: bool,
     pub max_cost: Option<f64>,
+    /// `SET LOCAL statement_timeout`. `0` leaves the session default.
+    pub statement_timeout_ms: u64,
 }
 
 pub trait SessionAuth: Send + Sync {
     fn role_for_token(&self, token: &str) -> Result<PgRole, String>;
 }
 
-/// Placeholder until M11. Every token is rejected.
+/// Stand-in for a process that has no token store. The inbound server does
+/// not use this type: it checks JWTs and hashed API keys in Postgres.
 #[derive(Clone, Debug, Default)]
 pub struct UnconfiguredAuth;
 
