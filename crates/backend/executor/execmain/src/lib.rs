@@ -48,6 +48,8 @@ mod semantic;
 mod treebatch;
 #[path = "../../../../rvbbit/rvbbit_batch/projbatch.rs"]
 mod projbatch;
+#[path = "../../../../rvbbit/rvbbit_batch/mcpbatch.rs"]
+mod mcpbatch;
 mod nodesubplan;
 pub mod p8census;
 mod procnode;

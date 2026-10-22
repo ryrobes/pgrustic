@@ -903,6 +903,8 @@ members = [
     "crates/rvbbit/rvbbit_catalog",
     "crates/rvbbit/hutch_mock",
     "crates/rvbbit/rvbbit_hutch_lite",
+    "crates/rvbbit/mcp_core",
+    "crates/rvbbit/hutch_mcp",
 ]
 
 [workspace.package]

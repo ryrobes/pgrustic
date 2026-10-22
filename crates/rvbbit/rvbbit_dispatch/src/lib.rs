@@ -33,7 +33,12 @@ use rvbbit_resolve::Endpoint;
 use types_error::{PgError, PgResult};
 
 pub mod clauses;
+mod mcp;
 mod memo;
+pub use mcp::{
+    mcp_arguments, mcp_batch, mcp_batch_for_tool, mcp_call, mcp_invoke_tool, mcp_list, mcp_url,
+    McpCallOpts,
+};
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
 const RETRY_CAP: Duration = Duration::from_millis(2_000);
@@ -211,6 +216,14 @@ pub fn define_gucs() {
         Some("HTTP read timeout for a hutch request, in seconds."),
         None,
         Some("120"),
+        PGC_USERSET,
+        0,
+    );
+    let _ = guc::DefineCustomStringVariable(
+        "semantic.mcp_url",
+        Some("Base URL of the hutch-mcp gateway. RVBBIT_MCP_URL or HUTCH_MCP_PORT override the default."),
+        None,
+        Some("http://127.0.0.1:8111"),
         PGC_USERSET,
         0,
     );
@@ -2156,6 +2169,9 @@ pub fn recent_calls_json(base_url: &str) -> Result<String, String> {
             "score": meter.score,
             "identical": meter.identical,
             "ts": meter.timestamp,
+            "server": meter.server,
+            "tool": meter.tool,
+            "status": meter.status,
         }));
     }
     serde_json::to_string(&rows).map_err(|e| format!("hutch calls encode: {e}"))

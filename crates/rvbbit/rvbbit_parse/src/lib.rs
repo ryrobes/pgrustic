@@ -9,9 +9,13 @@
 use serde_json::{json, Value};
 
 mod compat;
+mod mcp_on_error;
 mod native;
 pub use compat::{flow_arg_names, flow_statement, COMMON_CALLS};
+pub use mcp_on_error::rewrite_mcp_on_error;
 pub use native::rewrite_native_semantic;
+
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Piece<'a> {
@@ -32,6 +36,12 @@ pub fn split_if_rvbbit(sql: &str) -> Option<Vec<Piece<'_>>> {
 
 pub fn verb(sql: &str) -> &'static str {
     let toks = lexer::tokenize(sql);
+    if word_is(toks.first(), "import") {
+        return "import";
+    }
+    if word_is(toks.first(), "refresh") {
+        return "refresh";
+    }
     match toks.first().and_then(|t| t.kw()) {
         Some(Kw::Drop) => "drop",
         Some(Kw::Alter) => "alter",
@@ -156,6 +166,12 @@ fn is_rvbbit(sql: &str) -> bool {
     let toks = lexer::tokenize(sql);
     let kw = |i: usize, w: Kw| toks.get(i).and_then(|t| t.kw()) == Some(w);
     let k = |i: usize| toks.get(i).and_then(|t| t.kw());
+    if word_is(toks.first(), "import") {
+        return word_is(toks.get(1), "foreign") && word_is(toks.get(2), "tools");
+    }
+    if word_is(toks.first(), "refresh") {
+        return word_is(toks.get(1), "foreign") && word_is(toks.get(2), "tools");
+    }
     if kw(0, Kw::Create) {
         // CREATE [OR REPLACE] [IF NOT EXISTS] <kind>
         let mut n = 1;
@@ -165,10 +181,16 @@ fn is_rvbbit(sql: &str) -> bool {
         if kw(n, Kw::If) {
             n += 3;
         }
+        if word_is(toks.get(n), "server") {
+            return mcp_wrapper(&toks[n + 1..]);
+        }
         return matches!(
             k(n),
             Some(Kw::Backend | Kw::Model | Kw::Embedding | Kw::Semantic | Kw::Decision | Kw::Workflow)
         );
+    }
+    if kw(0, Kw::Alter) && word_is(toks.get(1), "foreign") && word_is(toks.get(2), "tool") {
+        return true;
     }
     if kw(0, Kw::Alter) || kw(0, Kw::Drop) {
         let n = if kw(0, Kw::Drop) && kw(1, Kw::If) { 3 } else { 1 };
@@ -193,6 +215,40 @@ fn is_rvbbit(sql: &str) -> bool {
         });
     }
     false
+}
+
+fn word_is(tok: Option<&lexer::Tok>, word: &str) -> bool {
+    match tok.map(|t| &t.kind) {
+        Some(Kind::Ident(s)) => s.eq_ignore_ascii_case(word),
+        Some(Kind::Kw(k)) => k.as_str().eq_ignore_ascii_case(word),
+        _ => false,
+    }
+}
+
+/// `FOREIGN DATA WRAPPER mcp` after the server name. Any other wrapper,
+/// including a real Postgres FDW, stays in gram.y.
+fn mcp_wrapper(toks: &[lexer::Tok]) -> bool {
+    let words: Vec<&str> = toks
+        .iter()
+        .filter_map(|t| match &t.kind {
+            Kind::Ident(s) => Some(s.as_str()),
+            Kind::Kw(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .collect();
+    words.windows(4).any(|w| {
+        w[0].eq_ignore_ascii_case("foreign")
+            && w[1].eq_ignore_ascii_case("data")
+            && w[2].eq_ignore_ascii_case("wrapper")
+            && w[3].eq_ignore_ascii_case("mcp")
+    })
+}
+
+fn split_qual(qual: &str) -> (String, String) {
+    match qual.split_once('.') {
+        Some((schema, name)) if !schema.is_empty() && !name.is_empty() => (schema.to_string(), name.to_string()),
+        _ => (String::new(), qual.to_string()),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -381,6 +437,26 @@ pub enum Command {
         args: Vec<Arg>,
         text: Option<String>,
     },
+    CreateMcpServer {
+        or_replace: bool,
+        if_not_exists: bool,
+        name: String,
+        options: BTreeMap<String, String>,
+    },
+    ImportMcpTools {
+        limit: Option<Vec<String>>,
+        except: Option<Vec<String>>,
+        server: String,
+        schema: String,
+    },
+    AlterMcpTool {
+        schema: String,
+        name: String,
+        options: BTreeMap<String, String>,
+    },
+    RefreshMcpTools {
+        server: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,6 +477,12 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn parse_stmt(&mut self) -> Result<Command, String> {
+        if self.eat_word("import") {
+            return self.parse_import_tools();
+        }
+        if self.eat_word("refresh") {
+            return self.parse_refresh_tools();
+        }
         if self.eat_kw(Kw::Create) {
             return self.parse_create();
         }
@@ -425,6 +507,9 @@ impl<'a> Parser<'a> {
     fn parse_create(&mut self) -> Result<Command, String> {
         let or_replace = self.eat_or_replace();
         let if_not_exists = self.eat_if_not_exists();
+        if self.eat_word("server") {
+            return self.parse_mcp_server(or_replace, if_not_exists);
+        }
         if self.eat_kw(Kw::Backend) {
             let name = self.name()?;
             self.expect_kw(Kw::Type, "TYPE")?;
@@ -622,6 +707,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_alter(&mut self) -> Result<Command, String> {
+        if self.eat_word("foreign") {
+            self.expect_word("tool")?;
+            let qual = self.name()?;
+            let (schema, name) = split_qual(&qual);
+            self.expect_word("options")?;
+            let options = self.paren_options()?;
+            return Ok(Command::AlterMcpTool { schema, name, options });
+        }
         if self.eat_kw(Kw::Backend) {
             let name = self.name()?;
             self.expect_kw(Kw::Set, "SET")?;
@@ -1263,6 +1356,124 @@ impl<'a> Parser<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_mcp_server(&mut self, or_replace: bool, if_not_exists: bool) -> Result<Command, String> {
+        let name = self.name()?;
+        self.expect_word("foreign")?;
+        self.expect_word("data")?;
+        self.expect_word("wrapper")?;
+        let wrapper = self.name()?;
+        if !wrapper.eq_ignore_ascii_case("mcp") {
+            return Err(format!("CREATE SERVER wrapper {wrapper} is not mcp"));
+        }
+        self.expect_word("options")?;
+        let options = self.paren_options()?;
+        Ok(Command::CreateMcpServer { or_replace, if_not_exists, name, options })
+    }
+
+    fn parse_import_tools(&mut self) -> Result<Command, String> {
+        self.expect_word("foreign")?;
+        self.expect_word("tools")?;
+        let mut limit = None;
+        let mut except = None;
+        if self.eat_word("limit") {
+            self.expect_word("to")?;
+            limit = Some(self.name_list()?);
+        } else if self.eat_word("except") {
+            except = Some(self.name_list()?);
+        }
+        self.expect_kw(Kw::From, "FROM")?;
+        self.expect_word("server")?;
+        let server = self.name()?;
+        self.expect_word("into")?;
+        let schema = self.name()?;
+        Ok(Command::ImportMcpTools { limit, except, server, schema })
+    }
+
+    fn parse_refresh_tools(&mut self) -> Result<Command, String> {
+        self.expect_word("foreign")?;
+        self.expect_word("tools")?;
+        self.expect_kw(Kw::From, "FROM")?;
+        self.expect_word("server")?;
+        let server = self.name()?;
+        Ok(Command::RefreshMcpTools { server })
+    }
+
+    fn paren_options(&mut self) -> Result<BTreeMap<String, String>, String> {
+        self.expect_sym('(')?;
+        let mut map = BTreeMap::new();
+        while !self.at_sym(')') && !self.at_end() {
+            self.eat_sym(',');
+            if self.at_sym(')') || self.at_end() {
+                break;
+            }
+            let key = self.word()?.to_ascii_lowercase();
+            let val = if self.at_string() {
+                self.string()?
+            } else if matches!(self.peek_kind(), Some(Kind::Num(_))) {
+                let n = self.number()?;
+                if n.fract() == 0.0 { format!("{}", n as i64) } else { n.to_string() }
+            } else {
+                self.word()?
+            };
+            map.insert(key, val);
+        }
+        self.expect_sym(')')?;
+        Ok(map)
+    }
+
+    fn name_list(&mut self) -> Result<Vec<String>, String> {
+        self.expect_sym('(')?;
+        let mut names = Vec::new();
+        while !self.at_sym(')') && !self.at_end() {
+            self.eat_sym(',');
+            if self.at_sym(')') || self.at_end() {
+                break;
+            }
+            names.push(self.name()?);
+        }
+        self.expect_sym(')')?;
+        if names.is_empty() {
+            return Err("empty name list".into());
+        }
+        Ok(names)
+    }
+
+    fn word(&mut self) -> Result<String, String> {
+        match self.peek_kind() {
+            Some(Kind::Ident(s)) => {
+                let s = s.clone();
+                self.bump();
+                Ok(s)
+            }
+            Some(Kind::Kw(k)) => {
+                let s = k.as_str().to_string();
+                self.bump();
+                Ok(s)
+            }
+            _ => Err(format!("expected a word near {}", self.near())),
+        }
+    }
+
+    fn expect_word(&mut self, word: &str) -> Result<(), String> {
+        if self.eat_word(word) {
+            Ok(())
+        } else {
+            Err(format!("expected {word} near {}", self.near()))
+        }
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        let hit = match self.peek_kind() {
+            Some(Kind::Ident(s)) => s.eq_ignore_ascii_case(word),
+            Some(Kind::Kw(k)) => k.as_str().eq_ignore_ascii_case(word),
+            _ => false,
+        };
+        if hit {
+            self.bump();
+        }
+        hit
     }
 
     fn eat_or_replace(&mut self) -> bool {
@@ -2183,5 +2394,47 @@ mod tests {
         parse_command("GRANT EXECUTE ON SEMANTIC FUNCTION means(text text, criterion text) TO reader").unwrap();
         parse_command("COMMENT ON BACKEND hutch IS 'local'").unwrap();
         parse_command("DROP BACKEND hutch CASCADE").unwrap();
+    }
+
+    #[test]
+    fn mcp_ddl_is_rvbbit_and_a_foreign_data_wrapper_is_not() {
+        assert!(split_if_rvbbit(
+            "CREATE SERVER mine FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host 'localhost')"
+        )
+        .is_none());
+        assert!(split_if_rvbbit("DROP SERVER mine CASCADE").is_none());
+        assert!(split_if_rvbbit("IMPORT FOREIGN SCHEMA public FROM SERVER mine INTO local").is_none());
+
+        let sql = "CREATE SERVER demo FOREIGN DATA WRAPPER mcp OPTIONS (transport 'stdio', command 'hutch-mcp', args '--mock-stdio', headers 'Authorization=secret:FETCH')";
+        assert!(split_if_rvbbit(sql).is_some());
+        match parse_command(sql).unwrap() {
+            Command::CreateMcpServer { name, options, .. } => {
+                assert_eq!(name, "demo");
+                assert_eq!(options.get("transport").map(String::as_str), Some("stdio"));
+                assert_eq!(options.get("headers").map(String::as_str), Some("Authorization=secret:FETCH"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(verb("IMPORT FOREIGN TOOLS FROM SERVER demo INTO mcp_demo"), "import");
+        match parse_command("IMPORT FOREIGN TOOLS LIMIT TO (echo, people) FROM SERVER demo INTO mcp_demo").unwrap() {
+            Command::ImportMcpTools { limit, server, schema, .. } => {
+                assert_eq!(limit.unwrap(), vec!["echo".to_string(), "people".to_string()]);
+                assert_eq!(server, "demo");
+                assert_eq!(schema, "mcp_demo");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_command("ALTER FOREIGN TOOL mcp_demo.echo OPTIONS (read_only 'true', cache_ttl '60s')").unwrap() {
+            Command::AlterMcpTool { schema, name, options } => {
+                assert_eq!(schema, "mcp_demo");
+                assert_eq!(name, "echo");
+                assert_eq!(options.get("read_only").map(String::as_str), Some("true"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_command("REFRESH FOREIGN TOOLS FROM SERVER demo").unwrap() {
+            Command::RefreshMcpTools { server } => assert_eq!(server, "demo"),
+            other => panic!("{other:?}"),
+        }
     }
 }

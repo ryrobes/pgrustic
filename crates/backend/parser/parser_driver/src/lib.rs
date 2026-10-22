@@ -34,6 +34,9 @@ pub fn raw_parser<'mcx>(
         if let Some(rewritten) = rvbbit_parse::rewrite_native_semantic(query_string) {
             return raw_parser(mcx, &rewritten, mode);
         }
+        if let Some(rewritten) = rvbbit_parse::rewrite_mcp_on_error(query_string) {
+            return raw_parser(mcx, &rewritten, mode);
+        }
         if let Some(pieces) = rvbbit_parse::split_if_rvbbit(query_string) {
             return parse_pieces(mcx, &pieces);
         }

@@ -428,6 +428,9 @@ fn mock_meter(op: Operation) -> CallMeter {
         score: None,
         payload: None,
         retake: None,
+        server: None,
+        tool: None,
+        status: None,
     }
 }
 

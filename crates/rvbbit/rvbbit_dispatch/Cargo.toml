@@ -12,6 +12,7 @@ guc = { path = "../../backend/utils/misc/guc" }
 init_small = { path = "../../backend/utils/init/init_small" }
 types_guc = { path = "../../_support/types/types_guc" }
 postgres_seams = { path = "../../backend/tcop/postgres_seams" }
+mcp_core = { path = "../mcp_core" }
 rvbbit_contract = { path = "../rvbbit_contract" }
 rvbbit_cost = { path = "../rvbbit_cost" }
 rvbbit_oids = { path = "../rvbbit_oids" }

@@ -482,6 +482,7 @@ pub fn init_all_with_transport(transport: Transport) {
     fmgr_core::install_extra_builtins(&EXTRA_BUILTINS);
     rvbbit_resolve::set_ensure(rvbbit_catalog::ensure_and_load);
     rvbbit_resolve::set_execute(rvbbit_catalog::execute);
+    rvbbit_resolve::set_mcp_drop(rvbbit_catalog::mcp_try_drop);
     rvbbit_resolve::set_enum_labels(rvbbit_catalog::enum_labels);
     rvbbit_dispatch::define_gucs();
     rvbbit_dispatch::set_nested_plan_probe(|| spi::debug_stack_depth() > 0);
