@@ -219,8 +219,8 @@ The mapped role does not need `INSERT` on the audit table.
 `VALUES`, `TABLE`, and `EXPLAIN` of those commands are allowed.
 Anything else returns `only read-only SELECT/WITH/VALUES/EXPLAIN allowed`.
 A write session (an `oidc_role` row with `read_only` false) may run
-other statements. `SET ROLE`, `RESET ROLE`, and `SET SESSION` stay
-rejected, including `SET SESSION AUTHORIZATION`. `SELECT`, `WITH`,
+other statements. `SET ROLE`, `SET LOCAL ROLE`, `RESET ROLE`, and
+`SET` or `RESET SESSION AUTHORIZATION` stay rejected. `SELECT`, `WITH`,
 `VALUES`, and `TABLE` are wrapped as
 `SELECT * FROM (...) AS rvbbit_mcp_q LIMIT n`. `EXPLAIN` is not wrapped.
 `n` is clamped to 1..=1000 and defaults to 200. A tool failure is an

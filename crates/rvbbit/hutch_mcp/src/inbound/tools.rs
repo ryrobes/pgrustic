@@ -601,19 +601,19 @@ fn command_after_explain(rest: &str) -> String {
 
 fn reject_session_auth(sql: &str) -> Result<(), String> {
     let (head, rest) = statement_head(sql);
-    if head == "reset" && rest.trim_start().to_ascii_lowercase().starts_with("role") {
-        return Err("SET ROLE is not allowed".into());
+    if head != "set" && head != "reset" {
+        return Ok(());
     }
-    if head == "set" {
-        let next = rest
-            .trim_start()
-            .split(|c: char| c.is_whitespace() || c == '=')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if next == "role" || next == "session" {
-            return Err("SET ROLE is not allowed".into());
-        }
+    // `rest` still starts with the keyword. Skip it, then LOCAL / SESSION,
+    // so SET LOCAL ROLE and SET SESSION AUTHORIZATION are the same check.
+    let after = rest.trim_start();
+    let after = after.get(head.len()..).unwrap_or("").trim_start().to_ascii_lowercase();
+    let target = after
+        .split(|c: char| c.is_whitespace() || c == '=' || c == ';')
+        .find(|word| !word.is_empty() && *word != "local" && *word != "session")
+        .unwrap_or("");
+    if target == "role" || target == "authorization" {
+        return Err("SET ROLE is not allowed".into());
     }
     Ok(())
 }
@@ -745,11 +745,16 @@ mod tests {
         assert!(reject_session_auth("INSERT INTO notes (owner, body) VALUES ('w', 'x')").is_ok());
         assert!(reject_session_auth("SET statement_timeout = '1s'").is_ok());
         assert_eq!(reject_session_auth("SET ROLE postgres").unwrap_err(), "SET ROLE is not allowed");
+        assert_eq!(reject_session_auth("SET LOCAL ROLE postgres").unwrap_err(), "SET ROLE is not allowed");
         assert_eq!(
             reject_session_auth("SET SESSION AUTHORIZATION postgres").unwrap_err(),
             "SET ROLE is not allowed"
         );
         assert_eq!(reject_session_auth("RESET ROLE").unwrap_err(), "SET ROLE is not allowed");
+        assert_eq!(
+            reject_session_auth("RESET SESSION AUTHORIZATION").unwrap_err(),
+            "SET ROLE is not allowed"
+        );
     }
 
     #[test]
