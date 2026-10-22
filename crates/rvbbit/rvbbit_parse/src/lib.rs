@@ -8,7 +8,9 @@
 
 use serde_json::{json, Value};
 
+mod compat;
 mod native;
+pub use compat::{flow_arg_names, flow_statement, COMMON_CALLS};
 pub use native::rewrite_native_semantic;
 
 #[derive(Clone, Debug, PartialEq)]

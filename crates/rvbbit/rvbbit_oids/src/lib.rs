@@ -79,6 +79,10 @@ pub const USER_OID: u32 = 9044;
 /// `rvbbit_semantic_similarity(text, text) -> float8`. Cosine of the two
 /// embedding vectors. The SQL name is `rvbbit.semantic_similarity`.
 pub const SIMILARITY_OID: u32 = 9045;
+/// `rvbbit_flow(text, text) -> text`. Runs the latest `CREATE WORKFLOW`
+/// body. A third `int` argument selects the version. The SQL name is
+/// `rvbbit.flow`.
+pub const FLOW_OID: u32 = 9046;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -105,6 +109,7 @@ pub const CLAUSE_TEXT_NAME: &str = "rvbbit_clause_text";
 pub const RERANK_FOR_NAME: &str = "rvbbit_rerank_for";
 pub const USER_NAME: &str = "rvbbit_user";
 pub const SIMILARITY_NAME: &str = "rvbbit_semantic_similarity";
+pub const FLOW_NAME: &str = "rvbbit_flow";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

@@ -534,6 +534,17 @@ pub fn cache_lookup(base_url: &str, keys: &[String]) -> PgResult<CacheLookupResp
     serde_json::from_str(&raw.body).map_err(|e| pg(format!("cache lookup decode: {e}")))
 }
 
+/// Split a classify label list. U+001F is the native rewrite's separator
+/// and is kept as written. A comma-separated list is the function-call
+/// form; each label is trimmed.
+pub fn split_classify_labels(raw: &str) -> Vec<String> {
+    if raw.contains('\u{1f}') {
+        raw.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    } else {
+        raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    }
+}
+
 /// Native `CLASSIFY(x INTO ...)`. Labels replace the catalog label set.
 /// The backend and decision model are the `means` function's, so a tree
 /// or MEANS model already pointed at hutch is reused. The result is the
@@ -2725,6 +2736,18 @@ pub fn forget_scalar(keys: &[(String, String)]) {
 mod tests {
     use super::{coerce_extracted, encode_items, typed_extract_endpoint};
     use rvbbit_contract::Operation;
+
+    #[test]
+    fn comma_labels_trim_and_unit_separator_does_not() {
+        assert_eq!(
+            super::split_classify_labels("biped, invoice"),
+            vec!["biped".to_string(), "invoice".to_string()]
+        );
+        assert_eq!(
+            super::split_classify_labels("bigfoot\u{1f}known animal\u{1f}unclear"),
+            vec!["bigfoot".to_string(), "known animal".to_string(), "unclear".to_string()]
+        );
+    }
 
     #[test]
     fn coerce_extract_kinds() {
