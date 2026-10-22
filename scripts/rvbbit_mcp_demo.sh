@@ -355,7 +355,7 @@ echo "$REQ_OUT" | tee "$RUNDIR/price-require.out"
 test "$REQ_CODE" -ne 0
 echo "$REQ_OUT" | grep -q 'no cost_usd'
 "${PSQL[@]}" -c "ALTER FOREIGN TOOL mcp_demo.slow OPTIONS (cost_usd '0.001');"
-REQ_OK=$("${PSQL[@]}" -tA -c "SET semantic.mcp_require_price = 'on'; SELECT count(mcp_demo.slow(x)) FROM mcp_agg;")
+REQ_OK=$("${PSQL[@]}" -tA -c "BEGIN; SET LOCAL semantic.mcp_require_price = 'on'; SELECT count(mcp_demo.slow(x)) FROM mcp_agg; COMMIT;" | grep -E '^[0-9]+$' | head -1)
 echo "require priced count=$REQ_OK"
 test "$REQ_OK" = "8"
 
