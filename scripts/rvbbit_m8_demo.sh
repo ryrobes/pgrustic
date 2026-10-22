@@ -226,13 +226,18 @@ if [[ "$max_status" == 0 ]]; then
 fi
 grep -q "exceeds budget" "$RUNDIR/maxcost.txt"
 
-"${PSQL[@]}" -d rvbbit_m8 -c \
-  "SET semantic.cost_check = off; SET semantic.max_cost = '0.0000001'; SELECT count(*) FROM notes WHERE body MEANS 'alpha'"
-
+# One backend, so the SELECT fills the process memo and ANALYZE is a
+# fully local cache run (HTTP calls 0). A new psql would miss that path.
+cat >"$RUNDIR/analyze.sql" <<'SQL'
+SET semantic.cost_check = off;
+SET semantic.max_cost = '0.0000001';
+SELECT count(*) FROM notes WHERE body MEANS 'alpha';
+SET semantic.cost_check = on;
+SET semantic.max_cost = '';
+EXPLAIN ANALYZE SELECT count(*) FROM notes WHERE id > 32 AND body MEANS 'alpha';
+SQL
 echo "=== EXPLAIN ANALYZE ==="
-"${PSQL[@]}" -d rvbbit_m8 -c \
-  "SET semantic.cost_check = on; SET semantic.max_cost = ''; EXPLAIN ANALYZE SELECT count(*) FROM notes WHERE id > 32 AND body MEANS 'alpha'" \
-  | tee "$RUNDIR/analyze.txt"
+"${PSQL[@]}" -d rvbbit_m8 -f "$RUNDIR/analyze.sql" | tee "$RUNDIR/analyze.txt"
 python3 - "$RUNDIR/analyze.txt" <<'PY'
 import sys
 text = open(sys.argv[1]).read()
@@ -250,6 +255,10 @@ for needle in (
 ):
     if needle not in text:
         raise SystemExit(f"missing {needle}")
+# The mock attaches a miss meter per row, so this run's actuals are
+# provider calls. A hutch lookup hit has no calls array; the cost unit
+# test covers that shape. Either way the lines have to be present,
+# including when the provider-call count is 0.
 print("analyze ok")
 PY
 

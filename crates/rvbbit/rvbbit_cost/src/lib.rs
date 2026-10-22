@@ -605,6 +605,11 @@ struct MissSample {
     latency_ms: f64,
     stamp: String,
     generation: String,
+    /// `items > 1` is one provider request cloned onto every document
+    /// (voyage `/rerank`). Those clones share a timestamp and must not
+    /// each open a wave. A normal call has `items` 1 and keeps its own
+    /// sample even when the mock stamps every meter the same.
+    items: u64,
 }
 
 impl Actual {
@@ -627,23 +632,26 @@ impl Actual {
 }
 
 /// One wave is `concurrency` calls wide. The wave costs its slowest call.
-/// Cloned rerank meters share a timestamp and a latency; they are one
-/// provider request, so they contribute one sample.
+/// A dedicated rerank clones one meter onto every document (`items > 1`);
+/// that group is one sample. Per-row calls stay separate.
 fn wall_ms(misses: &[MissSample], concurrency: u32) -> f64 {
     let mut seen = std::collections::HashSet::new();
     let mut latencies = Vec::new();
     for miss in misses {
-        let key = format!(
-            "{}\u{1e}{}\u{1e}{}\u{1e}{}\u{1e}{}",
-            miss.op,
-            miss.model,
-            miss.stamp,
-            miss.latency_ms.to_bits(),
-            miss.generation
-        );
-        if seen.insert(key) {
-            latencies.push(miss.latency_ms);
+        if miss.items > 1 {
+            let key = format!(
+                "{}\u{1e}{}\u{1e}{}\u{1e}{}\u{1e}{}",
+                miss.op,
+                miss.model,
+                miss.stamp,
+                miss.latency_ms.to_bits(),
+                miss.generation
+            );
+            if !seen.insert(key) {
+                continue;
+            }
         }
+        latencies.push(miss.latency_ms);
     }
     let width = concurrency.max(1) as usize;
     latencies.chunks(width).map(|chunk| chunk.iter().copied().fold(0.0, f64::max)).sum()
@@ -824,6 +832,7 @@ pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
                             .and_then(|s| s.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        items: call.get("items").and_then(|s| s.as_u64()).unwrap_or(1),
                     });
                 }
                 if let Some(id) = node {
@@ -1205,6 +1214,21 @@ mod tests {
         assert_eq!(cached.cache_hits, 2);
         assert_eq!(cached.http_batches, 0);
         assert!((cached.latency_ms - 0.0).abs() < 1e-9);
+        end_query();
+        begin_query();
+        let _scope = charge_scope(9);
+        observe_response(
+            r#"{"outputs":[
+                {"key":"0","calls":[{"op":"rerank","model":"voyageai/rerank-3","cost_usd":0.00003,"latency_ms":200,"cache":"miss","timestamp":"same","items":3}]},
+                {"key":"1","calls":[{"op":"rerank","model":"voyageai/rerank-3","cost_usd":0.00003,"latency_ms":200,"cache":"miss","timestamp":"same","items":3}]},
+                {"key":"2","calls":[{"op":"rerank","model":"voyageai/rerank-3","cost_usd":0.00003,"latency_ms":200,"cache":"miss","timestamp":"same","items":3}]}
+            ]}"#,
+            1,
+            4,
+        );
+        let rerank = node_actual(9).expect("rerank node");
+        assert_eq!(rerank.calls, 3);
+        assert!((rerank.latency_ms - 200.0).abs() < 1e-9, "cloned rerank meters are one wave");
         end_query();
         begin_query();
         assert_eq!(query_actual().calls, 0);
