@@ -32,6 +32,42 @@ if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
   exit 1
 fi
 
+# Fail before initdb when the chat base is a dead proxy or the key is rejected.
+CHAT_BASE=${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+CHAT_BASE=${CHAT_BASE%/}
+CHAT_MODEL=${HUTCH_MODEL:-openai/gpt-4o-mini}
+echo "=== probe $CHAT_MODEL at $CHAT_BASE ==="
+probe_body=$(mktemp)
+probe_code=$(curl -sS -o "$probe_body" -w '%{http_code}' --max-time 20 \
+  "$CHAT_BASE/chat/completions" \
+  -H "Authorization: Bearer ${OPENROUTER_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${CHAT_MODEL}\",\"temperature\":0,\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+  || true)
+if [[ -z "$probe_code" || "$probe_code" == "000" ]]; then
+  echo "chat probe failed at $CHAT_BASE: connection failed" >&2
+  echo "Live recall needs a reachable chat model. Check OPENROUTER_BASE_URL and OPENROUTER_API_KEY." >&2
+  rm -f "$probe_body"
+  exit 1
+fi
+python3 - "$probe_code" "$probe_body" "$CHAT_BASE" <<'PY'
+import json, sys
+code, path, base = sys.argv[1], sys.argv[2], sys.argv[3]
+if code == "200":
+    raise SystemExit(0)
+detail = ""
+try:
+    err = json.load(open(path)).get("error")
+    if isinstance(err, dict):
+        detail = str(err.get("message", ""))[:200]
+except Exception:
+    detail = open(path, errors="replace").read()[:200]
+print(f"chat probe failed at {base}: HTTP {code} {detail}", file=sys.stderr)
+print("Live recall needs a reachable chat model. Check OPENROUTER_BASE_URL and OPENROUTER_API_KEY.", file=sys.stderr)
+raise SystemExit(1)
+PY
+rm -f "$probe_body"
+
 PG_BIN=${PG_BIN:-/usr/lib/postgresql/18/bin}
 # Ignore an ambient PGPORT so this does not attach to another postmaster.
 EXTRACT_PORT=${RVBBIT_EXTRACT_PGPORT:-55440}
