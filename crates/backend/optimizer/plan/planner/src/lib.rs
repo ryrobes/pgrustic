@@ -589,6 +589,9 @@ fn note_small_scans<'mcx>(run: &PlannerRun<'mcx>, plan: Node<'mcx>) {
             note_small_scans(run, child);
         }
     }
+    if let Some(sub) = plan.as_subquery_scan().and_then(|s| s.subplan) {
+        note_small_scans(run, sub);
+    }
 }
 
 fn base_scan_relid(plan: Node<'_>) -> Option<u32> {

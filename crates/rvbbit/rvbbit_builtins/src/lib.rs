@@ -597,9 +597,10 @@ pub fn rvbbit_mcp_invoke(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) ->
     if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &canonical) {
         let delivery = rvbbit_dispatch::take_delivery(&key, &canonical);
         if !delivery {
-            if let Some(tool) = rvbbit_resolve::mcp_tool(&nsp, &name) {
-                let ok = matches!(hit, rvbbit_dispatch::ScalarHit::Value(_));
-                rvbbit_dispatch::note_mcp_memo_hit(&tool.server, &tool.tool, ok);
+            if let rvbbit_dispatch::ScalarHit::Value(_) = &hit {
+                if let Some(tool) = rvbbit_resolve::mcp_tool(&nsp, &name) {
+                    rvbbit_dispatch::note_mcp_memo_hit(&tool.server, &tool.tool, true);
+                }
             }
         }
         return match hit {
@@ -620,11 +621,8 @@ pub fn rvbbit_mcp_invoke(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) ->
             text_datum(fcinfo, &text)
         }
         Err(message) => {
-            rvbbit_dispatch::remember_scalar(
-                &key,
-                &canonical,
-                rvbbit_dispatch::ScalarHit::Failed(message.clone()),
-            );
+            // A failed call is not a memo. The next statement tries the
+            // tool again, and rvbbit.calls does not grow a hit/error row.
             mcp_fail(fcinfo, use_fallback, fallback, message)
         }
     }

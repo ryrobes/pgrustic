@@ -198,13 +198,10 @@ fn call_batch(body: &Value) -> Value {
     }
     if !pending.is_empty() {
         let batch = pending.iter().map(|(_, tool, args)| (tool.clone(), args.clone())).collect();
-        let started = Instant::now();
-        match client::call_many(&spec, batch, Duration::from_millis(opts.timeout_ms), opts.concurrency) {
+        match client::call_many_timed(&spec, batch, Duration::from_millis(opts.timeout_ms), opts.concurrency) {
             Ok(values) => {
-                let elapsed = started.elapsed().as_millis() as u64;
-                let share = (elapsed / pending.len().max(1) as u64).max(if elapsed > 0 { 1 } else { 0 });
-                for ((idx, tool, arguments), value) in pending.into_iter().zip(values) {
-                    results[idx] = finish(&spec, &tool, &arguments, &opts, value, share);
+                for ((idx, tool, arguments), timed) in pending.into_iter().zip(values) {
+                    results[idx] = finish(&spec, &tool, &arguments, &opts, timed.result, timed.latency_ms);
                 }
             }
             Err(message) => {

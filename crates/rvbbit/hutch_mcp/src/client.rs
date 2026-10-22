@@ -42,12 +42,29 @@ pub fn call_tool(
     })
 }
 
+pub struct TimedCall {
+    pub result: Result<Value, String>,
+    pub latency_ms: u64,
+}
+
 pub fn call_many(
     spec: &ServerSpec,
     calls: Vec<(String, Value)>,
     timeout: Duration,
     concurrency: usize,
 ) -> Result<Vec<Result<Value, String>>, String> {
+    Ok(call_many_timed(spec, calls, timeout, concurrency)?
+        .into_iter()
+        .map(|call| call.result)
+        .collect())
+}
+
+pub fn call_many_timed(
+    spec: &ServerSpec,
+    calls: Vec<(String, Value)>,
+    timeout: Duration,
+    concurrency: usize,
+) -> Result<Vec<TimedCall>, String> {
     let spec = spec.clone();
     block(async move {
         let client = connect(&spec).await?;
@@ -56,18 +73,27 @@ pub fn call_many(
         for chunk in calls.chunks(conc) {
             if conc == 1 {
                 for (name, args) in chunk {
-                    out.push(call_one(&client, name, args.clone(), timeout).await);
+                    out.push(call_timed(&client, name, args.clone(), timeout).await);
                 }
             } else {
                 let futs = chunk
                     .iter()
-                    .map(|(name, args)| call_one(&client, name, args.clone(), timeout));
+                    .map(|(name, args)| call_timed(&client, name, args.clone(), timeout));
                 out.extend(join_all(futs).await);
             }
         }
         let _ = client.cancel().await;
         Ok(out)
     })
+}
+
+async fn call_timed(client: &Client, tool: &str, arguments: Value, timeout: Duration) -> TimedCall {
+    let started = std::time::Instant::now();
+    let result = call_one(client, tool, arguments, timeout).await;
+    TimedCall {
+        result,
+        latency_ms: started.elapsed().as_millis() as u64,
+    }
 }
 
 async fn call_one(client: &Client, tool: &str, arguments: Value, timeout: Duration) -> Result<Value, String> {

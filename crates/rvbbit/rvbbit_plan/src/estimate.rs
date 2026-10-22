@@ -455,6 +455,11 @@ unsafe fn text_bytes(ptr: *const u8) -> Option<Vec<u8>> {
     }
 }
 
+fn mcp_only_model(model: &str) -> bool {
+    let parts: Vec<&str> = model.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    !parts.is_empty() && parts.iter().all(|part| part.starts_with("mcp:"))
+}
+
 /// Rows the semantic node will read.
 ///
 /// An Agg prices its own group count. A scan with no leftover qual returns
@@ -541,18 +546,35 @@ pub fn apply_costs(node: Node<'_>) {
     };
     if let Some(est) = node_estimate(node) {
         let added = est.usd * 1.0e8;
+        let live = input_rows(node);
+        let mcp = mcp_only_model(&est.model);
         let rows = if est.filters {
-            input_rows(node) * est.selectivity
+            live * est.selectivity
+        } else if mcp && plan.qual.is_nil() {
+            // The scan line otherwise keeps the 10-page floor (1360) while
+            // the MCP call count already uses the live tuple count.
+            live
         } else {
             plan.plan_rows
         };
         unsafe {
             let _ = node.with_plan_mut(|p| {
                 p.total_cost += added;
-                if est.filters {
+                if est.filters || (mcp && p.qual.is_nil()) {
                     p.plan_rows = rows;
                 }
             });
+        }
+        if mcp {
+            if let Some(child) = plan.lefttree {
+                if child.as_plan().is_some_and(|p| p.qual.is_nil()) {
+                    if let Some(counted) = counted_scan_rows(child) {
+                        unsafe {
+                            let _ = child.with_plan_mut(|p| p.plan_rows = counted);
+                        }
+                    }
+                }
+            }
         }
         account(&est);
     }

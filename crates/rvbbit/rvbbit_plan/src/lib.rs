@@ -591,6 +591,19 @@ fn func_is_native_project(func: &FuncExpr<'_>) -> bool {
     ns.name_str() == b"rvbbit"
 }
 
+/// An imported MCP tool. Lifted onto a Result so a subquery or aggregate
+/// batches it the same way a native project call does. Set-returning tools
+/// stay on the scan.
+fn func_is_mcp_project(func: &FuncExpr<'_>) -> bool {
+    if func.funcretset {
+        return false;
+    }
+    match rvbbit_resolve::mcp_tool_by_oid(func.funcid) {
+        Some(tool) => !tool.returns_table,
+        None => false,
+    }
+}
+
 /// A catalog function whose body is `rvbbit_user`. The Result batcher
 /// prefetches it. Pipe workflows stay out: the planner inlines those.
 fn func_is_user_project(func: &FuncExpr<'_>) -> bool {
@@ -616,6 +629,7 @@ fn expr_contains_project(node: Node<'_>) -> bool {
             let func = node.as_func_expr().expect("FuncExpr");
             func_is_native_project(func)
                 || func_is_user_project(func)
+                || func_is_mcp_project(func)
                 || func.args.iter().any(expr_contains_project)
         }
         NodeTag::T_OpExpr => node

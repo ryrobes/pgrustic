@@ -591,6 +591,13 @@ pub fn estimate(work: &Work) -> Estimate {
             latency_per = ms;
         }
     }
+    if work.op == Op::Mcp {
+        // Per-tool p50 from rvbbit.calls. The 50ms seed stays when the
+        // tool has not been called.
+        if let Some(ms) = p50_miss(&history_samples(Op::Mcp, &model)) {
+            latency_per = ms;
+        }
+    }
     let hit_rate = if work.knobs.cache_off {
         0.0
     } else {
@@ -1604,6 +1611,32 @@ mod tests {
         assert_eq!(node.retakes, 1);
         assert_eq!(query_actual().retakes, 1);
         end_query();
+        reset_history();
+    }
+
+    #[test]
+    fn mcp_latency_uses_per_tool_call_history() {
+        reset_history();
+        let work = Work {
+            op: Op::Mcp,
+            model: "mcp:demo/convert_time".into(),
+            rows: 10.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        };
+        let cold = estimate(&work);
+        assert!((cold.latency_ms - 150.0).abs() < 1e-9, "{}", cold.latency_ms);
+        let n = ingest_calls_json(
+            r#"[{"op":"mcp","model":"mcp:demo/convert_time","cost_usd":0,"latency_ms":900,"cache":"miss"}]"#,
+        );
+        assert_eq!(n, 1);
+        let warm = estimate(&work);
+        assert!((warm.latency_ms - 2700.0).abs() < 1e-9, "{}", warm.latency_ms);
         reset_history();
     }
 }
