@@ -642,9 +642,11 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
+                    let scan = node.as_seq_scan().unwrap();
+                    crate::mcpbatch::register_scan_tlist(scan.scan.plan.plan_node_id, &scan.scan.plan.targetlist);
                     PlanStateNode::SeqScan(::nodeseqscan::exec_init_seq_scan(
                         mcx,
-                        node.as_seq_scan().unwrap(),
+                        scan,
                         estate,
                         eflags,
                     )?)
@@ -696,9 +698,11 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
+                    let scan = node.as_values_scan().unwrap();
+                    crate::mcpbatch::register_scan_tlist(scan.scan.plan.plan_node_id, &scan.scan.plan.targetlist);
                     let state = ::nodevaluesscan::exec_init_values_scan(
                         mcx,
-                        node.as_values_scan().unwrap(),
+                        scan,
                         estate,
                     )?;
                     PlanStateNode::ValuesScan(::mcx::alloc_in(mcx, state)?)
@@ -2079,6 +2083,7 @@ pub(crate) fn fused_arm_set_for_tests(env_suffix: &str, on: bool) {
 #[inline(never)]
 fn result_arm<'mcx>(rs: &mut ResultState<'mcx>, estate: &mut EStateData<'mcx>) -> ProcResult {
     let _charge = rvbbit_cost::charge_scope(rs.ps.plan.plan_node_id);
+    let _mcp = crate::mcpbatch::arm_targetlist(rs.ps.plan.plan_node_id, &rs.ps.plan.targetlist, estate.es_query_cxt)?;
     exec_result(rs, estate)
 }
 
@@ -2095,6 +2100,10 @@ fn seq_scan_arm<'mcx>(
     ss: &mut ::nodeseqscan::SeqScanState<'mcx>,
     estate: &mut EStateData<'mcx>,
 ) -> ProcResult {
+    let _mcp = crate::mcpbatch::arm_registered(ss.plan_node_id(), estate.es_query_cxt)?;
+    if let Some(slot) = crate::mcpbatch::scan_pull(ss.plan_node_id(), ss, estate)? {
+        return Ok(slot);
+    }
     ::nodeseqscan::exec_seq_scan(ss, estate)
 }
 
@@ -2127,6 +2136,10 @@ fn values_scan_arm<'mcx>(
     vs: &mut PgBox<'mcx, ::nodevaluesscan::ValuesScanState<'mcx>>,
     estate: &mut EStateData<'mcx>,
 ) -> ProcResult {
+    let _mcp = crate::mcpbatch::arm_registered(vs.plan_node_id, estate.es_query_cxt)?;
+    if let Some(slot) = crate::mcpbatch::scan_pull(vs.plan_node_id, &mut **vs, estate)? {
+        return Ok(slot);
+    }
     ::nodevaluesscan::exec_values_scan(vs, estate)
 }
 
@@ -4084,6 +4097,8 @@ pub fn exec_set_tuple_bound<'mcx>(tuples_needed: i64, node: &mut PlanStateNode<'
                 exec_set_tuple_bound(tuples_needed, sub);
             }
         }
+        PlanStateNode::SeqScan(ss) => crate::mcpbatch::note_scan_bound(ss.plan_node_id(), tuples_needed),
+        PlanStateNode::ValuesScan(vs) => crate::mcpbatch::note_scan_bound(vs.plan_node_id, tuples_needed),
         PlanStateNode::SubqueryScan(s) => {
             let s = &mut **s;
             if s.ss.qual.is_none() {

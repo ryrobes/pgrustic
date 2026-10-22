@@ -5,7 +5,9 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+
+use socket2::{Domain, Socket, Type};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,8 +33,23 @@ fn state() -> &'static Mutex<State> {
     })
 }
 
+pub fn bind_listener(addr: &str) -> std::io::Result<TcpListener> {
+    let std_addr: SocketAddr = addr.parse().map_err(|err| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad address {addr}: {err}"))
+    })?;
+    let domain = match std_addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&std_addr.into())?;
+    socket.listen(128)?;
+    Ok(TcpListener::from(socket))
+}
+
 pub fn serve(addr: &str) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr)?;
+    let listener = bind_listener(addr)?;
     for conn in listener.incoming() {
         let conn = conn?;
         thread::spawn(move || {

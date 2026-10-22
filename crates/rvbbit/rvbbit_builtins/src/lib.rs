@@ -528,6 +528,7 @@ pub fn rvbbit_call_log(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> P
         append_call_log(&url, &mut rows, &mut seen);
     }
     append_call_log(&rvbbit_dispatch::mcp_url(), &mut rows, &mut seen);
+    rows.extend(rvbbit_dispatch::local_mcp_calls());
     let body = serde_json::Value::Array(rows).to_string();
     Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), body.as_bytes())?))
 }
@@ -594,6 +595,13 @@ pub fn rvbbit_mcp_invoke(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) ->
     let canonical = serde_json::to_string(&parsed).unwrap_or(args);
     let key = format!("mcp\u{1f}{nsp}\u{1f}{name}");
     if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &canonical) {
+        let delivery = rvbbit_dispatch::take_delivery(&key, &canonical);
+        if !delivery {
+            if let Some(tool) = rvbbit_resolve::mcp_tool(&nsp, &name) {
+                let ok = matches!(hit, rvbbit_dispatch::ScalarHit::Value(_));
+                rvbbit_dispatch::note_mcp_memo_hit(&tool.server, &tool.tool, ok);
+            }
+        }
         return match hit {
             rvbbit_dispatch::ScalarHit::Value(value) => text_datum(fcinfo, &value),
             rvbbit_dispatch::ScalarHit::Missing => Ok(fcinfo.return_null()),

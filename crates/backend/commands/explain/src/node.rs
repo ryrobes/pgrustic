@@ -141,6 +141,9 @@ fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
                 ExplainPropertyInteger("Actual MCP Calls", None, act.calls as i64, es);
                 ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
                 ExplainPropertyFloat("Actual MCP Latency", Some("ms"), act.latency_ms, 1, es);
+                if let Some(batches) = rvbbit_plan::mcp_batches(id) {
+                    ExplainPropertyInteger("MCP Batches", None, batches as i64, es);
+                }
                 if let Some((server, tool)) = mcp_target(&model) {
                     ExplainPropertyText("MCP Server", &server, es);
                     ExplainPropertyText("MCP Tool", &tool, es);

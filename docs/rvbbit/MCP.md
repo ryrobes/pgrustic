@@ -49,8 +49,12 @@ are not secrets.
 
 `IMPORT` creates one SQL function per tool. JSON Schema scalars become
 `text`, `bigint`, `double precision`, or `boolean`. Objects and arrays
-become `jsonb`. Defaults in the schema become SQL defaults. Argument
-order follows the sorted property names. An output schema that is an
+become `jsonb`. Defaults in the schema become SQL defaults. Required
+arguments come first, then arguments that have a default. Each group
+keeps the schema's property order, so a required argument is never
+placed after a defaulted one. A tool Postgres rejects is skipped with
+a `WARNING`, stored in `mcp.tool` with a null function oid and
+`import_error`, and does not abort the rest of the import. An output schema that is an
 array of objects with properties becomes `RETURNS TABLE`; anything else
 returns `jsonb`. The function body calls `rvbbit.mcp_invoke_text` and
 ends in `OFFSET 0`, so the planner does not inline it. Each row stores
@@ -94,17 +98,23 @@ The rewrite does not apply to `classify`, `extract`, `summarize`,
 `consensus`, `rerank`, or `means`. It always yields `jsonb`, so `ON ERROR`
 on a `RETURNS TABLE` tool is left as a SQL error.
 
-Scalar tools in a `Result` target list are batched. The batch width is
-the semantic batch size (32). HTTP calls overlap up to 4. A stdio server
-runs one call at a time on that connection. `jsonb` arguments,
-set-returning tools, and a `Result` that the semantic project batcher
-already owns stay one call per row. A non-batched stdio call starts a
-process for that call.
+Scalar tools in a `Result` target list are batched. A qual-free `Seq Scan`
+or `Values Scan` whose projection is the same kind of scalar tool is
+batched the same way. The batch width is the semantic batch size (32).
+Calls overlap up to 4 on one session for both HTTP and stdio (MCP allows
+concurrent request ids). `jsonb` arguments, set-returning tools, a scan
+that still has a qual, and a `Result` that the semantic project batcher
+already owns stay one call per row. A call outside a batch starts a
+process for that call. A value the builtin memoized from an earlier
+statement is a `cache = hit` row in `rvbbit.calls` even when the gateway
+cache ttl is 0. A value the batcher just prefetched is not logged twice.
 
 `EXPLAIN` prints `MCP Provider Calls`, `MCP Latency`, `MCP Server`, and
 `MCP Tool` when the node's model is only `mcp:<server>/<tool>`.
-`EXPLAIN ANALYZE` adds `Actual MCP Calls`, `Actual Cache Hits`, and
-`Actual MCP Latency`. A plan that also has a semantic call keeps the
+A qual-free scan prices those calls from the planner's live tuple count
+when it has one, instead of the 10-page floor. `EXPLAIN ANALYZE` adds
+`Actual MCP Calls`, `Actual Cache Hits`, `Actual MCP Latency`, and
+`MCP Batches` when a batch ran. A plan that also has a semantic call keeps the
 semantic labels. A tool projected by a scan, including `VALUES`, is
 costed on that scan. The call log is `rvbbit.calls` with `op = 'mcp'`,
 `server`, `tool`, `latency_ms`, and `status`. `rvbbit.call_log()` reads
@@ -147,17 +157,22 @@ Postgres. Live mode is not part of the mock gate.
 - `DROP SERVER` is a utility hook. A name that exists as both a Postgres
   foreign server and an MCP server is treated as MCP.
 - Batching covers scalar tools whose arguments are bool, int, float, or
-  text. `jsonb` and `numeric` arguments, set-returning tools, and a
-  Result already owned by the semantic project batcher stay per-row.
-  Stdio is serial per connection. A stdio call outside a batch spawns a
-  process per call. There is no cross-statement session pool.
+  text, on a `Result` or on a qual-free scan projection. `jsonb` and
+  `numeric` arguments, set-returning tools, scans that still have a qual,
+  and a Result already owned by the semantic project batcher stay per-row.
+  A call outside a batch spawns a process per call. There is no
+  cross-statement session pool.
 - One HTTP batch shares one timeout, cache ttl, and `read_only` flag.
   Tools that differ on those options are separate batches. Each call in
   the batch is charged an equal share of the batch wall time.
 - Streamable HTTP only. No legacy SSE. Tools only: no resources, prompts,
   or sampling.
 - SQL names are sanitized. A collision gets `_2`, `_3`, and so on.
-  Argument order is the sorted JSON Schema key order.
+  A name longer than 63 bytes is skipped with a warning and a catalog
+  row. Argument order is required properties, then defaulted properties,
+  schema order inside each group.
+- Streamable HTTP uses rustls. A plaintext `http://` URL still works.
+  The gateway listens with `SO_REUSEADDR`.
 - `EXPLAIN` for a fresh backend that has not loaded the rvbbit catalog
   yet does not print MCP lines. `IMPORT` in the same session does.
 - The mock `now` tool is not a real RFC3339 timestamp.

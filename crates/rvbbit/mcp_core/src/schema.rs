@@ -5,7 +5,10 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArgSpec {
+    /// Sanitized SQL argument name.
     pub name: String,
+    /// Original JSON Schema property name. Positional calls map back to this.
+    pub json_name: String,
     pub sql_type: String,
     pub default_sql: Option<String>,
 }
@@ -20,13 +23,12 @@ pub struct ToolShape {
 
 pub const RETURNS_TABLE: &str = "table";
 
-/// Property names in the same order as [`sql_args`]. serde_json maps sort keys.
+/// Property names in the same order as [`sql_args`]: required arguments,
+/// then arguments with a JSON Schema default. Schema order is kept inside
+/// each group. `serde_json` is built with `preserve_order`, so that order
+/// is the object order, not a sorted key order.
 pub fn json_names(input: &Value) -> Vec<String> {
-    input
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default()
+    object_fields(input).into_iter().map(|arg| arg.json_name).collect()
 }
 
 /// Positional SQL arguments become the tool's JSON object.
@@ -90,14 +92,23 @@ fn object_fields(schema: &Value) -> Vec<ArgSpec> {
     let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
         return Vec::new();
     };
-    props
-        .iter()
-        .map(|(name, spec)| ArgSpec {
+    let mut required = Vec::new();
+    let mut defaulted = Vec::new();
+    for (name, spec) in props {
+        let arg = ArgSpec {
             name: sql_ident(name),
+            json_name: name.clone(),
             sql_type: json_type_to_sql(spec),
             default_sql: spec.get("default").map(json_default_sql),
-        })
-        .collect()
+        };
+        if arg.default_sql.is_none() {
+            required.push(arg);
+        } else {
+            defaulted.push(arg);
+        }
+    }
+    required.extend(defaulted);
+    required
 }
 
 fn table_columns(schema: &Value) -> (bool, Vec<ArgSpec>) {
@@ -245,5 +256,36 @@ mod tests {
     fn odd_tool_names_become_idents() {
         assert_eq!(sql_ident("get-Time"), "get_time");
         assert_eq!(sql_ident("1st"), "t1st");
+    }
+
+    /// Postgres rejects a required argument after one that has a default.
+    /// Required properties stay in schema order, then defaulted properties.
+    #[test]
+    fn required_args_precede_defaulted_args_in_schema_order() {
+        let mut props = serde_json::Map::new();
+        props.insert("zebra".into(), json!({"type": "string"}));
+        props.insert("mango".into(), json!({"type": "string", "default": "ripe"}));
+        props.insert("apple".into(), json!({"type": "integer"}));
+        props.insert("banana".into(), json!({"type": "boolean", "default": true}));
+        let input = serde_json::Value::Object({
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), serde_json::Value::String("object".into()));
+            obj.insert("properties".into(), serde_json::Value::Object(props));
+            obj
+        });
+        let shape = sql_args(&input, &Value::Null);
+        let names: Vec<&str> = shape.args.iter().map(|arg| arg.json_name.as_str()).collect();
+        assert_eq!(names, vec!["zebra", "apple", "mango", "banana"]);
+        assert!(shape.args[0].default_sql.is_none());
+        assert!(shape.args[1].default_sql.is_none());
+        assert!(shape.args[2].default_sql.is_some());
+        assert!(shape.args[3].default_sql.is_some());
+        assert_eq!(json_names(&input), vec!["zebra", "apple", "mango", "banana"]);
+        let body = tool_fn_body("mcp_demo", "fetch", &shape.args, false, &[]);
+        let zebra = body.find("zebra").expect("zebra");
+        let apple = body.find("apple").expect("apple");
+        let mango = body.find("mango").expect("mango");
+        let banana = body.find("banana").expect("banana");
+        assert!(zebra < apple && apple < mango && mango < banana, "{body}");
     }
 }

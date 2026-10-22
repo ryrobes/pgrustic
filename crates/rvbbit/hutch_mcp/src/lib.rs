@@ -8,7 +8,7 @@ mod http;
 mod mock;
 
 pub use client::{call_many, call_tool, list_tools};
-pub use http::serve;
+pub use http::{bind_listener, serve};
 pub use mock::{serve_http as mock_http, serve_stdio as mock_stdio};
 
 pub use mcp_core::{PgRole, PgSession, RecordingPg, ServerSpec, SessionAuth, SessionPreamble, UnconfiguredAuth};

@@ -14,7 +14,7 @@
 //! 10k miss run still counts one predict per 32 rows.
 //! In-flight HTTP is not aborted; the wait returns at the next 20ms poll.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -37,7 +37,7 @@ mod mcp;
 mod memo;
 pub use mcp::{
     mcp_arguments, mcp_batch, mcp_batch_for_tool, mcp_call, mcp_invoke_tool, mcp_list, mcp_url,
-    McpCallOpts,
+    note_mcp_memo_hit, McpCallOpts,
 };
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
@@ -2844,11 +2844,38 @@ pub enum ScalarHit {
 static SCALAR_MEMO: std::sync::LazyLock<Mutex<HashMap<(String, String), ScalarHit>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Keys the project or scan batcher stored for the builtin to consume
+/// during projection. Recalling one of these is not a second cache hit:
+/// the gateway already logged the call. A memo the builtin itself stored
+/// survives the statement, and recalling that one is a local cache hit.
+static DELIVERY_MEMO: std::sync::LazyLock<Mutex<HashSet<(String, String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+static LOCAL_MCP_CALLS: std::sync::LazyLock<Mutex<std::collections::VecDeque<serde_json::Value>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+
 pub fn remember_scalar(key: &str, input: &str, hit: ScalarHit) {
     SCALAR_MEMO
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert((key.to_string(), input.to_string()), hit);
+}
+
+pub fn remember_delivery(key: &str, input: &str, hit: ScalarHit) {
+    remember_scalar(key, input, hit);
+    DELIVERY_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((key.to_string(), input.to_string()));
+}
+
+/// True when this recall consumes a batcher delivery. The caller then
+/// returns the value without logging another hit.
+pub fn take_delivery(key: &str, input: &str) -> bool {
+    DELIVERY_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(key.to_string(), input.to_string()))
 }
 
 pub fn recall_scalar(key: &str, input: &str) -> Option<ScalarHit> {
@@ -2861,9 +2888,30 @@ pub fn recall_scalar(key: &str, input: &str) -> Option<ScalarHit> {
 
 pub fn forget_scalar(keys: &[(String, String)]) {
     let mut memo = SCALAR_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let mut delivery = DELIVERY_MEMO.lock().unwrap_or_else(|e| e.into_inner());
     for key in keys {
         memo.remove(key);
+        delivery.remove(key);
     }
+}
+
+/// A retained builtin memo hit. `rvbbit.calls` merges these with the
+/// gateway log. The row is already in the view's column shape.
+pub fn push_local_mcp_call(row: serde_json::Value) {
+    let mut rows = LOCAL_MCP_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+    if rows.len() >= rvbbit_contract::CALL_LOG_CAP {
+        rows.pop_front();
+    }
+    rows.push_back(row);
+}
+
+pub fn local_mcp_calls() -> Vec<serde_json::Value> {
+    LOCAL_MCP_CALLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

@@ -70,7 +70,7 @@ pub use estimate::{
     remember_scan_rows,
     tree_estimate, Shown,
 };
-pub use rvbbit_cost::{node_actual, query_actual};
+pub use rvbbit_cost::{mcp_batches, node_actual, query_actual};
 
 fn lift_tree<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Node<'mcx>> {
     if plan.as_plan().is_none() {

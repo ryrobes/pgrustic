@@ -371,6 +371,7 @@ pub(crate) fn executor_finish_and_park_seam(h: QueryDescHandle) -> PgResult<bool
             return Ok(false);
         }
         rvbbit_cost::end_query();
+        crate::mcpbatch::on_executor_end();
         // CreateQueryDesc registered this snapshot; the parked QueryDesc
         // skips FreeQueryDesc, so release it here (rearm re-registers).
         snapmgr::UnregisterSnapshot(qd.snapshot.take().as_ref());
@@ -1757,6 +1758,7 @@ fn exec_postprocess_plan(estate: &mut EStateData<'_>) -> PgResult<()> {
 #[inline]
 pub fn standard_executor_end(qd: &mut QueryDescData) -> PgResult<()> {
     rvbbit_cost::end_query();
+    crate::mcpbatch::on_executor_end();
     // execMain.c:487-489.
     if let Some(exec) = qd.exec.as_mut() {
         exec.with_mut(|data| {

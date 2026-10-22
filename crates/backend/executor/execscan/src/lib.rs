@@ -291,6 +291,16 @@ fn exec_scan_fetch<'mcx, N: ScanNode<'mcx>, const EPQ: bool>(
     Ok(None)
 }
 
+/// Fetch one raw scan tuple without qual or projection. A projecting scan
+/// cannot use `exec_scan_extended::<_, false, false>`: that asserts the
+/// projection flag matches `ps_ProjInfo`.
+pub fn fetch_scan_tuple<'mcx, N: ScanNode<'mcx>>(
+    node: &mut N,
+    estate: &mut EStateData<'mcx>,
+) -> PgResult<Option<ExecSlotId>> {
+    exec_scan_fetch::<_, false>(node, estate)
+}
+
 /// `ExecScanExtended`: QUAL/PROJ mirror C's const-NULL argument elimination.
 #[inline(always)]
 pub fn exec_scan_extended<'mcx, N: ScanNode<'mcx>, const QUAL: bool, const PROJ: bool>(

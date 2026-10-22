@@ -139,7 +139,7 @@ SQL
 fi
 
 echo "=== import the mock stdio server ==="
-"${PSQL[@]}" <<SQL
+"${PSQL[@]}" <<SQL 2>&1 | tee "$RUNDIR/import.out"
 CREATE SERVER demo FOREIGN DATA WRAPPER mcp OPTIONS (
   transport 'stdio',
   command '${HUTCH_BIN}',
@@ -147,6 +147,12 @@ CREATE SERVER demo FOREIGN DATA WRAPPER mcp OPTIONS (
 );
 IMPORT FOREIGN TOOLS FROM SERVER demo INTO mcp_demo;
 SQL
+grep -q 'skipping MCP tool' "$RUNDIR/import.out"
+SKIPPED=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM mcp.tool WHERE procoid IS NULL AND import_error IS NOT NULL AND length(tool) > 63;")
+echo "skipped tools=$SKIPPED"
+test "$SKIPPED" = "1"
+ECHO_FN=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'mcp_demo' AND p.proname = 'echo';")
+test "$ECHO_FN" = "1"
 
 echo "=== echo, people, fail, ON ERROR ==="
 ECHO=$("${PSQL[@]}" -tA -c "SELECT mcp_demo.echo('Ken Lay') = to_jsonb('Ken Lay'::text);")
@@ -183,14 +189,24 @@ SQL
 "${PSQL[@]}" -c "SELECT cache FROM rvbbit.calls WHERE op = 'mcp' AND tool = 'echo' AND server = 'demo' ORDER BY ts;" | tee "$RUNDIR/calls.out"
 grep -q 'hit' "$RUNDIR/calls.out"
 
+echo "=== memo hit without a gateway cache ttl ==="
+"${PSQL[@]}" <<'SQL'
+SELECT mcp_demo.bag('{"k":"one"}'::jsonb);
+SELECT mcp_demo.bag('{"k":"one"}'::jsonb);
+SQL
+"${PSQL[@]}" -c "SELECT cache FROM rvbbit.calls WHERE op = 'mcp' AND tool = 'bag' AND server = 'demo' ORDER BY ts;" | tee "$RUNDIR/bag.out"
+grep -q 'hit' "$RUNDIR/bag.out"
+
 echo "=== explain and refresh ==="
 # EXPLAIN reads the in-memory tool cache. A statement in the same session
 # loads it. A fresh backend's first statement is the documented gap.
 "${PSQL[@]}" <<'SQL' | tee "$RUNDIR/explain.out"
 SELECT mcp_demo.echo('plan');
-EXPLAIN (COSTS ON) SELECT mcp_demo.echo(x) FROM (VALUES ('a'), ('b'), ('c'), ('d')) v(x);
+EXPLAIN (ANALYZE, COSTS ON) SELECT mcp_demo.echo(x) FROM (VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('g'), ('h'), ('i'), ('j')) v(x);
 SQL
 grep -q 'MCP Provider Calls' "$RUNDIR/explain.out"
+grep -E -q 'Actual MCP Calls: [1-9]' "$RUNDIR/explain.out"
+grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/explain.out"
 "${PSQL[@]}" -c "REFRESH FOREIGN TOOLS FROM SERVER demo;" 2>&1 | tee "$RUNDIR/refresh.out"
 grep -q 'unchanged' "$RUNDIR/refresh.out"
 
@@ -199,5 +215,9 @@ echo "=== drop ==="
 LEFT=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM mcp.tool;")
 echo "tools left=$LEFT"
 test "$LEFT" = "0"
+if grep -q 'schema mcp already exists' "$PG_LOG"; then
+  echo "schema mcp notice leaked into the postgres log" >&2
+  exit 1
+fi
 
 echo "mcp demo ok"

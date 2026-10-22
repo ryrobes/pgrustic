@@ -322,6 +322,7 @@ pub(crate) fn release_query_desc_seam(h: QueryDescHandle) {
     // depth here so the next statement on this backend still sees a fresh
     // pre-flight arm and fresh EXPLAIN ANALYZE actuals.
     rvbbit_cost::end_query();
+    crate::mcpbatch::on_executor_end();
     drop(remove(h));
 }
 
