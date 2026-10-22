@@ -4067,6 +4067,9 @@ pub fn exec_set_tuple_bound<'mcx>(tuples_needed: i64, node: &mut PlanStateNode<'
             if let Some(proj) = rs.proj.as_deref_mut() {
                 crate::projbatch::note_tuple_bound(proj, tuples_needed);
             }
+            if let Some(mcp) = rs.mcp.as_deref_mut() {
+                crate::mcpbatch::note_tuple_bound(mcp, tuples_needed);
+            }
             if let Some(outer) = rs.outer.as_deref_mut() {
                 exec_set_tuple_bound(tuples_needed, outer);
             }

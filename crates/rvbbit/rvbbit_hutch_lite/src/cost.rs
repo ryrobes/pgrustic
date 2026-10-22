@@ -294,6 +294,9 @@ mod tests {
             identical: None,
             payload: None,
             retake: None,
+            server: None,
+            tool: None,
+            status: None,
         };
         let line = meter_log_line(&meter, "sk-secret");
         assert!(line.starts_with("hutch_call "));

@@ -15,6 +15,9 @@ use rvbbit_parse::{Arg, Command, FnClauses, ObjKind, WithOpts};
 use rvbbit_resolve::{Endpoint, Resolved};
 use types_error::{PgError, PgResult};
 
+mod mcp;
+pub use mcp::mcp_try_drop;
+
 fn ensure_m6_ops() -> PgResult<()> {
     for (name, args, ret, body) in [
         (
@@ -361,6 +364,7 @@ fn reload() -> PgResult<()> {
     }
     rvbbit_resolve::install(entries);
     load_trees()?;
+    mcp::load()?;
     if let Some(oid) = scalar(
         "SELECT p.oid::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'decide'",
@@ -476,6 +480,10 @@ fn apply(cmd: Command) -> PgResult<()> {
             grant(is_grant, &privilege, kind, &name, &args, &role)
         }
         Command::Comment { kind, name, args, text } => comment(kind, &name, &args, text.as_deref()),
+        other @ (Command::CreateMcpServer { .. }
+        | Command::ImportMcpTools { .. }
+        | Command::AlterMcpTool { .. }
+        | Command::RefreshMcpTools { .. }) => mcp::apply(other),
     }
 }
 
@@ -1267,7 +1275,11 @@ fn ensure_schema() -> PgResult<()> {
     .is_none()
     {
         exec(CALLS_VIEW)?;
-    } else if !catalog_column("calls", "node")? || !catalog_column("calls", "score")? || !catalog_column("calls", "identical")? {
+    } else if !catalog_column("calls", "node")?
+        || !catalog_column("calls", "score")?
+        || !catalog_column("calls", "identical")?
+        || !catalog_column("calls", "server")?
+    {
         exec(CALLS_VIEW)?;
     }
     if scalar(
@@ -1328,6 +1340,7 @@ fn ensure_schema() -> PgResult<()> {
         )?;
     }
     ensure_m6_ops()?;
+    mcp::ensure()?;
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'dump_sql'",
@@ -1510,13 +1523,14 @@ const SCHEMA_DDL: &[&str] = &[
 const CALLS_VIEW: &str = "CREATE OR REPLACE VIEW rvbbit.calls AS \
     SELECT op, model, tokens_in, tokens_out, cost, cost_saved, \
            latency_ms, provider_latency_ms, cache, items, tenant, \
-           generation_id, node, score, identical, ts::timestamptz AS ts \
+           generation_id, node, score, identical, server, tool, status, \
+           ts::timestamptz AS ts \
     FROM json_to_recordset(rvbbit.call_log()::json) AS r( \
         op text, model text, tokens_in bigint, tokens_out bigint, \
         cost float8, cost_saved float8, latency_ms float8, \
         provider_latency_ms float8, cache text, items int, \
         tenant text, generation_id text, node text, score float8, \
-        identical boolean, ts text)";
+        identical boolean, server text, tool text, status text, ts text)";
 
 const FUNCTION_DDL: &[&str] = &[
     "CREATE OR REPLACE FUNCTION rvbbit.dump_sql() RETURNS text

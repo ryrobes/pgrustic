@@ -12,7 +12,7 @@ use rvbbit_oids::{
     CLAUSE_TEXT_OID, CONSENSUS_FINAL_NAME, CONSENSUS_FINAL_OID, CONSENSUS_TRANS_NAME,
     CONSENSUS_TRANS_OID, DECIDE_NAME, DECIDE_OID, DUMP_NAME, DUMP_OID, EXTRACT_MANY_NAME,
     EXTRACT_MANY_OID, EXTRACT_NAME, EXTRACT_OID, EXTRACT_TYPED_NAME, EXTRACT_TYPED_OID, FLOW_NAME,
-    FLOW_OID, GETDEF_NAME,
+    FLOW_OID, GETDEF_NAME, MCP_INVOKE_NAME, MCP_INVOKE_OID,
     GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_FOR_NAME,
     RERANK_FOR_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID, SUMMARIZE_FINAL_NAME,
     SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID, SUMMARIZE_TRANS_NAME,
@@ -523,18 +523,31 @@ pub fn rvbbit_call_log(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> P
     rvbbit_resolve::ensure()?;
     let urls = rvbbit_catalog::hutch_urls()?;
     let mut rows = Vec::new();
+    let mut seen = Vec::new();
     for url in urls {
-        let text = rvbbit_dispatch::recent_calls_json(&url).map_err(|message| {
-            Box::new(types_error::PgError::error(message)) as Box<types_error::PgError>
-        })?;
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| {
-            Box::new(types_error::PgError::error(format!("rvbbit.call_log: {e}")))
-                as Box<types_error::PgError>
-        })?;
-        rows.extend(parsed);
+        append_call_log(&url, &mut rows, &mut seen);
     }
+    append_call_log(&rvbbit_dispatch::mcp_url(), &mut rows, &mut seen);
     let body = serde_json::Value::Array(rows).to_string();
     Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), body.as_bytes())?))
+}
+
+/// One GET per distinct backend. A server that does not answer is skipped
+/// so a stopped hutch does not hide MCP rows, and a gateway that is also
+/// registered as a hutch backend is not listed twice.
+fn append_call_log(url: &str, rows: &mut Vec<serde_json::Value>, seen: &mut Vec<String>) {
+    let key = url.trim().trim_end_matches('/').to_string();
+    if key.is_empty() || seen.iter().any(|item| item == &key) {
+        return;
+    }
+    seen.push(key);
+    let Ok(text) = rvbbit_dispatch::recent_calls_json(url) else {
+        return;
+    };
+    let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        return;
+    };
+    rows.extend(parsed);
 }
 
 pub fn rvbbit_dump_sql(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
@@ -564,6 +577,62 @@ pub fn rvbbit_flow(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgRes
     };
     let text = rvbbit_catalog::run_flow(&name, &input, version)?;
     text_datum(fcinfo, &text)
+}
+
+pub fn rvbbit_mcp_invoke(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let nsp = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let name = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let args = arg_text(fcinfo, 2)?.unwrap_or_else(|| "[]".into());
+    let use_fallback = fcinfo.nargs() >= 4 && !fcinfo.argisnull(3) && fcinfo.arg_bool(3);
+    let fallback = if fcinfo.nargs() >= 5 && !fcinfo.argisnull(4) {
+        arg_text(fcinfo, 4)?
+    } else {
+        None
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&args).unwrap_or(serde_json::json!([]));
+    let canonical = serde_json::to_string(&parsed).unwrap_or(args);
+    let key = format!("mcp\u{1f}{nsp}\u{1f}{name}");
+    if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &canonical) {
+        return match hit {
+            rvbbit_dispatch::ScalarHit::Value(value) => text_datum(fcinfo, &value),
+            rvbbit_dispatch::ScalarHit::Missing => Ok(fcinfo.return_null()),
+            rvbbit_dispatch::ScalarHit::Failed(message) => mcp_fail(fcinfo, use_fallback, fallback, message),
+        };
+    }
+    let Some(tool) = rvbbit_resolve::mcp_tool(&nsp, &name) else {
+        return Err(Box::new(types_error::PgError::error(format!(
+            "MCP tool {nsp}.{name} is not imported"
+        ))));
+    };
+    match rvbbit_dispatch::mcp_invoke_tool(&tool, &canonical) {
+        Ok(value) => {
+            let text = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
+            rvbbit_dispatch::remember_scalar(&key, &canonical, rvbbit_dispatch::ScalarHit::Value(text.clone()));
+            text_datum(fcinfo, &text)
+        }
+        Err(message) => {
+            rvbbit_dispatch::remember_scalar(
+                &key,
+                &canonical,
+                rvbbit_dispatch::ScalarHit::Failed(message.clone()),
+            );
+            mcp_fail(fcinfo, use_fallback, fallback, message)
+        }
+    }
+}
+
+fn mcp_fail(fcinfo: &mut Fcinfo, use_fallback: bool, fallback: Option<String>, message: String) -> PgResult<Datum> {
+    if use_fallback {
+        return match fallback {
+            None => Ok(fcinfo.return_null()),
+            Some(text) => {
+                let encoded = serde_json::Value::String(text).to_string();
+                text_datum(fcinfo, &encoded)
+            }
+        };
+    }
+    Err(Box::new(types_error::PgError::error(message)))
 }
 
 pub fn rvbbit_get_semfn_def(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
@@ -795,5 +864,13 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: true,
         retset: false,
         func: rvbbit_semantic_similarity as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: MCP_INVOKE_OID,
+        name: MCP_INVOKE_NAME,
+        nargs: 5,
+        strict: false,
+        retset: false,
+        func: rvbbit_mcp_invoke as PGFunction,
     },
 ];

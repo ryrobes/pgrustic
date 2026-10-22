@@ -106,15 +106,27 @@ fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
     };
     if es.costs {
         if let Some(est) = &est {
-            ExplainPropertyFloat("Semantic Provider Calls", None, est.provider_calls, 2, es);
-            ExplainPropertyFloat("Semantic HTTP Batches", None, est.http_batches, 2, es);
-            ExplainPropertyFloat("Semantic USD", None, est.usd, 8, es);
-            ExplainPropertyFloat("Semantic Latency", Some("ms"), est.latency_ms, 1, es);
-            if !est.model.is_empty() {
-                ExplainPropertyText("Semantic Model", &est.model, es);
-            }
-            if est.filters {
-                ExplainPropertyFloat("Semantic Selectivity", None, est.selectivity, 2, es);
+            if mcp_only(&est.model) {
+                ExplainPropertyFloat("MCP Provider Calls", None, est.provider_calls, 2, es);
+                ExplainPropertyFloat("MCP Latency", Some("ms"), est.latency_ms, 1, es);
+                ExplainPropertyFloat("MCP USD", None, est.usd, 8, es);
+                if let Some((server, tool)) = mcp_target(&est.model) {
+                    ExplainPropertyText("MCP Server", &server, es);
+                    ExplainPropertyText("MCP Tool", &tool, es);
+                } else if !est.model.is_empty() {
+                    ExplainPropertyText("MCP Model", &est.model, es);
+                }
+            } else {
+                ExplainPropertyFloat("Semantic Provider Calls", None, est.provider_calls, 2, es);
+                ExplainPropertyFloat("Semantic HTTP Batches", None, est.http_batches, 2, es);
+                ExplainPropertyFloat("Semantic USD", None, est.usd, 8, es);
+                ExplainPropertyFloat("Semantic Latency", Some("ms"), est.latency_ms, 1, es);
+                if !est.model.is_empty() {
+                    ExplainPropertyText("Semantic Model", &est.model, es);
+                }
+                if est.filters {
+                    ExplainPropertyFloat("Semantic Selectivity", None, est.selectivity, 2, es);
+                }
             }
         }
     }
@@ -124,18 +136,46 @@ fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
         if let Some(est) = &est {
             let id = node.as_plan().map(|p| p.plan_node_id).unwrap_or(-1);
             let act = rvbbit_plan::node_actual(id).unwrap_or_default();
-            ExplainPropertyInteger("Actual Semantic Calls", None, act.calls as i64, es);
-            ExplainPropertyInteger("Actual Choice Retakes", None, act.retakes as i64, es);
-            ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
-            ExplainPropertyInteger("Actual HTTP Batches", None, act.http_batches as i64, es);
-            ExplainPropertyFloat("Actual Semantic USD", None, act.usd, 8, es);
-            ExplainPropertyFloat("Actual Semantic Latency", Some("ms"), act.latency_ms, 1, es);
-            let model = if act.model.is_empty() { est.model.clone() } else { act.model };
-            if !model.is_empty() {
-                ExplainPropertyText("Actual Semantic Model", &model, es);
+            let model = if act.model.is_empty() { est.model.clone() } else { act.model.clone() };
+            if mcp_only(&est.model) || mcp_only(&model) {
+                ExplainPropertyInteger("Actual MCP Calls", None, act.calls as i64, es);
+                ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
+                ExplainPropertyFloat("Actual MCP Latency", Some("ms"), act.latency_ms, 1, es);
+                if let Some((server, tool)) = mcp_target(&model) {
+                    ExplainPropertyText("MCP Server", &server, es);
+                    ExplainPropertyText("MCP Tool", &tool, es);
+                }
+            } else {
+                ExplainPropertyInteger("Actual Semantic Calls", None, act.calls as i64, es);
+                ExplainPropertyInteger("Actual Choice Retakes", None, act.retakes as i64, es);
+                ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
+                ExplainPropertyInteger("Actual HTTP Batches", None, act.http_batches as i64, es);
+                ExplainPropertyFloat("Actual Semantic USD", None, act.usd, 8, es);
+                ExplainPropertyFloat("Actual Semantic Latency", Some("ms"), act.latency_ms, 1, es);
+                if !model.is_empty() {
+                    ExplainPropertyText("Actual Semantic Model", &model, es);
+                }
             }
         }
     }
+}
+
+fn mcp_only(model: &str) -> bool {
+    let parts: Vec<&str> = model.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    !parts.is_empty() && parts.iter().all(|part| part.starts_with("mcp:"))
+}
+
+fn mcp_target(model: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = model.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if parts.len() != 1 {
+        return None;
+    }
+    let rest = parts[0].strip_prefix("mcp:")?;
+    let (server, tool) = rest.split_once('/')?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((server.to_string(), tool.to_string()))
 }
 
 fn show_semantic_totals(root: Node<'_>, es: &mut ExplainState<'_>) {
@@ -146,10 +186,16 @@ fn show_semantic_totals(root: Node<'_>, es: &mut ExplainState<'_>) {
     };
     if es.costs {
         if let Some(total) = &total {
-            ExplainPropertyFloat("Semantic Total Provider Calls", None, total.provider_calls, 2, es);
-            ExplainPropertyFloat("Semantic Total HTTP Batches", None, total.http_batches, 2, es);
-            ExplainPropertyFloat("Semantic Total USD", None, total.usd, 8, es);
-            ExplainPropertyFloat("Semantic Total Latency", Some("ms"), total.latency_ms, 1, es);
+            if mcp_only(&total.model) {
+                ExplainPropertyFloat("MCP Total Provider Calls", None, total.provider_calls, 2, es);
+                ExplainPropertyFloat("MCP Total Latency", Some("ms"), total.latency_ms, 1, es);
+                ExplainPropertyFloat("MCP Total USD", None, total.usd, 8, es);
+            } else {
+                ExplainPropertyFloat("Semantic Total Provider Calls", None, total.provider_calls, 2, es);
+                ExplainPropertyFloat("Semantic Total HTTP Batches", None, total.http_batches, 2, es);
+                ExplainPropertyFloat("Semantic Total USD", None, total.usd, 8, es);
+                ExplainPropertyFloat("Semantic Total Latency", Some("ms"), total.latency_ms, 1, es);
+            }
         }
     }
     if es.analyze {
@@ -1184,6 +1230,7 @@ pub fn ExplainNode<'mcx>(
             if !plan.qual.is_nil() {
                 show_instrumentation_count("Rows Removed by Filter", 1, &instrument, es);
             }
+            show_semantic_cost(node, es);
         }
         NodeTag::T_SeqScan
         | NodeTag::T_CteScan
@@ -1212,6 +1259,7 @@ pub fn ExplainNode<'mcx>(
             if node.node_tag() == NodeTag::T_TableFuncScan {
                 show_table_func_scan_info(node, es);
             }
+            show_semantic_cost(node, es);
         }
         NodeTag::T_ForeignScan => {
             show_scan_qual(&plan.qual, "Filter", node, ancestors, es)?;
@@ -1219,6 +1267,7 @@ pub fn ExplainNode<'mcx>(
                 show_instrumentation_count("Rows Removed by Filter", 1, &instrument, es);
             }
             show_foreignscan_info(plan.plan_node_id, es)?;
+            show_semantic_cost(node, es);
         }
         NodeTag::T_FunctionScan => {
             if es.verbose {
@@ -1242,6 +1291,7 @@ pub fn ExplainNode<'mcx>(
             if !plan.qual.is_nil() {
                 show_instrumentation_count("Rows Removed by Filter", 1, &instrument, es);
             }
+            show_semantic_cost(node, es);
         }
         NodeTag::T_BitmapIndexScan => {
             let s = node.as_bitmap_index_scan().unwrap();

@@ -39,6 +39,9 @@ pub struct ResultState<'mcx> {
     /// Batch executor for top-level native CLASSIFY / EXTRACT. None when
     /// MEANS or a decision tree owns the node.
     pub proj: Option<Box<crate::projbatch::ProjectState<'mcx>>>,
+    /// Batch executor for scalar MCP tools. None when a semantic project
+    /// batcher already owns the node, or when a tool returns a set.
+    pub mcp: Option<Box<crate::mcpbatch::McpState<'mcx>>>,
 }
 
 /// `ExecInitResult` (nodeResult.c).
@@ -103,6 +106,11 @@ pub fn exec_init_result<'mcx>(
     } else {
         None
     };
+    let mcp = if rvbbit.is_none() && tree.is_none() && project.is_none() {
+        crate::mcpbatch::compile(estate, node)?
+    } else {
+        None
+    };
     Ok(ResultState {
         ps: PlanStateBase {
             plan: &node.plan,
@@ -120,6 +128,7 @@ pub fn exec_init_result<'mcx>(
         rvbbit,
         tree,
         proj: project,
+        mcp,
     })
 }
 
@@ -136,6 +145,9 @@ pub fn exec_result<'mcx>(
     }
     if node.proj.is_some() {
         return crate::projbatch::exec(node, estate);
+    }
+    if node.mcp.is_some() {
+        return crate::mcpbatch::exec(node, estate);
     }
     crate::cfi()?;
     let ecxt = node
@@ -364,5 +376,5 @@ pub fn exec_end_result<'mcx>(
 // rvbbit / tree exempt: the batch state owns heap (memo, saved tuples);
 // exec_end_result and release_owned take() it before the node is forgotten.
 ::mcx::forget_safe_struct!(
-    ResultState<'_> { ps, outer, rs_done, rs_checkqual, outer_chg; resconstantqual, rvbbit, tree, proj },
+    ResultState<'_> { ps, outer, rs_done, rs_checkqual, outer_chg; resconstantqual, rvbbit, tree, proj, mcp },
 );

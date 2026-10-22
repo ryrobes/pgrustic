@@ -9,7 +9,9 @@ path = "src/lib.rs"
 
 [dependencies]
 mcx = { path = "../../_support/mcx" }
+mcp_core = { path = "../mcp_core" }
 rvbbit_contract = { path = "../rvbbit_contract" }
+rvbbit_dispatch = { path = "../rvbbit_dispatch" }
 rvbbit_oids = { path = "../rvbbit_oids" }
 rvbbit_parse = { path = "../rvbbit_parse" }
 rvbbit_resolve = { path = "../rvbbit_resolve" }

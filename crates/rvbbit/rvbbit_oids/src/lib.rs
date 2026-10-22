@@ -83,6 +83,10 @@ pub const SIMILARITY_OID: u32 = 9045;
 /// body. A third `int` argument selects the version. The SQL name is
 /// `rvbbit.flow`.
 pub const FLOW_OID: u32 = 9046;
+/// `rvbbit_mcp_invoke_text(nsp, name, args, use_fallback, fallback) -> text`.
+/// The SQL name is `rvbbit.mcp_invoke_text`. Not strict: `ON ERROR NULL`
+/// passes a null fallback.
+pub const MCP_INVOKE_OID: u32 = 9047;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -110,6 +114,7 @@ pub const RERANK_FOR_NAME: &str = "rvbbit_rerank_for";
 pub const USER_NAME: &str = "rvbbit_user";
 pub const SIMILARITY_NAME: &str = "rvbbit_semantic_similarity";
 pub const FLOW_NAME: &str = "rvbbit_flow";
+pub const MCP_INVOKE_NAME: &str = "rvbbit_mcp_invoke_text";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

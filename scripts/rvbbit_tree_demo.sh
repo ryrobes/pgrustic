@@ -26,8 +26,7 @@ PGDATA=${PGDATA:-/tmp/rvbbit-tree-pg}
 RUNDIR=${RUNDIR:-/tmp/rvbbit-tree-demo}
 DECISION=${HUTCH_DECISION_MODEL:-typesafe/jev-1.14}
 export HUTCH_DECISION_MODEL="$DECISION"
-# rvbbit.calls and the bootstrap backend use this URL. Without it,
-# call_log reads the default port 8099 and the query fails.
+# rvbbit.calls and the bootstrap backend use this URL.
 export RVBBIT_HUTCH_URL="http://127.0.0.1:${HUTCH_PORT}"
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}

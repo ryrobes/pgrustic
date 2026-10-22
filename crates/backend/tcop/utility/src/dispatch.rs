@@ -2057,6 +2057,13 @@ fn exec_drop_stmt<'mcx>(mcx: Mcx<'mcx>, parsetree: Node<'_>, is_top_level: bool)
             &types_nodes::parsenodes::DropStmt<'mcx>,
         >(stmt)
     };
+    if stmt.removeType == OBJECT_FOREIGN_SERVER {
+        let names = foreign_server_names(&stmt.objects);
+        let cascade = stmt.behavior == types_nodes::parsenodes::DropBehavior::DROP_CASCADE;
+        if rvbbit_resolve::try_mcp_drop(&names, cascade, stmt.missing_ok)? {
+            return Ok(());
+        }
+    }
     match stmt.removeType {
         OBJECT_INDEX if stmt.concurrent => {
             xact::PreventInTransactionBlock(is_top_level, "DROP INDEX CONCURRENTLY")?;
@@ -2067,6 +2074,25 @@ fn exec_drop_stmt<'mcx>(mcx: Mcx<'mcx>, parsetree: Node<'_>, is_top_level: bool)
         _ => commands_dropcmds::RemoveObjects(mcx, stmt)?,
     }
     Ok(())
+}
+
+fn foreign_server_names(objects: &types_nodes::list::NodeList<'_>) -> Vec<String> {
+    fn walk(node: Node<'_>, names: &mut Vec<String>) {
+        if let Some(text) = node.as_string() {
+            names.push(text.sval.to_string());
+            return;
+        }
+        if let Some(list) = node.as_list() {
+            for item in list.iter() {
+                walk(item, names);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    for item in objects.iter() {
+        walk(item, &mut names);
+    }
+    names
 }
 
 fn exec_comment_stmt<'mcx>(mcx: Mcx<'mcx>, parsetree: Node<'_>) -> PgResult<ObjectAddress> {

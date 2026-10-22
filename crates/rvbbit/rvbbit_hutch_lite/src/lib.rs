@@ -2280,6 +2280,9 @@ fn miss_meter(
         identical: None,
         payload: audit_payload(),
         retake: None,
+        server: None,
+        tool: None,
+        status: None,
     }
 }
 
@@ -2319,6 +2322,9 @@ fn saved_meter(
         identical: None,
         payload: audit_payload(),
         retake: None,
+        server: None,
+        tool: None,
+        status: None,
     }
 }
 
@@ -2354,6 +2360,9 @@ fn meter_cached(
         identical: stored.identical_takes,
         payload: audit_payload(),
         retake: None,
+        server: None,
+        tool: None,
+        status: None,
     };
     record_call(server, &meter);
     let mut scored = stored.clone();
@@ -2934,6 +2943,9 @@ fn lookup_hit_meter(tenant: &str, stored: &Scored) -> CallMeter {
         identical: stored.identical_takes,
         payload: audit_payload(),
         retake: None,
+        server: None,
+        tool: None,
+        status: None,
     }
 }
 

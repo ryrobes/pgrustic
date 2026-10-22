@@ -193,3 +193,10 @@ edits are in files that already existed (`parser_driver`, `lex.rs`,
 `parse_expr`, `noderesult.rs`, `procnode.rs`, `execmain/src/lib.rs`,
 `semantic.rs`, `explain/src/node.rs`, `seams_init`). `gram.y`, `gram.c`,
 and `actions.rs` have no diff.
+
+## MCP tools
+
+`CREATE SERVER ... FOREIGN DATA WRAPPER mcp`, `IMPORT FOREIGN TOOLS`,
+`ALTER FOREIGN TOOL`, and `REFRESH FOREIGN TOOLS` are the same pre-parse.
+A foreign-data wrapper other than `mcp`, and `DROP SERVER` of a name
+that is not in `mcp.server`, stay in gram.y. See `docs/rvbbit/MCP.md`.

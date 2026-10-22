@@ -71,6 +71,33 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
 static TREES: Mutex<Option<HashMap<String, DecisionTree>>> = Mutex::new(None);
 static DECIDE_OID: Mutex<Option<u32>> = Mutex::new(None);
 static ENUM_LABELS: Mutex<Option<fn(&str) -> PgResult<Vec<String>>>> = Mutex::new(None);
+static MCP: Mutex<Option<Vec<McpTool>>> = Mutex::new(None);
+static MCP_DROP: Mutex<Option<fn(&[String], bool, bool) -> PgResult<bool>>> = Mutex::new(None);
+
+/// One imported MCP tool. The executor reads this instead of SPI.
+#[derive(Clone, Debug)]
+pub struct McpTool {
+    pub nsp: String,
+    pub name: String,
+    pub server: String,
+    pub tool: String,
+    pub procoid: u32,
+    pub arg_types: Vec<String>,
+    /// Original JSON Schema property names, same order as [`Self::arg_types`].
+    pub arg_keys: Vec<String>,
+    pub read_only: bool,
+    pub returns_table: bool,
+    pub timeout_ms: u64,
+    pub cache_ttl_ms: u64,
+    pub max_cost: Option<f64>,
+    pub retries: u32,
+    pub transport: String,
+    pub url: Option<String>,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub headers_json: String,
+    pub env_json: String,
+}
 
 /// One `CREATE DECISION TREE` row, joined to its model's backend.
 #[derive(Clone, Debug)]
@@ -216,6 +243,31 @@ pub fn default_base_url() -> String {
         .or_else(|| trimmed.strip_suffix("/v1/predict"))
         .unwrap_or(trimmed);
     trimmed.trim_end_matches('/').to_string()
+}
+
+pub fn install_mcp_tools(tools: Vec<McpTool>) {
+    *lock_hooks(&MCP) = Some(tools);
+}
+
+pub fn mcp_tool_by_oid(oid: u32) -> Option<McpTool> {
+    lock_hooks(&MCP).as_ref()?.iter().find(|t| t.procoid == oid).cloned()
+}
+
+pub fn mcp_tool(nsp: &str, name: &str) -> Option<McpTool> {
+    lock_hooks(&MCP).as_ref()?.iter().find(|t| t.nsp == nsp && t.name == name).cloned()
+}
+
+/// Installed from `seams_init`. `true` means every name was an MCP server
+/// and has been dropped. `false` means none of them were, so gram.y continues.
+pub fn set_mcp_drop(hook: fn(&[String], bool, bool) -> PgResult<bool>) {
+    *lock_hooks(&MCP_DROP) = Some(hook);
+}
+
+pub fn try_mcp_drop(names: &[String], cascade: bool, missing_ok: bool) -> PgResult<bool> {
+    match *lock_hooks(&MCP_DROP) {
+        Some(hook) => hook(names, cascade, missing_ok),
+        None => Ok(false),
+    }
 }
 
 pub fn default_endpoint() -> Endpoint {

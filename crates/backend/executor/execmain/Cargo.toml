@@ -165,6 +165,7 @@ rvbbit_dispatch = { path = "../../../rvbbit/rvbbit_dispatch" }
 rvbbit_cost = { path = "../../../rvbbit/rvbbit_cost" }
 rvbbit_plan = { path = "../../../rvbbit/rvbbit_plan" }
 rvbbit_resolve = { path = "../../../rvbbit/rvbbit_resolve" }
+serde_json = "1"
 
 [dev-dependencies]
 adt_numeric = { path = "../../utils/adt/numeric" }

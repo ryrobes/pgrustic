@@ -34,7 +34,11 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
         collect(node, &plan.qual, &mut works);
         collect_tlist(&plan.targetlist, &mut works);
     } else {
-        return None;
+        // A tool projected by a scan (VALUES, Seq Scan) never reaches a
+        // Result node. Cost those calls here. Semantic work stays on
+        // Result and Agg so a mixed plan is not charged twice.
+        collect_tlist(&plan.targetlist, &mut works);
+        works.retain(|w| w.op == Op::Mcp);
     }
     if works.is_empty() {
         return None;
@@ -241,6 +245,16 @@ fn found_agg(oid: u32) -> Option<Found> {
 
 fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found> {
     let oid = func.funcid;
+    if let Some(tool) = rvbbit_resolve::mcp_tool_by_oid(oid) {
+        return Some(Found {
+            op: Op::Mcp,
+            model: format!("mcp:{}/{}", tool.server, tool.tool),
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: if tool.returns_table || in_agg { Grouping::PerGroup } else { Grouping::Batched },
+            filters: false,
+        });
+    }
     let name = proc_name(oid);
     let tail = clause_tail(func);
     let mut knobs = tail.as_deref().map(knobs_from_tail).unwrap_or_default();

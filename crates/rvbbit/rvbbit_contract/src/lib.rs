@@ -284,6 +284,15 @@ pub struct CallMeter {
     /// Absent on the first take and on every other operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retake: Option<bool>,
+    /// MCP server name. Absent on model calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// MCP tool name. Absent on model calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `ok` or `error` for an MCP call. Absent on model calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

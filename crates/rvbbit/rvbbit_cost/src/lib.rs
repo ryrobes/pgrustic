@@ -61,6 +61,8 @@ pub enum Op {
     Summarize,
     Decide,
     Embed,
+    /// An outbound MCP tool call. Unpriced: the seed is 0 USD.
+    Mcp,
 }
 
 impl Op {
@@ -73,6 +75,7 @@ impl Op {
             Op::Summarize => "summarize",
             Op::Decide => "decide",
             Op::Embed => "embed",
+            Op::Mcp => "mcp",
         }
     }
 
@@ -85,6 +88,7 @@ impl Op {
             "summarize" | "summary" => Some(Op::Summarize),
             "decide" => Some(Op::Decide),
             "embed" | "about" | "semantic_similarity" => Some(Op::Embed),
+            "mcp" => Some(Op::Mcp),
             _ => None,
         }
     }
@@ -354,6 +358,9 @@ struct Seed {
 }
 
 fn seed_for(model: &str, op: Op) -> Seed {
+    if op == Op::Mcp {
+        return Seed { usd_per_item: 0.0, latency_ms: 50.0 };
+    }
     let m = model.trim().to_ascii_lowercase();
     if m.contains("gpt-4o-mini") || m.contains("4o-mini") {
         let usd = (MINI_TOKENS_IN * MINI_USD_PER_MILLION_IN
