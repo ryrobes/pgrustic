@@ -488,7 +488,7 @@ pub fn extract_lists(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
             inputs.len()
         )));
     }
-    let values = confirm_mentions(kind, inputs, values);
+    let values = filter_listed(kind, values);
     Ok(ManyReply { values, http_calls: raw.http_calls })
 }
 
@@ -603,7 +603,8 @@ fn summary_endpoint() -> Endpoint {
 
 /// Object schema so a provider can lock the reply with structured output.
 /// The root is an object because strict JSON Schema rejects a bare array.
-/// Hutch unwraps `mentions` back into the array SQL explodes.
+/// Each mention carries a category. Hutch unwraps `mentions`; the filter
+/// keeps only `specific_instance_of_kind`.
 fn many_schema(kind: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -612,16 +613,26 @@ fn many_schema(kind: &str) -> serde_json::Value {
         "properties": {
             "mentions": {
                 "type": "array",
-                "description": format!("One {kind} copied from the text, or empty."),
+                "description": format!("Each {kind} copied from the text, or empty."),
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["text", "proper"],
+                    "required": ["mention", "category"],
                     "properties": {
-                        "text": { "type": "string" },
-                        "proper": {
-                            "type": "boolean",
-                            "description": "True when text is a proper noun or a named entity."
+                        "mention": {
+                            "type": "string",
+                            "description": format!("The whole noun phrase for one {kind}.")
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": [
+                                "specific_instance_of_kind",
+                                "generic_kind_word",
+                                "attribute_or_part",
+                                "place",
+                                "sound_or_event",
+                                "other"
+                            ]
                         }
                     }
                 }
@@ -651,61 +662,45 @@ fn many_endpoint(kind: &str) -> Endpoint {
     ep.extract_mode = Some("many".into());
     ep.system_prompt = format!(
         "Extract every {kind}. JSON only, no markdown, schema {schema_text}. \
+         Each item has mention and category. \
+         category is specific_instance_of_kind, generic_kind_word, attribute_or_part, place, sound_or_event, or other. \
+         Copy the whole noun phrase from the user text (\"black dog\", not \"dog\"). \
          {} \
-         proper is true for a proper noun or a named entity, including a cryptid name. \
          Copy only words from the user text. Leave out anything that is not a {kind}. \
          If there are none, mentions is [].",
         many_examples()
     );
     ep.user_prompt = format!(
-        "List every {kind}. Proper nouns, descriptive phrases, and synonyms count. \
-         Set proper true for a proper noun or named entity. \
+        "List every {kind}. Copy the whole noun phrase. \
+         Set category to specific_instance_of_kind, generic_kind_word, attribute_or_part, place, sound_or_event, or other. \
          Leave out anything that is not a {kind}. If there are none, mentions is [].\n{{{{input}}}}"
     );
     ep.max_tokens = Some(256);
     ep
 }
 
-/// Short recall cues. A longer example block made each chat call about
-/// 2.5x more expensive without improving the jev check that drops junk.
+/// Short recall cues. The category enum does the filtering; these only
+/// show the object shape and the whole noun phrase.
 fn many_examples() -> String {
-    "Examples, do not copy: creature in \"My story of Bigfoot\" is Bigfoot; \
-     color in \"Large gray triangular aircraft\" is gray; \
-     creature in \"a sasquatch crossed the road\" is sasquatch."
+    "Examples, do not copy: creature in \"My story of Bigfoot\" is \
+     {\"mention\":\"Bigfoot\",\"category\":\"specific_instance_of_kind\"}; \
+     color in \"Large gray triangular aircraft\" is \
+     {\"mention\":\"gray\",\"category\":\"specific_instance_of_kind\"}; \
+     creature in \"a sasquatch crossed the road\" is \
+     {\"mention\":\"sasquatch\",\"category\":\"specific_instance_of_kind\"}."
         .to_string()
 }
 
-/// One mention from the chat list. `proper` is set when the extractor
-/// marked a proper noun or named entity, or the copied text has a capital.
+/// One mention from the chat list. `category` is absent when the model
+/// returned a bare string (the schema-rejected fallback). Those are
+/// treated as specific, then the stoplist and phrase rule still apply.
 #[derive(Clone, Debug)]
 struct Mention {
     text: String,
-    proper: bool,
+    category: Option<String>,
 }
 
-/// Keep, drop, or ask jev. A marked proper noun is never dropped. An
-/// exact generic (`animal`, `creature`, `sea life`) is never kept. A
-/// concrete species or type, including `black dog` and `big buck`, is
-/// kept without asking. Jev only sees a leftover that is neither.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MentionFate {
-    Keep,
-    Drop,
-    Ask,
-}
-
-fn mention_fate(kind: &str, text: &str, proper: bool) -> MentionFate {
-    if proper {
-        return MentionFate::Keep;
-    }
-    if generic_kind_word(kind, text) || vague_only(text) {
-        return MentionFate::Drop;
-    }
-    if concrete_mention(kind, text) {
-        return MentionFate::Keep;
-    }
-    MentionFate::Ask
-}
+const CATEGORY_SPECIFIC: &str = "specific_instance_of_kind";
 
 fn generic_kind_word(kind: &str, text: &str) -> bool {
     let folded = fold_words(text);
@@ -825,118 +820,89 @@ fn vague_only(text: &str) -> bool {
     !words.is_empty() && words.iter().all(|w| is_stop_or_vague(w))
 }
 
-/// A concrete species, breed, type, or color name. Modified names count.
-/// Anything else is ambiguous and can go to jev.
-fn concrete_mention(kind: &str, text: &str) -> bool {
-    let words = tokens(text);
-    if is_color_kind(kind) {
-        return words.iter().any(|w| is_color_word(w));
-    }
-    words.iter().any(|w| !is_stop_or_vague(w))
-}
-
 fn fold_words(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
 
-fn looks_proper(text: &str) -> bool {
-    text.chars().any(|c| c.is_uppercase())
+/// A color mention is the color word itself. `gray aircraft` is not a color.
+fn color_words_only(text: &str) -> bool {
+    let words = tokens(text);
+    !words.is_empty() && words.iter().all(|w| is_color_word(w))
 }
 
-/// The question names the source text. A context-free `is X a creature?`
-/// told jev that Bigfoot is a cryptid, not a creature, and let `animal` through.
-fn specific_question(kind: &str, cand: &str, input: &str) -> String {
-    let cand = cand.replace('"', "'");
-    let excerpt: String = input.chars().take(400).collect();
-    format!(
-        "Text: {excerpt}. In this text, does \"{cand}\" name a specific {kind}, rather than a generic word for the kind itself? \
-         Answer yes for a concrete species, breed, color, or type name, including a modified one. \
-         Answer no only when it is not a {kind}."
-    )
-}
-
-/// One batched jev question per candidate that is not already decided.
-/// The input and the question both carry the source text. A false answer
-/// drops that candidate. A transport error, or a reply that does not line
-/// up, keeps the undecided candidates. Proper nouns stay either way.
-/// Values are deduped case-insensitively.
-fn confirm_mentions(
-    kind: &str,
-    inputs: &[String],
-    mut values: Vec<Result<String, String>>,
-) -> Vec<Result<String, String>> {
-    let mut jobs: Vec<(String, String)> = Vec::new();
-    let mut where_job: Vec<(usize, usize)> = Vec::new();
-    let mut parsed: Vec<Option<Vec<Mention>>> = Vec::with_capacity(values.len());
-    let mut dropped: Vec<Vec<bool>> = Vec::with_capacity(values.len());
-    for (row, value) in values.iter().enumerate() {
-        let Some(text) = value.as_ref().ok() else {
-            parsed.push(None);
-            dropped.push(Vec::new());
-            continue;
-        };
-        let Some(mentions) = parse_mentions(text) else {
-            parsed.push(None);
-            dropped.push(Vec::new());
-            continue;
-        };
-        let input = inputs.get(row).map(|s| s.as_str()).unwrap_or("");
-        let mut row_drop = vec![false; mentions.len()];
-        for (index, mention) in mentions.iter().enumerate() {
-            let trimmed = mention.text.trim();
-            if trimmed.is_empty() {
-                row_drop[index] = true;
-                continue;
-            }
-            match mention_fate(kind, trimmed, mention.proper) {
-                MentionFate::Keep => {}
-                MentionFate::Drop => row_drop[index] = true,
-                MentionFate::Ask => {
-                    jobs.push((input.to_string(), specific_question(kind, trimmed, input)));
-                    where_job.push((row, index));
-                }
-            }
-        }
-        parsed.push(Some(mentions));
-        dropped.push(row_drop);
+/// Keep a specific instance. Drop every other category, the generic
+/// stoplist, and a color mention that is not itself a color word.
+/// A bare string (no category) counts as specific so a schema fallback
+/// still returns Bigfoot, then the stoplist applies.
+fn keep_mention(kind: &str, mention: &Mention) -> bool {
+    let text = mention.text.trim();
+    if text.is_empty() {
+        return false;
     }
-    if !jobs.is_empty() {
-        let oid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
-        if let Ok(reply) = submit(oid, &jobs).and_then(wait) {
-            if reply.matched.len() == where_job.len() {
-                for (flag, (row, index)) in reply.matched.iter().zip(where_job) {
-                    if !flag {
-                        dropped[row][index] = true;
-                    }
-                }
+    match mention.category.as_deref() {
+        None | Some(CATEGORY_SPECIFIC) => {}
+        Some(_) => return false,
+    }
+    if generic_kind_word(kind, text) || vague_only(text) {
+        return false;
+    }
+    if is_color_kind(kind) && !color_words_only(text) {
+        return false;
+    }
+    true
+}
+
+/// `dog` is a contiguous subslice of `black dog`, so the shorter one goes.
+/// `deer` is not a subslice of `big buck`, so both stay.
+fn is_contiguous_subslice(shorter: &[String], longer: &[String]) -> bool {
+    if shorter.is_empty() || shorter.len() >= longer.len() {
+        return false;
+    }
+    longer.windows(shorter.len()).any(|window| window == shorter)
+}
+
+/// Category filter, then the stoplist, then the whole-phrase rule.
+/// Case-insensitive duplicates collapse to the first spelling.
+fn select_mentions(kind: &str, mentions: &[Mention]) -> String {
+    let kept: Vec<&Mention> = mentions.iter().filter(|m| keep_mention(kind, m)).collect();
+    let tokenized: Vec<Vec<String>> = kept.iter().map(|m| tokens(&m.text)).collect();
+    let mut covered = vec![false; kept.len()];
+    for i in 0..kept.len() {
+        for j in 0..kept.len() {
+            if i != j && is_contiguous_subslice(&tokenized[i], &tokenized[j]) {
+                covered[i] = true;
+                break;
             }
         }
     }
-    for (row, mentions) in parsed.into_iter().enumerate() {
-        let Some(mentions) = mentions else {
-            continue;
-        };
-        values[row] = Ok(retain_mentions(&mentions, &dropped[row]));
-    }
-    values
-}
-
-fn retain_mentions(mentions: &[Mention], rejected: &[bool]) -> String {
     let mut seen = Vec::new();
-    let mut kept = Vec::new();
-    for (index, mention) in mentions.iter().enumerate() {
-        let text = mention.text.trim();
-        if text.is_empty() || rejected.get(index).copied().unwrap_or(false) {
+    let mut out = Vec::new();
+    for (index, mention) in kept.iter().enumerate() {
+        if covered[index] {
             continue;
         }
-        let key = text.to_ascii_lowercase();
-        if seen.iter().any(|s: &String| s == &key) {
+        let key = tokens(&mention.text).join(" ");
+        if key.is_empty() || seen.iter().any(|s: &String| s == &key) {
             continue;
         }
         seen.push(key);
-        kept.push(text);
+        out.push(mention.text.trim());
     }
-    serde_json::to_string(&kept).unwrap_or_else(|_| "[]".into())
+    serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
+}
+
+fn filter_mentions(kind: &str, text: &str) -> String {
+    match parse_mentions(text) {
+        Some(mentions) => select_mentions(kind, &mentions),
+        None => text.to_string(),
+    }
+}
+
+fn filter_listed(kind: &str, values: Vec<Result<String, String>>) -> Vec<Result<String, String>> {
+    values
+        .into_iter()
+        .map(|value| value.map(|text| filter_mentions(kind, &text)))
+        .collect()
 }
 
 fn parse_mentions(text: &str) -> Option<Vec<Mention>> {
@@ -949,20 +915,25 @@ fn parse_mentions(text: &str) -> Option<Vec<Mention>> {
             if s.is_empty() {
                 continue;
             }
-            let proper = looks_proper(s);
-            out.push(Mention { text: s.to_string(), proper });
+            out.push(Mention { text: s.to_string(), category: None });
             continue;
         }
         let obj = item.as_object()?;
-        let text = obj.get("text").and_then(|t| t.as_str()).unwrap_or("").trim();
+        let text = obj
+            .get("mention")
+            .and_then(|t| t.as_str())
+            .or_else(|| obj.get("text").and_then(|t| t.as_str()))
+            .unwrap_or("")
+            .trim();
         if text.is_empty() {
             continue;
         }
-        let flagged = obj.get("proper").and_then(|p| p.as_bool()).unwrap_or(false);
-        out.push(Mention {
-            text: text.to_string(),
-            proper: flagged || looks_proper(text),
-        });
+        let category = obj
+            .get("category")
+            .and_then(|c| c.as_str())
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty());
+        out.push(Mention { text: text.to_string(), category });
     }
     Some(out)
 }
@@ -1220,7 +1191,7 @@ pub fn extract_many_json(kind: &str, input: &str, clauses: &str) -> PgResult<Str
     } else {
         winner_of(&apply_clauses_text("extract_many", input, kind, clauses)?)?
     };
-    match confirm_mentions(kind, &[input.to_string()], vec![Ok(listed)]).into_iter().next() {
+    match filter_listed(kind, vec![Ok(listed)]).into_iter().next() {
         Some(Ok(value)) => Ok(value),
         Some(Err(message)) => Err(pg(message)),
         None => Ok("[]".into()),
@@ -1544,7 +1515,9 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
             temperature: ep.temperature,
             max_tokens: ep.max_tokens,
             take_index: 0,
-            seed: "",
+            // EXTRACT MANY chats are seeded. The key has to change with that
+            // seed, or a temperature-0 reply from an unseeded call is reused.
+            seed: if ep.extract_mode.as_deref() == Some("many") { "0" } else { "" },
             opts: &opts,
             threshold: ep.threshold,
             extract_mode: ep.extract_mode.as_deref().unwrap_or(""),
@@ -2411,35 +2384,56 @@ mod tests {
         assert!(ep.system_prompt.contains("Copy only words from the user text"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("not a creature"), "{}", ep.system_prompt);
         assert!(ep.system_prompt.contains("mentions is []"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("specific_instance_of_kind"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("attribute_or_part"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("sound_or_event"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("\"black dog\", not \"dog\""), "{}", ep.system_prompt);
         assert!(!ep.system_prompt.contains("descriptive word or short phrase"), "{}", ep.system_prompt);
         assert!(!ep.system_prompt.contains("does not include the aircraft"), "{}", ep.system_prompt);
-        assert!(ep.user_prompt.contains("Proper nouns, descriptive phrases, and synonyms count"));
+        assert!(!ep.system_prompt.contains("proper is true"), "{}", ep.system_prompt);
+        assert!(ep.user_prompt.contains("whole noun phrase"));
+        assert!(ep.user_prompt.contains("specific_instance_of_kind"));
         assert!(ep.user_prompt.contains("not a creature"));
         assert!(ep.user_prompt.contains("mentions is []"));
         let schema: serde_json::Value = serde_json::from_str(&ep.return_type).unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["mentions"]["type"], "array");
-        assert_eq!(schema["properties"]["mentions"]["items"]["type"], "object");
-        assert_eq!(schema["properties"]["mentions"]["items"]["properties"]["proper"]["type"], "boolean");
+        let item = &schema["properties"]["mentions"]["items"];
+        assert_eq!(item["type"], "object");
+        assert_eq!(item["additionalProperties"], false);
+        assert_eq!(item["required"][0], "mention");
+        assert_eq!(item["required"][1], "category");
+        assert_eq!(item["properties"]["mention"]["type"], "string");
+        assert_eq!(item["properties"]["category"]["type"], "string");
+        let categories: Vec<&str> = item["properties"]["category"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            categories,
+            vec![
+                "specific_instance_of_kind",
+                "generic_kind_word",
+                "attribute_or_part",
+                "place",
+                "sound_or_event",
+                "other",
+            ]
+        );
         assert!(schema["properties"]["mentions"]["description"]
             .as_str()
             .unwrap()
             .contains("creature"));
-        assert!(ep.system_prompt.contains("proper is true"));
-        assert!(ep.user_prompt.contains("Set proper true"));
         let color = super::many_endpoint("color");
         assert!(color.system_prompt.contains("Large gray triangular aircraft"));
         assert!(color.system_prompt.contains("not a color"));
-        let mentions = super::parse_mentions("[\"gray\",\"night\",\"bright\"]").unwrap();
         assert_eq!(
-            super::retain_mentions(&mentions, &[false, true, true]),
+            super::filter_mentions("color", "[\"gray\",\"night\",\"bright\",\"aircraft\"]"),
             "[\"gray\"]"
         );
-        let question = super::specific_question("color", "night", "Large gray triangular aircraft");
-        assert!(question.contains("Large gray triangular aircraft"), "{question}");
-        assert!(question.contains("does \"night\" name a specific color"), "{question}");
-        assert!(question.contains("generic word"), "{question}");
         assert!(super::parse_mentions("not json").is_none());
         assert!(!color.system_prompt.contains("or adjectives"));
         let body = encode_items(
@@ -2462,8 +2456,11 @@ mod tests {
         );
         let system = parsed["items"][0]["system"].as_str().unwrap();
         assert!(system.contains("Bigfoot"));
+        assert!(system.contains("specific_instance_of_kind"));
         assert!(system.contains("not a creature"));
         assert!(system.contains("mentions is []"));
+        let item_schema = &parsed["items"][0]["response_schema"]["properties"]["mentions"]["items"];
+        assert_eq!(item_schema["properties"]["category"]["enum"][0], "specific_instance_of_kind");
         assert_ne!(
             super::scalar_key_extract("creature"),
             super::scalar_key_extract_many("creature")
@@ -2489,45 +2486,54 @@ mod tests {
     }
 
     #[test]
-    fn extract_many_keeps_proper_nouns_drops_generics_and_dedupes() {
-        let bare = super::parse_mentions("[\"Bigfoot\",\"black dog\"]").unwrap();
-        assert!(bare[0].proper, "a capital letter is a proper noun");
-        assert!(!bare[1].proper);
+    fn extract_many_keeps_specific_instances_and_whole_phrases() {
+        let listed = r#"[
+            {"mention":"Bigfoot","category":"specific_instance_of_kind"},
+            {"mention":"animal","category":"generic_kind_word"},
+            {"mention":"black dog","category":"specific_instance_of_kind"},
+            {"mention":"dog","category":"specific_instance_of_kind"},
+            {"mention":"deer","category":"specific_instance_of_kind"},
+            {"mention":"buck","category":"specific_instance_of_kind"},
+            {"mention":"big buck","category":"specific_instance_of_kind"},
+            {"mention":"hunting dog","category":"specific_instance_of_kind"},
+            {"mention":"bird dog","category":"specific_instance_of_kind"},
+            {"mention":"sasquatch","category":"specific_instance_of_kind"},
+            {"mention":"night","category":"specific_instance_of_kind"},
+            {"mention":"bright","category":"other"},
+            {"mention":"man","category":"specific_instance_of_kind"},
+            {"mention":"shellfish","category":"specific_instance_of_kind"},
+            {"mention":"sea life","category":"specific_instance_of_kind"},
+            {"mention":"human like figure","category":"specific_instance_of_kind"},
+            {"mention":"growl type high pitch yell","category":"sound_or_event"},
+            {"mention":"two legs","category":"attribute_or_part"},
+            {"mention":"hair","category":"attribute_or_part"},
+            {"mention":"Alabama","category":"place"},
+            {"mention":"Florida","category":"place"},
+            {"mention":"Deer","category":"specific_instance_of_kind"}
+        ]"#;
         assert_eq!(
-            super::mention_fate("creature", &bare[0].text, bare[0].proper),
-            super::MentionFate::Keep
+            super::filter_mentions("creature", listed),
+            "[\"Bigfoot\",\"black dog\",\"deer\",\"big buck\",\"hunting dog\",\"bird dog\",\"sasquatch\"]"
         );
-        assert_eq!(super::mention_fate("creature", "bigfoot", true), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "animal", false), super::MentionFate::Drop);
-        assert_eq!(super::mention_fate("creature", "man", false), super::MentionFate::Drop);
-        assert_eq!(super::mention_fate("creature", "shellfish", false), super::MentionFate::Drop);
-        assert_eq!(super::mention_fate("creature", "sea life", false), super::MentionFate::Drop);
+        // A schema fallback is a string list. Stoplist and the phrase rule still run.
         assert_eq!(
-            super::mention_fate("creature", "human like figure", false),
-            super::MentionFate::Drop
+            super::filter_mentions("creature", "[\"Bigfoot\",\"animal\",\"dog\",\"black dog\",\"Deer\",\"deer\"]"),
+            "[\"Bigfoot\",\"black dog\",\"Deer\"]"
         );
-        assert_eq!(super::mention_fate("creature", "black dog", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "sasquatch", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "deer", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "buck", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "big buck", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "hunting dog", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "bird dog", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("creature", "night", false), super::MentionFate::Drop);
-        assert_eq!(super::mention_fate("creature", "bright", false), super::MentionFate::Drop);
-        assert_eq!(super::mention_fate("color", "gray", false), super::MentionFate::Keep);
-        assert_eq!(super::mention_fate("color", "night", false), super::MentionFate::Drop);
-        assert_eq!(super::mention_fate("color", "bright", false), super::MentionFate::Drop);
-        assert_eq!(super::mention_fate("color", "aircraft", false), super::MentionFate::Ask);
-        let marked = super::parse_mentions(
-            r#"[{"text":"Bigfoot","proper":true},{"text":"animal","proper":false},{"text":"Deer","proper":false},{"text":"deer","proper":false}]"#,
-        )
-        .unwrap();
-        assert!(marked[0].proper);
-        assert!(!marked[1].proper);
+        // A head noun alone is kept. The recall script accepts it for "black dog".
+        assert_eq!(super::filter_mentions("creature", "[\"dog\"]"), "[\"dog\"]");
         assert_eq!(
-            super::retain_mentions(&marked, &[false, true, false, false]),
-            "[\"Bigfoot\",\"Deer\"]"
+            super::filter_mentions(
+                "color",
+                r#"[
+                    {"mention":"gray","category":"specific_instance_of_kind"},
+                    {"mention":"night","category":"specific_instance_of_kind"},
+                    {"mention":"bright","category":"other"},
+                    {"mention":"aircraft","category":"specific_instance_of_kind"},
+                    {"mention":"large gray","category":"specific_instance_of_kind"}
+                ]"#
+            ),
+            "[\"gray\"]"
         );
         let body = encode_items(
             &super::summary_endpoint(),
