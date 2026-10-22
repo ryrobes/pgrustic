@@ -560,11 +560,14 @@ fn is_parallel_worker() -> bool {
 /// Semantic costing reads it later. A missing buffer manager, or a
 /// non-relation RTE, leaves the planner estimate alone.
 fn note_small_scans<'mcx>(run: &PlannerRun<'mcx>, plan: Node<'mcx>) {
+    // A catalog query planned from inside SPI must not replace the
+    // counts EXPLAIN is about to print.
+    if rvbbit_plan::in_nested_planner() {
+        return;
+    }
     if let Some(relid) = base_scan_relid(plan) {
         if let Some(rows) = small_scan_rows(run, relid) {
-            if let Some(p) = plan.as_plan() {
-                rvbbit_plan::remember_scan_rows(p.plan_node_id, rows);
-            }
+            rvbbit_plan::remember_scan_rows(plan, rows);
         }
     }
     let Some(base) = plan.as_plan() else {

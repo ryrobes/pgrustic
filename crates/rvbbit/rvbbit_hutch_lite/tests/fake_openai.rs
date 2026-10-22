@@ -1325,7 +1325,10 @@ fn low_confidence_choice_takes_a_second_pass() {
         before + 2,
         "a 0.46 winner asks once more"
     );
-    assert_eq!(got.outputs[0].calls.as_ref().unwrap().len(), 2);
+    let calls = got.outputs[0].calls.as_ref().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].retake.is_none(), "the first take is not a retake");
+    assert_eq!(calls[1].retake, Some(true));
     // (0.42+0.90)/2 = 0.66 beats (0.46+0.05)/2 = 0.255.
     assert_eq!(got.outputs[0].value, Some(serde_json::json!("bigfoot")));
     let score = got.outputs[0].score.unwrap();

@@ -244,11 +244,17 @@ fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found>
     let name = proc_name(oid);
     let tail = clause_tail(func);
     let mut knobs = tail.as_deref().map(knobs_from_tail).unwrap_or_default();
-    if tail.is_none() && rvbbit_resolve::is_semantic_func(oid) {
-        if let Some(defaults) = rvbbit_resolve::endpoint_for(oid).default_clauses {
-            if !defaults.trim().is_empty() {
-                knobs = knobs_from_tail(&defaults);
+    if rvbbit_resolve::is_semantic_func(oid) {
+        let ep = rvbbit_resolve::endpoint_for(oid);
+        if tail.is_none() {
+            if let Some(defaults) = ep.default_clauses.clone() {
+                if !defaults.trim().is_empty() {
+                    knobs = knobs_from_tail(&defaults);
+                }
             }
+        }
+        if knobs.threshold.is_none() {
+            knobs.threshold = ep.threshold;
         }
     }
     let (op, filters, per_row, grouping) = classify(oid, &name, in_qual, in_agg)?;
@@ -450,11 +456,18 @@ fn input_rows(node: Node<'_>) -> f64 {
     if node.node_tag() == NodeTag::T_Agg {
         return plan.plan_rows;
     }
-    let Some(child) = plan.lefttree.and_then(|c| c.as_plan()) else {
+    let Some(child_node) = plan.lefttree else {
         return plan.plan_rows;
     };
+    let Some(child) = child_node.as_plan() else {
+        return plan.plan_rows;
+    };
+    // Keyed by the scan node, not `plan_node_id`. Catalog SPI during
+    // EXPLAIN reuses id 1 for a small catalog table and used to replace
+    // the user scan's count, so a 40-row project estimated a handful of
+    // calls.
     if child.qual.is_nil() {
-        if let Some(rows) = counted_scan_rows(child.plan_node_id) {
+        if let Some(rows) = counted_scan_rows(child_node) {
             return rows;
         }
     }
@@ -462,27 +475,40 @@ fn input_rows(node: Node<'_>) -> f64 {
 }
 
 thread_local! {
-    static SCAN_ROWS: std::cell::RefCell<std::collections::HashMap<i32, f64>> =
+    static SCAN_ROWS: std::cell::RefCell<std::collections::HashMap<usize, f64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn in_nested_planner() -> bool {
+    rvbbit_cost::in_nested_planner()
 }
 
 pub fn clear_scan_rows() {
     SCAN_ROWS.with(|rows| rows.borrow_mut().clear());
 }
 
-/// `plan_node_id` of a base scan → counted rows. Ignored when the count
-/// is missing or not finite.
-pub fn remember_scan_rows(plan_node_id: i32, rows: f64) {
+/// Counted rows for one base-scan node. The key is the node's address.
+/// `plan_node_id` is reused by every later plan, including catalog SPI
+/// while EXPLAIN is printing. Ignored when the count is not finite.
+pub fn remember_scan_rows(scan: Node<'_>, rows: f64) {
+    remember_scan_key(scan.as_raw().as_ptr() as usize, rows);
+}
+
+pub(crate) fn remember_scan_key(key: usize, rows: f64) {
     if !rows.is_finite() || rows < 0.0 {
         return;
     }
     SCAN_ROWS.with(|slot| {
-        slot.borrow_mut().insert(plan_node_id, rows);
+        slot.borrow_mut().insert(key, rows);
     });
 }
 
-fn counted_scan_rows(plan_node_id: i32) -> Option<f64> {
-    SCAN_ROWS.with(|slot| slot.borrow().get(&plan_node_id).copied())
+fn counted_scan_rows(scan: Node<'_>) -> Option<f64> {
+    counted_scan_key(scan.as_raw().as_ptr() as usize)
+}
+
+fn counted_scan_key(key: usize) -> Option<f64> {
+    SCAN_ROWS.with(|slot| slot.borrow().get(&key).copied())
 }
 
 pub fn apply_costs(node: Node<'_>) {
@@ -549,7 +575,9 @@ fn acc() -> std::sync::MutexGuard<'static, Acc> {
 pub fn begin_statement_cost() {
     rvbbit_cost::refresh_history();
     let mut a = acc();
-    if rvbbit_cost::execution_in_progress() {
+    // Catalog SPI plans while EXPLAIN reads this map. Those plans must
+    // not clear it or replace the armed pre-flight estimate.
+    if rvbbit_cost::execution_in_progress() || rvbbit_cost::in_nested_planner() {
         a.skip += 1;
         return;
     }
@@ -564,12 +592,24 @@ mod tests {
     #[test]
     fn counted_scan_rows_round_trip_and_clear() {
         clear_scan_rows();
-        remember_scan_rows(7, 12.0);
-        remember_scan_rows(8, f64::NAN);
-        assert_eq!(counted_scan_rows(7), Some(12.0));
-        assert_eq!(counted_scan_rows(8), None);
+        remember_scan_key(7, 12.0);
+        remember_scan_key(8, f64::NAN);
+        assert_eq!(counted_scan_key(7), Some(12.0));
+        assert_eq!(counted_scan_key(8), None);
         clear_scan_rows();
-        assert_eq!(counted_scan_rows(7), None);
+        assert_eq!(counted_scan_key(7), None);
+    }
+
+    /// Two scans can both be `plan_node_id` 1 in successive plans. The
+    /// user table's count has to survive a catalog scan that reuses that id.
+    #[test]
+    fn scan_counts_are_per_node_not_per_plan_id() {
+        clear_scan_rows();
+        remember_scan_key(0xA, 40.0);
+        remember_scan_key(0xB, 4.0);
+        assert_eq!(counted_scan_key(0xA), Some(40.0));
+        assert_eq!(counted_scan_key(0xB), Some(4.0));
+        clear_scan_rows();
     }
 }
 

@@ -206,12 +206,63 @@ pub fn define_gucs() {
         PGC_USERSET,
         0,
     );
+    let _ = guc::DefineCustomStringVariable(
+        "semantic.hutch_timeout",
+        Some("HTTP read timeout for a hutch request, in seconds."),
+        None,
+        Some("120"),
+        PGC_USERSET,
+        0,
+    );
     guc::MarkGUCPrefixReserved("semantic");
     let read = |name: &str| guc::GetConfigOption(name, true, false).ok().flatten();
     memo::set_guc_reader(read);
     clauses::set_guc_reader(read);
     rvbbit_cost::set_guc_reader(read);
     rvbbit_cost::set_history_refresher(pull_remote_history);
+}
+
+/// Nested SPI plans must not wipe the scan-row counts EXPLAIN recorded.
+pub fn set_nested_plan_probe(probe: fn() -> bool) {
+    rvbbit_cost::set_nested_plan_probe(probe);
+}
+
+/// `semantic.hutch_timeout` is seconds (`120` or `120s`). Empty, missing,
+/// or unreadable falls back to 120s. The catalog `timeout_ms` of 30s is
+/// not the client read timeout.
+fn hutch_timeout_ms() -> u64 {
+    let text = std::panic::catch_unwind(|| {
+        guc::GetConfigOption("semantic.hutch_timeout", true, false)
+            .ok()
+            .flatten()
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    parse_hutch_timeout_ms(&text)
+}
+
+fn parse_hutch_timeout_ms(raw: &str) -> u64 {
+    let s = raw.trim();
+    if s.is_empty() {
+        return 120_000;
+    }
+    let s = s.strip_suffix('s').or_else(|| s.strip_suffix('S')).unwrap_or(s).trim();
+    match s.parse::<f64>() {
+        Ok(n) if n.is_finite() && n > 0.0 => (n * 1000.0).round() as u64,
+        _ => 120_000,
+    }
+}
+
+/// Same split `summarize` and the other batched ops use: `batch_rows`
+/// items per POST (default 32). The pool limiter is the backend
+/// concurrency (default 4).
+fn extract_chunk_sizes(n: usize, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    if n == 0 {
+        return Vec::new();
+    }
+    (0..n).step_by(width).map(|start| (n - start).min(width)).collect()
 }
 
 /// One short read of hutch `/stats` and `/v1/calls` so the next plan can
@@ -596,9 +647,9 @@ pub fn extract_typed(kind: &str, input: &str) -> PgResult<String> {
     one_item(reply)
 }
 
-/// One HTTP extract for every input. The model on the wire is `mock`.
+/// Chunked HTTP extract. The model on the wire is `mock`.
 /// Returned strings are still raw model text; [`coerce_extracted`] parses
-/// `int` / `float` / `bool`.
+/// `int` / `float` / `bool`. Each POST is at most `batch_rows` items.
 pub fn extract_many(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
     if inputs.is_empty() {
         return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
@@ -608,9 +659,7 @@ pub fn extract_many(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
         .iter()
         .map(|input| serde_json::json!({ "input": input }))
         .collect();
-    let body = encode_items(&ep, Operation::Extract, &payload).map_err(pg)?;
-    let raw = post_op(&ep, "extract", body)?;
-    let values = decode_text_items(&raw.body).map_err(pg)?;
+    let (values, http_calls) = post_chunked_extract(&ep, &payload)?;
     if values.len() != inputs.len() {
         return Err(pg(format!(
             "hutch extract returned {} items for {} inputs",
@@ -618,10 +667,10 @@ pub fn extract_many(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
             inputs.len()
         )));
     }
-    Ok(ManyReply { values, http_calls: raw.http_calls })
+    Ok(ManyReply { values, http_calls })
 }
 
-/// One HTTP extract for every input. Each value is a JSON array of strings
+/// Chunked HTTP extract. Each value is a JSON array of strings
 /// of `kind` only, or `[]`. The array is stored as text; the SQL lateral
 /// join explodes it. Unlike [`extract_many`], the strings are not coerced.
 pub fn extract_lists(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
@@ -633,9 +682,7 @@ pub fn extract_lists(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
         .iter()
         .map(|input| serde_json::json!({ "input": input }))
         .collect();
-    let body = encode_items(&ep, Operation::Extract, &payload).map_err(pg)?;
-    let raw = post_op(&ep, "extract", body)?;
-    let values = decode_text_items(&raw.body).map_err(pg)?;
+    let (values, http_calls) = post_chunked_extract(&ep, &payload)?;
     if values.len() != inputs.len() {
         return Err(pg(format!(
             "hutch extract many returned {} items for {} inputs",
@@ -644,7 +691,33 @@ pub fn extract_lists(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
         )));
     }
     let values = filter_listed(kind, values);
-    Ok(ManyReply { values, http_calls: raw.http_calls })
+    Ok(ManyReply { values, http_calls })
+}
+
+fn post_chunked_extract(
+    ep: &Endpoint,
+    inputs: &[serde_json::Value],
+) -> PgResult<(Vec<Result<String, String>>, u32)> {
+    if inputs.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let width = rvbbit_resolve::batch_rows().max(1);
+    let mut tickets = Vec::new();
+    let mut start = 0;
+    for size in extract_chunk_sizes(inputs.len(), width) {
+        let chunk = &inputs[start..start + size];
+        start += size;
+        let body = encode_items(ep, Operation::Extract, chunk).map_err(pg)?;
+        tickets.push(post_ticket(ep, "extract", body)?);
+    }
+    let mut values = Vec::with_capacity(inputs.len());
+    let mut http_calls = 0u32;
+    for ticket in tickets {
+        let raw = wait_raw(ticket)?;
+        http_calls = http_calls.saturating_add(raw.http_calls);
+        values.extend(decode_text_items(&raw.body).map_err(pg)?);
+    }
+    Ok((values, http_calls))
 }
 
 pub struct ManyReply {
@@ -1193,23 +1266,11 @@ fn summarize_many(inputs: &[String]) -> PgResult<ManyReply> {
         return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
     }
     let ep = summary_endpoint();
-    let width = rvbbit_resolve::batch_rows().max(1);
-    let mut tickets = Vec::new();
-    for chunk in inputs.chunks(width) {
-        let payload: Vec<serde_json::Value> = chunk
-            .iter()
-            .map(|input| serde_json::json!({ "input": input }))
-            .collect();
-        let body = encode_items(&ep, Operation::Extract, &payload).map_err(pg)?;
-        tickets.push(post_ticket(&ep, "extract", body)?);
-    }
-    let mut values = Vec::with_capacity(inputs.len());
-    let mut http_calls = 0u32;
-    for ticket in tickets {
-        let raw = wait_raw(ticket)?;
-        http_calls = http_calls.saturating_add(raw.http_calls);
-        values.extend(decode_text_items(&raw.body).map_err(pg)?);
-    }
+    let payload: Vec<serde_json::Value> = inputs
+        .iter()
+        .map(|input| serde_json::json!({ "input": input }))
+        .collect();
+    let (values, http_calls) = post_chunked_extract(&ep, &payload)?;
     if values.len() != inputs.len() {
         return Err(pg(format!(
             "hutch summarize returned {} items for {} groups",
@@ -1430,7 +1491,7 @@ fn enqueue(
         limiter: limiter_for(&url, ep.max_concurrent),
         url,
         auth,
-        timeout_ms: ep.timeout_ms,
+        timeout_ms: hutch_timeout_ms(),
         retries: ep.retries.max(1),
         body,
         cache_header,
@@ -1795,14 +1856,19 @@ fn score_user(ep: &Endpoint, rows: &[Vec<String>]) -> PgResult<UserReply> {
 
 fn extract_user(ep: &Endpoint, rows: &[Vec<String>]) -> PgResult<UserReply> {
     let inputs: Vec<serde_json::Value> = rows.iter().map(|row| named_row(ep, row)).collect();
-    let body = encode_items(ep, Operation::Extract, &inputs).map_err(pg)?;
-    let raw = post_op(ep, "extract", body)?;
-    let values = decode_text_items(&raw.body).map_err(pg)?;
+    let (values, http_calls) = post_chunked_extract(ep, &inputs)?;
+    if values.len() != rows.len() {
+        return Err(pg(format!(
+            "hutch extract returned {} items for {} inputs",
+            values.len(),
+            rows.len()
+        )));
+    }
     let mut out = Vec::with_capacity(values.len());
     for item in values {
         out.push(item.map_err(pg)?);
     }
-    Ok(UserReply { values: out, http_calls: raw.http_calls })
+    Ok(UserReply { values: out, http_calls })
 }
 
 fn classify_user(ep: &Endpoint, rows: &[Vec<String>]) -> PgResult<UserReply> {
@@ -2947,6 +3013,27 @@ mod tests {
         assert_eq!(parsed["items"].as_array().unwrap().len(), 3);
         assert_eq!(parsed["items"][0]["extract_mode"], "summary");
         assert_eq!(parsed["items"][2]["inputs"]["input"], "three");
+    }
+
+    #[test]
+    fn extract_chunks_match_the_batch_width() {
+        assert_eq!(super::extract_chunk_sizes(70, 32), vec![32, 32, 6]);
+        assert_eq!(super::extract_chunk_sizes(32, 32), vec![32]);
+        assert_eq!(super::extract_chunk_sizes(0, 32), Vec::<usize>::new());
+        assert_eq!(super::extract_chunk_sizes(5, 0), vec![1, 1, 1, 1, 1]);
+        let items: Vec<u8> = (0..70).collect();
+        let got: Vec<usize> = items.chunks(32).map(|c| c.len()).collect();
+        assert_eq!(got, super::extract_chunk_sizes(70, 32));
+    }
+
+    #[test]
+    fn hutch_timeout_parses_seconds() {
+        assert_eq!(super::parse_hutch_timeout_ms(""), 120_000);
+        assert_eq!(super::parse_hutch_timeout_ms("120"), 120_000);
+        assert_eq!(super::parse_hutch_timeout_ms("120s"), 120_000);
+        assert_eq!(super::parse_hutch_timeout_ms("30"), 30_000);
+        assert_eq!(super::parse_hutch_timeout_ms("nope"), 120_000);
+        assert_eq!(super::hutch_timeout_ms(), 120_000);
     }
 
     #[test]

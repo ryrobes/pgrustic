@@ -150,16 +150,18 @@ STATS="$STATS" ROWS="$ROWS" FILTER_N="$FILTER_N" python3 - <<'PY'
 import json, os, sys
 stats = json.loads(os.environ["STATS"])
 rows = int(os.environ["ROWS"])
-calls = stats["calls"]
+calls = stats.get("calls", stats.get("requests", 0))
+stat_rows = stats.get("rows", 0)
+max_batch = stats.get("max_batch") or 0
 got = int(os.environ["FILTER_N"])
 expect = rows - rows // 5
-print(f"filter calls={calls} rows={stats['rows']} max_batch={stats['max_batch']} matches={got}")
+print(f"filter calls={calls} rows={stat_rows} max_batch={max_batch} matches={got}")
 if got != expect:
     sys.exit(f"expected {expect} biped rows, got {got}")
 if calls >= rows:
     sys.exit(f"filter was not batched: {calls} calls for {rows} rows")
-if stats["max_batch"] > 33:
-    sys.exit(f"batch larger than 32 rows plus the query: {stats['max_batch']}")
+if max_batch > 33:
+    sys.exit(f"batch larger than 32 rows plus the query: {max_batch}")
 PY
 
 echo "=== cost ==="

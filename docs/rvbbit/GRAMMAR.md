@@ -128,18 +128,23 @@ model hutch actually calls. `USING MODEL 'voyageai/rerank-3'` is priced
 as voyage. MEANS stays on jev. A response `calls` array, `rvbbit.calls`,
 or hutch `/stats` replaces that seed for the same operation and model.
 `TAKES`, `PHRASINGS`, `ACROSS`, and `FALLBACK` multiply the items. A
-cache hit rate, including `CACHE off`, reduces the charged provider
+project or a pipe counts one provider call per input row before those
+factors, including when the table is still unanalyzed. A single-model,
+single-take CLASSIFY also multiplies by 1.10 for the expected retake.
+A cache hit rate, including `CACHE off`, reduces the charged provider
 calls. HTTP batches are `ceil(provider calls / batch)` for a fan-out
 op, or one batch for a dedicated rerank. Latency is wall time: fan-out
 ops take `ceil(provider calls / concurrency)` waves, and a voyage
 rerank takes one wave per HTTP batch. A filter's selectivity is 0.5,
-or `1 - THRESHOLD` clamped to 0.05..0.95.
+or `1 - THRESHOLD` clamped to 0.05..0.95. ABOUT with no catalog
+threshold uses 0.30, so its selectivity is 0.70.
 
 `EXPLAIN` prints `Semantic Provider Calls`, `Semantic HTTP Batches`,
 `Semantic USD`, `Semantic Latency`, and `Semantic Model` on the node,
 and the same `Semantic Total` lines for the statement.
 `EXPLAIN (COSTS OFF)` leaves those lines out. `EXPLAIN ANALYZE` always
-adds `Actual Semantic Calls` (provider misses), `Actual Cache Hits`,
+adds `Actual Semantic Calls` (provider misses), `Actual Choice Retakes`
+(the second CLASSIFY take under 0.60), `Actual Cache Hits`,
 `Actual HTTP Batches`, `Actual Semantic USD`, `Actual Semantic Latency`
 (wall time, not the sum of every call), and `Actual Semantic Model`,
 including when every row was a cache hit and the provider-call count

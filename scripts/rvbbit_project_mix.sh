@@ -3,8 +3,11 @@
 # The scan target list used to share TargetEntry nodes with the Result,
 # so a kept column was written onto a semantic column.
 #
-# Ports: Postgres 55450, mock 8110. The spike on 55432 / 8099 is not used.
-# Run with `env -u PGPORT -u HUTCH_PORT`. No OpenRouter key.
+# Ports: Postgres 55450, hutch 8110. The spike on 55432 / 8099 is not used.
+# Run with `env -u PGPORT -u HUTCH_PORT`.
+#   RVBBIT_PROJECT_MIX_LIVE=1 bash scripts/rvbbit_project_mix.sh
+# Live mode needs OPENROUTER_API_KEY and swaps hutch_mock for hutch_lite.
+# The key is not printed.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,6 +32,17 @@ if [[ "$PGPORT" == "55432" || "$HUTCH_PORT" == "8099" ]]; then
   exit 1
 fi
 
+HUTCH_CRATE=hutch_mock
+HUTCH_BIN=hutch_mock
+if [[ "${RVBBIT_PROJECT_MIX_LIVE:-}" == "1" ]]; then
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "RVBBIT_PROJECT_MIX_LIVE=1 needs OPENROUTER_API_KEY" >&2
+    exit 1
+  fi
+  HUTCH_CRATE=rvbbit_hutch_lite
+  HUTCH_BIN=hutch_lite
+fi
+
 for cmd in gcc g++ curl initdb psql cargo python3; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing command: $cmd" >&2
@@ -50,7 +64,7 @@ if [[ -S "$PGHOST/.s.PGSQL.$PGPORT" ]]; then
 fi
 
 echo "=== build (CC=$CC CXX=$CXX) ==="
-cargo build -p main_main -p hutch_mock --profile fast-profile
+cargo build -p main_main -p "$HUTCH_CRATE" --profile fast-profile
 
 mkdir -p "$RUNDIR"
 MOCK_LOG=$RUNDIR/mock.log
@@ -68,9 +82,9 @@ trap cleanup EXIT
 
 rm -rf "$PGDATA"
 
-echo "=== hutch_mock on 127.0.0.1:$HUTCH_PORT ==="
+echo "=== $HUTCH_BIN on 127.0.0.1:$HUTCH_PORT ==="
 : >"$MOCK_LOG"
-./target/fast-profile/hutch_mock "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
+./target/fast-profile/"$HUTCH_BIN" "$HUTCH_PORT" >"$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
 
 echo "=== initdb $PGDATA ==="
@@ -111,6 +125,9 @@ CREATE SEMANTIC FUNCTION credibility(body text) RETURNS score
 CREATE SEMANTIC FUNCTION is_credible_sighting(body text) RETURNS bool
   AS 'credible sighting'
   USING MODEL default;
+
+CREATE SEMANTIC FUNCTION creature_of(body text) RETURNS text
+  AS PIPE $$ {{body}} |> EXTRACT creature $$;
 
 DROP TABLE IF EXISTS bf;
 CREATE TABLE bf (id int, class text, n numeric, body text);
@@ -161,68 +178,88 @@ FROM generate_series(1, 12) AS g;
 SQL
 PLAN=$("${PSQL[@]}" -c "EXPLAIN SELECT count(*) FROM raw12 WHERE rvbbit.is_credible_sighting(body)")
 echo "$PLAN"
+PLAN_PROJECT=$("${PSQL[@]}" -c "EXPLAIN SELECT rvbbit.is_credible_sighting(body) FROM raw12")
+echo "$PLAN_PROJECT"
+PLAN_PIPE=$("${PSQL[@]}" -c "EXPLAIN SELECT rvbbit.creature_of(body) FROM raw12")
+echo "$PLAN_PIPE"
 
-MIX="$MIX" MID="$MID" FIRST="$FIRST" LAST="$LAST" SCORE="$SCORE" PIPE="$PIPE" ALIAS="$ALIAS" ASLIST="$ASLIST" PLAN="$PLAN" python3 - <<'PY'
+MIX="$MIX" MID="$MID" FIRST="$FIRST" LAST="$LAST" SCORE="$SCORE" PIPE="$PIPE" ALIAS="$ALIAS" ASLIST="$ASLIST" PLAN="$PLAN" PLAN_PROJECT="$PLAN_PROJECT" PLAN_PIPE="$PLAN_PIPE" python3 - <<'PY'
 import os, sys
 
 def rows(text):
     return [ln.split("|") for ln in text.splitlines() if ln.strip()]
 
+live = os.environ.get("RVBBIT_PROJECT_MIX_LIVE") == "1"
 mix = rows(os.environ["MIX"])
-assert mix == [
-    ["1", "cryptid", "0.82", "t"],
-    ["2", "paper", "0.15", "f"],
-], mix
-
 mid = rows(os.environ["MID"])
-assert mid[0][0] == "1" and mid[0][1] == "biped", mid
-assert mid[0][2].startswith("a large hairy biped"), mid
-assert mid[1][1] == "invoice", mid
-assert "invoice 12" in mid[1][2], mid
-assert mid[0][1] != mid[0][2], mid
-
 first = rows(os.environ["FIRST"])
-assert first == [
-    ["biped", "1", "a large hair"],
-    ["invoice", "2", "invoice 12 f"],
-], first
-
 last = rows(os.environ["LAST"])
-assert last == [
-    ["a large hair", "1", "1.25", "biped"],
-    ["invoice 12 f", "2", "2.5", "invoice"],
-], last
-
 score = rows(os.environ["SCORE"])
-assert score == [
-    ["0.82", "1", "1.25"],
-    ["0.15", "2", "2.5"],
-], score
-
 pipe = rows(os.environ["PIPE"])
-assert pipe == [
-    ["1", "t", "1.25", "cryptid"],
-    ["2", "f", "2.5", "paper"],
-], pipe
-
 alias = rows(os.environ["ALIAS"])
-assert alias == [["t"], ["f"]], alias
-
 aslist = rows(os.environ["ASLIST"])
-assert aslist[0][0] == "biped" and aslist[0][1] == "a large hair", aslist
-assert aslist[1][0] == "invoice", aslist
 
-calls = [
-    ln.split(":", 1)[1].strip()
-    for ln in os.environ["PLAN"].splitlines()
-    if "Semantic Provider Calls" in ln
-]
-print("provider call estimates", calls)
-if not calls:
-    sys.exit("EXPLAIN has no Semantic Provider Calls")
-for value in calls:
-    if abs(float(value) - 12.0) > 0.01:
-        sys.exit(f"expected 12 provider calls for 12 unanalyzed rows, got {value}")
+if live:
+    assert len(mix) == 2 and mix[0][0] == "1" and mix[0][1] == "cryptid", mix
+    assert mix[1][0] == "2" and mix[1][1] == "paper", mix
+    assert mix[0][3] in ("t", "f") and mix[1][3] in ("t", "f"), mix
+    assert len(mid) == 2 and mid[0][0] == "1" and mid[0][2].startswith("a large hairy"), mid
+    assert "invoice 12" in mid[1][2], mid
+    assert len(first) == 2 and first[0][1] == "1" and first[0][2].startswith("a large hair"), first
+    assert len(last) == 2 and last[0][0].startswith("a large hair") and last[0][1] == "1", last
+    assert len(score) == 2 and score[0][1] == "1" and score[1][2] == "2.5", score
+    assert len(pipe) == 2 and pipe[0][0] == "1" and pipe[0][1] in ("t", "f"), pipe
+    assert len(alias) == 2 and alias[0][0] in ("t", "f") and alias[1][0] in ("t", "f"), alias
+    assert len(aslist) == 2 and aslist[0][1].startswith("a large hair"), aslist
+else:
+    assert mix == [
+        ["1", "cryptid", "0.82", "t"],
+        ["2", "paper", "0.15", "f"],
+    ], mix
+    assert mid[0][0] == "1" and mid[0][1] == "biped", mid
+    assert mid[0][2].startswith("a large hairy biped"), mid
+    assert mid[1][1] == "invoice", mid
+    assert "invoice 12" in mid[1][2], mid
+    assert mid[0][1] != mid[0][2], mid
+    assert first == [
+        ["biped", "1", "a large hair"],
+        ["invoice", "2", "invoice 12 f"],
+    ], first
+    assert last == [
+        ["a large hair", "1", "1.25", "biped"],
+        ["invoice 12 f", "2", "2.5", "invoice"],
+    ], last
+    assert score == [
+        ["0.82", "1", "1.25"],
+        ["0.15", "2", "2.5"],
+    ], score
+    assert pipe == [
+        ["1", "t", "1.25", "cryptid"],
+        ["2", "f", "2.5", "paper"],
+    ], pipe
+    assert alias == [["t"], ["f"]], alias
+    assert aslist[0][0] == "biped" and aslist[0][1] == "a large hair", aslist
+    assert aslist[1][0] == "invoice", aslist
+
+def provider_calls(text):
+    return [
+        ln.split(":", 1)[1].strip()
+        for ln in text.splitlines()
+        if "Semantic Provider Calls" in ln
+    ]
+
+for label, text in (
+    ("filter", os.environ["PLAN"]),
+    ("project", os.environ["PLAN_PROJECT"]),
+    ("pipe", os.environ["PLAN_PIPE"]),
+):
+    calls = provider_calls(text)
+    print(label, "provider call estimates", calls)
+    if not calls:
+        sys.exit(f"{label} EXPLAIN has no Semantic Provider Calls")
+    for value in calls:
+        if abs(float(value) - 12.0) > 0.01:
+            sys.exit(f"{label}: expected 12 provider calls for 12 unanalyzed rows, got {value}")
 print("project mix passed")
 PY
 

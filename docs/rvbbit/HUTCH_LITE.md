@@ -34,7 +34,7 @@ provider calls is the expected first pass (24 bigfoot `noul`, 8 bigfoot
 `choice`, 8 chat, 8 UFO `noul`, 8 UFO `choice`). The tight score rows
 are memo hits: cost 0, and `cost_saved` equal to the original `noul`
 charge. The script aborts above 60 provider calls. It prints `GET /stats`
-(including `latency_by_op_model`, where `calls` is misses and `hits` is
+(including `latency_by_op_model`, where `calls` is the uncapped miss counter and `hits` is
 cache reuse) and:
 
 ```sql
