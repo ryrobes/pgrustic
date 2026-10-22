@@ -11,6 +11,14 @@ use std::sync::Mutex;
 use rvbbit_oids::{BATCH_ROWS, CONCURRENCY, MEANS_OID};
 use types_error::PgResult;
 
+/// `system_prompt` of a pipe-body semantic function. The SQL function is
+/// inlined; the project batcher must not also call it.
+pub const PIPE_BODY: &str = "\u{1e}pipe";
+
+/// `user_prompt` prefix of a function defined as a decision tree.
+/// The name follows the prefix.
+pub const TREE_PREFIX: &str = "\u{1e}tree:";
+
 #[derive(Clone, Debug)]
 pub struct Endpoint {
     pub base_url: String,
@@ -40,6 +48,11 @@ pub struct Endpoint {
     pub extract_mode: Option<String>,
     /// `DEFAULT CLAUSES` tail. Empty when the function did not set one.
     pub default_clauses: Option<String>,
+    /// Argument names, in order. Empty on built-in endpoints.
+    pub arg_names: Vec<String>,
+    /// The SQL body is `rvbbit_user`. Project batching fills a memo that
+    /// the builtin reads back.
+    pub user_fn: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -232,5 +245,7 @@ pub fn default_endpoint() -> Endpoint {
         threshold: None,
         extract_mode: None,
         default_clauses: None,
+        arg_names: Vec::new(),
+        user_fn: false,
     }
 }

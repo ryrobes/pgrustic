@@ -48,7 +48,8 @@ pub fn semantic_stats(plan_node_id: i32) -> Option<SemanticStats> {
 
 struct MeansArgs<'mcx> {
     input: PgBox<'mcx, ExprState<'mcx>>,
-    criterion: PgBox<'mcx, ExprState<'mcx>>,
+    /// `None` on a 1-argument template. The criterion is the rendered prompt.
+    criterion: Option<PgBox<'mcx, ExprState<'mcx>>>,
 }
 
 pub(crate) enum Field {
@@ -79,6 +80,7 @@ struct Inflight {
 pub struct SemanticState<'mcx> {
     args: Vec<MeansArgs<'mcx>>,
     func_oid: u32,
+    arity: usize,
     batch_rows: usize,
     concurrency: usize,
     memo: HashMap<(String, String), bool>,
@@ -133,21 +135,30 @@ pub fn compile<'mcx>(
         return Ok(None);
     }
     let func_oid = funcs[0].as_func_expr().expect("FuncExpr").funcid;
+    let arity = funcs[0].as_func_expr().expect("FuncExpr").args.len();
+    if arity != 1 && arity != 2 {
+        return Ok(None);
+    }
     let mcx = estate.es_query_cxt;
     let params = estate.param_bind();
     let mut args = Vec::with_capacity(funcs.len());
     for func in funcs {
         let f = func.as_func_expr().expect("FuncExpr");
-        if f.args.len() != 2 {
-            return Err(err("rvbbit_means expects 2 arguments"));
+        if f.args.len() != arity || f.funcid != func_oid {
+            return Ok(None);
         }
         let input = compile_expr(estate, mcx, params, f.args.nth(0))?;
-        let criterion = compile_expr(estate, mcx, params, f.args.nth(1))?;
+        let criterion = if arity == 2 {
+            Some(compile_expr(estate, mcx, params, f.args.nth(1))?)
+        } else {
+            None
+        };
         args.push(MeansArgs { input, criterion });
     }
     Ok(Some(Box::new(SemanticState {
         args,
         func_oid,
+        arity,
         batch_rows: rvbbit_resolve::batch_rows().max(1),
         concurrency: rvbbit_resolve::max_concurrent().max(1),
         memo: HashMap::new(),
@@ -338,11 +349,18 @@ impl<'mcx> SemanticState<'mcx> {
             let mut pairs = Vec::with_capacity(self.args.len());
             for arg in &mut self.args {
                 let input = eval_text(estate, ecxt, &mut arg.input)?;
-                let criterion = eval_text(estate, ecxt, &mut arg.criterion)?;
-                pairs.push(match (input, criterion) {
-                    (Some(i), Some(c)) => Some((i, c)),
-                    _ => None,
-                });
+                let pair = match input {
+                    Some(input) => match arg.criterion.as_mut() {
+                        Some(expr) => eval_text(estate, ecxt, expr)?.map(|criterion| (input, criterion)),
+                        None => {
+                            let ep = rvbbit_resolve::endpoint_for(self.func_oid);
+                            let criterion = rvbbit_dispatch::derive_criterion(&ep, &input);
+                            Some((input, criterion))
+                        }
+                    },
+                    None => None,
+                };
+                pairs.push(pair);
             }
             lane_result_project(&mut node.ps, estate)?;
             let saved = snapshot_slot(estate, node.ps.ps_ResultTupleSlot.expect("result slot"))?;
@@ -368,6 +386,34 @@ impl<'mcx> SemanticState<'mcx> {
         }
         if sent.is_empty() {
             self.enqueue_ready(rows, &BatchReply { matched: Vec::new(), http_calls: 0 });
+            return Ok(());
+        }
+        let ep = rvbbit_resolve::endpoint_for(self.func_oid);
+        if ep.user_prompt.starts_with(rvbbit_resolve::TREE_PREFIX) {
+            let tree_rows: Vec<Vec<String>> = sent
+                .iter()
+                .map(|(input, criterion)| {
+                    if self.arity == 1 {
+                        vec![input.clone()]
+                    } else {
+                        vec![input.clone(), criterion.clone()]
+                    }
+                })
+                .collect();
+            let reply = rvbbit_dispatch::user_eval_many(self.func_oid, &tree_rows)?;
+            if reply.values.len() != sent.len() {
+                return Err(err(format!(
+                    "decision tree returned {} results for {} items",
+                    reply.values.len(),
+                    sent.len()
+                )));
+            }
+            let matched: Vec<bool> = reply.values.iter().map(|value| truthy(value)).collect();
+            self.http_calls += reply.http_calls as u64;
+            for (pair, bit) in sent.iter().zip(matched.iter()) {
+                self.memo.insert(pair.clone(), *bit);
+            }
+            self.enqueue_ready(rows, &BatchReply { matched, http_calls: reply.http_calls });
             return Ok(());
         }
         let ticket = rvbbit_dispatch::submit(self.func_oid, &sent)?;
@@ -412,6 +458,10 @@ impl<'mcx> SemanticState<'mcx> {
             }
         }
     }
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "t" | "yes" | "1")
 }
 
 fn row_passes(row: &RowWork, memo: &HashMap<(String, String), bool>) -> bool {

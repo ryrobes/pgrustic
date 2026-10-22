@@ -236,6 +236,12 @@ pub struct FnClauses {
     pub threshold: Option<f64>,
     /// `DEFAULT CLAUSES (...)` tail. Call-site clauses override it.
     pub clauses: Option<String>,
+    /// `RETURNS label`. The stored SQL type is `text` and `LABELS` is required.
+    pub returns_label: bool,
+    /// `AS DECISION TREE name`.
+    pub tree: Option<String>,
+    /// `AS PIPE` body, before the native rewrite.
+    pub pipe: Option<String>,
 }
 
 impl Default for FnClauses {
@@ -253,6 +259,9 @@ impl Default for FnClauses {
             label_descriptions: Vec::new(),
             threshold: None,
             clauses: None,
+            returns_label: false,
+            tree: None,
+            pipe: None,
         }
     }
 }
@@ -489,8 +498,19 @@ impl<'a> Parser<'a> {
                 let name = self.name()?;
                 let args = self.arg_list()?;
                 self.expect_kw(Kw::Returns, "RETURNS")?;
-                let returns = self.typ()?;
-                let clauses = self.fn_clauses()?;
+                let raw_returns = self.typ()?;
+                let mut clauses = self.fn_clauses()?;
+                let (returns, label) = normalize_returns(&raw_returns)?;
+                clauses.returns_label = label;
+                if label && clauses.labels.len() < 2 {
+                    return Err("RETURNS label needs LABELS with at least two labels".into());
+                }
+                if clauses.pipe.is_some() && clauses.tree.is_some() {
+                    return Err("AS PIPE and AS DECISION TREE cannot both be set".into());
+                }
+                if clauses.prompt.is_some() && (clauses.pipe.is_some() || clauses.tree.is_some()) {
+                    return Err("AS template cannot be combined with AS PIPE or AS DECISION TREE".into());
+                }
                 return Ok(Command::CreateFunction {
                     or_replace,
                     name,
@@ -882,6 +902,22 @@ impl<'a> Parser<'a> {
                     return Err("DEFAULT CLAUSES is empty".into());
                 }
                 c.clauses = Some(body);
+            } else if self.eat_kw(Kw::Using) {
+                self.expect_kw(Kw::Model, "MODEL")?;
+                c.model = Some(self.name()?);
+            } else if self.eat_kw(Kw::As) {
+                if self.eat_kw(Kw::Decision) {
+                    self.expect_kw(Kw::Tree, "TREE")?;
+                    c.tree = Some(self.name()?);
+                } else if self.eat_kw(Kw::Pipe) {
+                    let body = self.string()?;
+                    if body.trim().is_empty() {
+                        return Err("AS PIPE body is empty".into());
+                    }
+                    c.pipe = Some(body);
+                } else {
+                    c.prompt = Some(self.string()?);
+                }
             } else if self.eat_kw(Kw::Takes) {
                 let n = self.int()?;
                 if n < 1 {
@@ -1093,6 +1129,7 @@ impl<'a> Parser<'a> {
         let stop = [
             Kw::Model, Kw::System, Kw::Prompt, Kw::Max, Kw::Temperature, Kw::Cache, Kw::Test,
             Kw::Version, Kw::Steps, Kw::Takes, Kw::Ward, Kw::As, Kw::Labels, Kw::Default,
+            Kw::Using,
         ];
         let mut depth = 0i32;
         let mut parts = Vec::new();
@@ -1501,7 +1538,7 @@ enum Kw {
     Returns, System, Prompt, Max, Tokens, Temperature, Cache, Test, Expect, For,
     Leftarg, Rightarg, Symbol, Negator, Ask, Yes, No, Choose, When, Then, Meaning,
     Threshold, Using, Combine, As, Version, Set, Cascade, Restrict, Usage, Execute, To, From, Is,
-    Null, Steps, Takes, Ward, Labels, True, False, Default, Clauses, Phrasings,
+    Null, Steps, Takes, Ward, Labels, True, False, Default, Clauses, Phrasings, Pipe,
 }
 
 impl Kw {
@@ -1583,6 +1620,7 @@ impl Kw {
             Kw::Default => "default",
             Kw::Clauses => "clauses",
             Kw::Phrasings => "phrasings",
+            Kw::Pipe => "pipe",
         }
     }
 
@@ -1663,6 +1701,7 @@ impl Kw {
             "default" => Kw::Default,
             "clauses" => Kw::Clauses,
             "phrasings" => Kw::Phrasings,
+            "pipe" => Kw::Pipe,
             "labels" => Kw::Labels,
             _ => return None,
         })
@@ -1829,6 +1868,18 @@ mod lexer {
         let rest = &sql[body_start..];
         let k = rest.find(tag)?;
         Some((body_start + k + tag.len(), rest[..k].to_string()))
+    }
+}
+
+/// `bool`, `score`, and `label` are spellings of the stored SQL types.
+/// `label` still needs `LABELS`.
+fn normalize_returns(raw: &str) -> Result<(String, bool), String> {
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => Ok(("boolean".into(), false)),
+        "score" => Ok(("double precision".into(), false)),
+        "label" => Ok(("text".into(), true)),
+        _ => Ok((trimmed.to_string(), false)),
     }
 }
 
@@ -2023,6 +2074,73 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+
+        let sugar = parse_command(
+            "CREATE SEMANTIC FUNCTION is_biped(notes text) RETURNS bool \
+             AS 'large hairy biped' USING MODEL jev DEFAULT CLAUSES ('WITH TAKES 1')",
+        )
+        .unwrap();
+        match sugar {
+            Command::CreateFunction { returns, clauses, args, .. } => {
+                assert_eq!(returns, "boolean");
+                assert_eq!(args[0].name, "notes");
+                assert_eq!(clauses.prompt.as_deref(), Some("large hairy biped"));
+                assert_eq!(clauses.model.as_deref(), Some("jev"));
+                assert_eq!(clauses.clauses.as_deref(), Some("WITH TAKES 1"));
+                assert!(clauses.tree.is_none() && clauses.pipe.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        let score = parse_command(
+            "CREATE SEMANTIC FUNCTION how_biped(notes text) RETURNS score AS '{{notes}} is a biped'",
+        )
+        .unwrap();
+        match score {
+            Command::CreateFunction { returns, clauses, .. } => {
+                assert_eq!(returns, "double precision");
+                assert_eq!(clauses.prompt.as_deref(), Some("{{notes}} is a biped"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let label = parse_command(
+            "CREATE SEMANTIC FUNCTION kind(notes text) RETURNS label \
+             LABELS ('bigfoot' AS 'a large primate', 'other') USING MODEL jev",
+        )
+        .unwrap();
+        match label {
+            Command::CreateFunction { returns, clauses, .. } => {
+                assert_eq!(returns, "text");
+                assert!(clauses.returns_label);
+                assert_eq!(clauses.labels.len(), 2);
+                assert_eq!(clauses.model.as_deref(), Some("jev"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let tree = parse_command(
+            "CREATE SEMANTIC FUNCTION sighting_of(notes text) RETURNS text AS DECISION TREE sighting",
+        )
+        .unwrap();
+        match tree {
+            Command::CreateFunction { clauses, .. } => {
+                assert_eq!(clauses.tree.as_deref(), Some("sighting"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let pipe = parse_command(
+            "CREATE SEMANTIC FUNCTION creature_of(notes text) RETURNS text AS PIPE $$ {{notes}} |> EXTRACT creature $$",
+        )
+        .unwrap();
+        match pipe {
+            Command::CreateFunction { clauses, .. } => {
+                assert_eq!(clauses.pipe.as_deref(), Some(" {{notes}} |> EXTRACT creature "));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_command(
+            "CREATE SEMANTIC FUNCTION kind(notes text) RETURNS label LABELS ('only')"
+        )
+        .unwrap_err()
+        .contains("at least two"));
 
         parse_command(
             "CREATE WORKFLOW triage(tickets text) RETURNS TABLE (id bigint, route text) VERSION 2 AS $$\nFROM tickets\n$$",

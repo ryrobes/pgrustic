@@ -238,11 +238,14 @@ fn reload() -> PgResult<()> {
                 COALESCE(b.timeout_ms, 30000)::text, COALESCE(b.retries, 5)::text, \
                 COALESCE(f.cache_mode, 'memoize'), COALESCE(f.labels, ''), \
                 COALESCE(o.threshold, f.threshold)::text, \
-                COALESCE(f.clauses, '') \
+                COALESCE(f.clauses, ''), \
+                COALESCE(f.argnames::text, '{}'), \
+                COALESCE(p.prosrc, '') \
          FROM rvbbit.semfn f \
          LEFT JOIN rvbbit.semop o ON o.func_name = f.name \
          LEFT JOIN rvbbit.model m ON m.name = f.model_name \
          LEFT JOIN rvbbit.backend b ON b.oid = m.backend_oid \
+         LEFT JOIN pg_proc p ON p.oid = f.procoid \
          WHERE f.nsp = 'rvbbit'",
     )?;
     let mut entries = Vec::with_capacity(rows.len());
@@ -292,6 +295,8 @@ fn reload() -> PgResult<()> {
                 threshold: cell_opt(&r, 18).and_then(|s| s.parse().ok()),
                 extract_mode: None,
                 default_clauses: cell_opt(&r, 19),
+                arg_names: parse_pg_array(&cell(&r, 20)),
+                user_fn: cell(&r, 21) == "rvbbit_user",
             },
         });
     }
@@ -358,6 +363,8 @@ fn load_trees() -> PgResult<()> {
                 threshold: None,
                 extract_mode: None,
                 default_clauses: None,
+                arg_names: Vec::new(),
+                user_fn: false,
             },
         });
     }
@@ -527,7 +534,18 @@ fn create_function(or_replace: bool, name: &str, args: &[Arg], returns: &str, cl
     if !clauses.labels.is_empty() && !is_text_return(returns) {
         return Err(pg("LABELS is only valid on a text semantic function"));
     }
-    let procoid = create_proc(name, args, returns, &clauses.labels)?;
+    if clauses.returns_label && clauses.labels.len() < 2 {
+        return Err(pg("RETURNS label needs LABELS with at least two labels"));
+    }
+    let procoid = create_proc(name, args, returns, clauses)?;
+    let mut stored = clauses.clone();
+    if let Some(body) = stored.pipe.clone() {
+        stored.system = Some(rvbbit_resolve::PIPE_BODY.to_string());
+        stored.prompt = Some(body);
+    } else if let Some(tree) = stored.tree.clone() {
+        stored.prompt = Some(format!("{}{tree}", rvbbit_resolve::TREE_PREFIX));
+    }
+    let clauses = &stored;
     let tests = if clauses.tests.is_empty() {
         "NULL".to_string()
     } else {
@@ -1044,42 +1062,100 @@ fn is_text_return(returns: &str) -> bool {
     returns.trim().eq_ignore_ascii_case("text")
 }
 
-fn create_proc(name: &str, args: &[Arg], returns: &str, labels: &[String]) -> PgResult<String> {
+fn create_proc(name: &str, args: &[Arg], returns: &str, clauses: &FnClauses) -> PgResult<String> {
     let sig = args
         .iter()
         .map(|a| format!("{} {}", qident(&a.name), a.typ))
         .collect::<Vec<_>>()
         .join(", ");
-    let prosrc = match returns.trim().to_ascii_lowercase().as_str() {
-        "boolean" | "bool" => "rvbbit_means",
-        "double precision" | "float8" | "float" => "rvbbit_means_score",
-        // JSON is parsed by hutch and returned as text. Cast in SQL for jsonb.
-        // A declared label set uses the decision model and returns
-        // {"label","score","scores"} as text.
-        "text" if labels.is_empty() => "rvbbit_extract",
-        "text" => {
-            if labels.len() < 2 {
-                return Err(pg("classify label set needs at least two labels"));
-            }
-            "rvbbit_classify"
+    if clauses.pipe.is_some() && clauses.tree.is_some() {
+        return Err(pg("AS PIPE and AS DECISION TREE cannot both be set"));
+    }
+    if let Some(body) = clauses.pipe.as_deref() {
+        return create_pipe_proc(name, args, returns, &sig, body);
+    }
+    let prosrc = match proc_body(args, returns, clauses)? {
+        "rvbbit_classify" if clauses.labels.len() < 2 => {
+            return Err(pg("classify label set needs at least two labels"));
         }
-        other => {
-            return Err(pg(format!(
-                "semantic function return type {other} is not supported yet; use boolean, double precision, or text"
-            )))
-        }
+        other => other,
     };
     exec(&format!(
         "CREATE OR REPLACE FUNCTION rvbbit.{}({sig}) RETURNS {returns} \
          LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS '{prosrc}'",
         qident(name)
     ))?;
+    proc_oid(name)
+}
+
+/// A pipe workflow is a SQL function so the planner inlines the inner
+/// `CLASSIFY` / `EXTRACT` / `MEANS` call. Semantic Project then batches
+/// that call. The wrapper itself is not a second HTTP call. Volatility
+/// is VOLATILE because those inner calls are volatile; a STABLE wrapper
+/// would be refused at inline time.
+fn create_pipe_proc(name: &str, args: &[Arg], returns: &str, sig: &str, body: &str) -> PgResult<String> {
+    let mut sql_body = body.trim().trim_end_matches(';').trim().to_string();
+    for arg in args {
+        let needle = format!("{{{{{}}}}}", arg.name);
+        sql_body = sql_body.replace(&needle, &qident(&arg.name));
+    }
+    let rewritten = rvbbit_parse::rewrite_native_semantic(&sql_body).unwrap_or(sql_body);
+    let expr = rewritten.trim().trim_end_matches(';').trim();
+    if expr.is_empty() {
+        return Err(pg("AS PIPE body is empty"));
+    }
+    let select = if expr.len() >= 6 && expr[..6].eq_ignore_ascii_case("select") {
+        expr.to_string()
+    } else {
+        format!("SELECT {expr}")
+    };
+    exec(&format!(
+        "CREATE OR REPLACE FUNCTION rvbbit.{}({sig}) RETURNS {returns} \
+         LANGUAGE sql VOLATILE PARALLEL UNSAFE COST 1000000 AS {}",
+        qident(name),
+        dollar(&select)
+    ))?;
+    proc_oid(name)
+}
+
+fn proc_oid(name: &str) -> PgResult<String> {
     scalar(&format!(
         "SELECT p.oid::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = {}",
         qlit(name)
     ))?
     .ok_or_else(|| pg(format!("function rvbbit.{name} was not created")))
+}
+
+/// Legacy 2-arg bool and score stay on `rvbbit_means` so the operator is
+/// unchanged. A template, a label set written as `RETURNS label`, a
+/// 1-arg bool or score, or a decision tree uses `rvbbit_user`.
+fn proc_body(args: &[Arg], returns: &str, clauses: &FnClauses) -> PgResult<&'static str> {
+    let ret = returns.trim().to_ascii_lowercase();
+    let user = clauses.tree.is_some()
+        || clauses.prompt.is_some()
+        || clauses.returns_label
+        || (args.len() != 2 && matches!(ret.as_str(), "boolean" | "bool" | "double precision" | "float8" | "float"));
+    if user {
+        return match ret.as_str() {
+            "boolean" | "bool" | "double precision" | "float8" | "float" | "text" => Ok("rvbbit_user"),
+            other => Err(pg(format!(
+                "semantic function return type {other} is not supported yet; use boolean, double precision, text, bool, score, or label"
+            ))),
+        };
+    }
+    match ret.as_str() {
+        "boolean" | "bool" => Ok("rvbbit_means"),
+        "double precision" | "float8" | "float" => Ok("rvbbit_means_score"),
+        // JSON is parsed by hutch and returned as text. Cast in SQL for jsonb.
+        // A declared label set uses the decision model and returns
+        // {"label","score","scores"} as text.
+        "text" if clauses.labels.is_empty() => Ok("rvbbit_extract"),
+        "text" => Ok("rvbbit_classify"),
+        other => Err(pg(format!(
+            "semantic function return type {other} is not supported yet; use boolean, double precision, or text"
+        ))),
+    }
 }
 
 fn ensure_schema() -> PgResult<()> {
@@ -1510,14 +1586,27 @@ fn render_function(r: &[Option<String>]) -> String {
             s.push_str(&format!(" LABELS ({quoted})"));
         }
     }
+    let sys = cell_opt(r, 5);
+    let prompt = cell_opt(r, 6);
+    let pipe = sys.as_deref() == Some(rvbbit_resolve::PIPE_BODY);
+    let tree = prompt.as_deref().and_then(|p| p.strip_prefix(rvbbit_resolve::TREE_PREFIX));
+    if pipe {
+        if let Some(body) = &prompt {
+            s.push_str(&format!(" AS PIPE {}", dollar(body)));
+        }
+    } else if let Some(name) = tree {
+        s.push_str(&format!(" AS DECISION TREE {}", qident(name)));
+    }
     if let Some(model) = cell_opt(r, 4) {
         s.push_str(&format!(" MODEL {}", qident(&model)));
     }
-    if let Some(sys) = cell_opt(r, 5) {
-        s.push_str(&format!(" SYSTEM {}", dollar(&sys)));
-    }
-    if let Some(prompt) = cell_opt(r, 6) {
-        s.push_str(&format!(" PROMPT {}", dollar(&prompt)));
+    if !pipe && tree.is_none() {
+        if let Some(sys) = sys {
+            s.push_str(&format!(" SYSTEM {}", dollar(&sys)));
+        }
+        if let Some(prompt) = prompt {
+            s.push_str(&format!(" PROMPT {}", dollar(&prompt)));
+        }
     }
     if let Some(max) = cell_opt(r, 7) {
         s.push_str(&format!(" MAX TOKENS {max}"));

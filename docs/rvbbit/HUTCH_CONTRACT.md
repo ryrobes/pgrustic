@@ -280,8 +280,17 @@ Give it the same prompt as MEANS when the two should share a provider
 call: hutch-lite memos the Decisions HTTP body, which does not include
 the function name.
 
+`RETURNS bool`, `RETURNS score`, `AS 'template {{arg}}'`, `USING MODEL`,
+and `AS DECISION TREE` are the same catalog row with a shorter spelling.
+A template or a 1-argument bool or score is `rvbbit_user` (oid 9044).
+Predict inputs still carry `input` and `criterion`, and also each
+argument name, so `{{notes}}` substitutes. `DEFAULT CLAUSES` on that
+function are the decision stack (`takes`, `phrasings`, `across`) when
+the call itself has no clause tail. `AS PIPE` is SQL, not an HTTP body.
+
 A text function with `LABELS ('a', 'b', ...)` (at least two labels) is
-`rvbbit_classify` (oid 9026). It posts `/v1/classify` with `item.labels`
+`rvbbit_classify` (oid 9026), unless it was declared `RETURNS label`,
+which uses `rvbbit_user` and the same JSON result. It posts `/v1/classify` with `item.labels`
 set. A label may carry a description: `LABELS ('bigfoot' AS 'an unidentified large primate or sasquatch', 'known animal')`.
 The SQL result is JSON text `{"label","score","scores"}`. Text
 without `LABELS` stays `rvbbit_extract` on `/v1/extract`.

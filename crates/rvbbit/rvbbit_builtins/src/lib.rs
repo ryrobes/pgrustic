@@ -15,7 +15,7 @@ use rvbbit_oids::{
     GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_FOR_NAME,
     RERANK_FOR_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID, SUMMARIZE_FINAL_NAME,
     SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID, SUMMARIZE_TRANS_NAME,
-    SUMMARIZE_TRANS_OID,
+    SUMMARIZE_TRANS_OID, USER_NAME, USER_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -430,6 +430,49 @@ fn typed_text(kind: &str, value: &str) -> Result<String, String> {
     rvbbit_dispatch::coerce_extracted(kind, value)
 }
 
+/// User semantic function. One builtin serves every arity: `pg_proc.pronargs`
+/// is what the call sees. A project batch may already have the answer.
+pub fn rvbbit_user(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let oid = flinfo.as_ref().map(|f| f.fn_oid).unwrap_or(USER_OID);
+    let mut args = Vec::new();
+    for i in 0..fcinfo.nargs() {
+        let packed = unsafe { fcinfo.arg_varlena_packed(i)? };
+        args.push(String::from_utf8_lossy(packed.data()).into_owned());
+    }
+    let key = rvbbit_dispatch::user_memo_key(oid);
+    let joined = args.join("\u{1e}");
+    if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &joined) {
+        return user_datum(fcinfo, oid, hit);
+    }
+    let reply = rvbbit_dispatch::user_eval_many(oid, &[args])?;
+    let value = reply.values.into_iter().next().unwrap_or_default();
+    user_value(fcinfo, oid, &value)
+}
+
+fn user_datum(fcinfo: &mut Fcinfo, oid: u32, hit: rvbbit_dispatch::ScalarHit) -> PgResult<Datum> {
+    match hit {
+        rvbbit_dispatch::ScalarHit::Value(value) => user_value(fcinfo, oid, &value),
+        rvbbit_dispatch::ScalarHit::Failed(message) => Err(Box::new(types_error::PgError::error(message))),
+    }
+}
+
+fn user_value(fcinfo: &mut Fcinfo, oid: u32, value: &str) -> PgResult<Datum> {
+    let ep = rvbbit_resolve::endpoint_for(oid);
+    let ret = ep.return_type.to_ascii_lowercase();
+    if ret == "boolean" || ret == "bool" {
+        return Ok(Datum::from_bool(value == "true"));
+    }
+    if ret.contains("double") || ret == "float8" || ret == "float" {
+        let n: f64 = value.parse().map_err(|_| {
+            Box::new(types_error::PgError::error(format!("semantic score {value} is not a number")))
+                as Box<types_error::PgError>
+        })?;
+        return Ok(Datum::from_f64(n));
+    }
+    Ok(varlena_result(varlena::cstring_to_text(fcinfo.result_mcx(), value.as_bytes())?))
+}
+
 pub fn rvbbit_call_log(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     rvbbit_resolve::ensure()?;
     let urls = rvbbit_catalog::hutch_urls()?;
@@ -626,6 +669,14 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: true,
         retset: false,
         func: rvbbit_rerank as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: USER_OID,
+        name: USER_NAME,
+        nargs: 1,
+        strict: true,
+        retset: false,
+        func: rvbbit_user as PGFunction,
     },
     FmgrBuiltin {
         foid: RERANK_FOR_OID,
