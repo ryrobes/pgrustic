@@ -3395,7 +3395,97 @@ mod tests {
             assert!(body.contains(&format!("\"state\":\"{input}\"")), "{body}");
             assert_eq!(rough_tokens(&body), tokens, "{body}");
             assert_eq!(body.len(), bytes, "{body}");
+            let posted: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(posted["state"].is_string(), "one text per decision call: {body}");
         }
+    }
+
+    /// The ~300 billed input tokens are not this JSON. OpenRouter's
+    /// decisions reference prints a three-question example and, next to
+    /// it, `usage.input_tokens` 476. This counts that example. It does
+    /// not call the provider: the key in this environment is a dummy.
+    /// Packing eight texts into one `state` shrinks the JSON we would
+    /// post, but every question would see every text, and the schema
+    /// returns one answer map for that single state. We still post one
+    /// string state per row.
+    #[test]
+    fn jev_billed_gap_is_outside_the_posted_body() {
+        let published = serde_json::json!({
+            "model": "typesafe/jev-1.13",
+            "state": {
+                "customer_tier": "enterprise",
+                "ticket": "My checkout page shows a blank screen after I click Pay. I have tried two browsers."
+            },
+            "questions": {
+                "is_bug": {
+                    "type": "noul",
+                    "instructions": "Is the customer reporting a software defect?",
+                    "criteria": {
+                        "true": "The customer describes broken or unexpected product behavior.",
+                        "false": "The customer is asking a question or requesting a feature."
+                    }
+                },
+                "team": {
+                    "type": "choice",
+                    "instructions": "Which team should own this ticket?",
+                    "criteria": {
+                        "payments": "Checkout, billing, or payment processing issues.",
+                        "frontend": "Rendering, layout, or browser compatibility issues.",
+                        "account": "Login, permissions, or profile issues.",
+                        "none": "None of the teams above."
+                    }
+                },
+                "urgency": {
+                    "type": "score",
+                    "instructions": "How urgent is this ticket?",
+                    "criteria": [
+                        "Can wait for the next release",
+                        "Should be fixed this week",
+                        "Blocking revenue right now"
+                    ]
+                }
+            }
+        });
+        let published_body = serde_json::to_string(&published).unwrap();
+        assert_eq!(rough_tokens(&published_body), 284, "{published_body}");
+        assert_eq!(published_body.len(), 892, "{published_body}");
+        // Printed on the same OpenRouter page. Not remeasured here.
+        let published_billed = 476;
+        assert!(published_billed > rough_tokens(&published_body));
+
+        let model = "typesafe/jev-1.14";
+        let criterion = "a large hairy biped was seen";
+        let row = "A tall hairy figure crossed the logging road on two legs and left huge prints.";
+        let one = noul_body(model, &demo_item(row, criterion)).unwrap();
+        assert_eq!(rough_tokens(&one), 79, "{one}");
+        let mut separate = 0;
+        let mut questions = serde_json::Map::new();
+        let mut states = Vec::new();
+        for i in 0..8 {
+            let text = format!("{row} {i}");
+            let body = noul_body(model, &demo_item(&text, criterion)).unwrap();
+            separate += rough_tokens(&body);
+            states.push(serde_json::Value::String(text));
+            questions.insert(
+                format!("q{i}"),
+                serde_json::json!({
+                    "type": "noul",
+                    "instructions": format!("Does the text match the criterion?\n{criterion}")
+                }),
+            );
+        }
+        let packed = serde_json::json!({
+            "model": model,
+            "state": states,
+            "questions": questions
+        });
+        let packed_body = serde_json::to_string(&packed).unwrap();
+        let packed_tokens = rough_tokens(&packed_body);
+        assert_eq!(separate, 640, "eight posted bodies");
+        assert_eq!(packed_tokens, 467, "{packed_body}");
+        assert!(packed_tokens < separate, "packing shrinks JSON, not the decision");
+        assert!(packed["state"].is_array());
+        assert!(serde_json::from_str::<serde_json::Value>(&one).unwrap()["state"].is_string());
     }
 
     #[test]
