@@ -225,10 +225,23 @@ SQL
 grep -q 'MCP Provider Calls' "$RUNDIR/explain.out"
 grep -E -q 'Actual MCP Calls: [1-9]' "$RUNDIR/explain.out"
 grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/explain.out"
+# count(*) drops a STABLE target it does not read. now() is volatile, so
+# the aggregate still has to run it, the same shape as the live
+# convert_time subquery.
 "${PSQL[@]}" <<'SQL' | tee "$RUNDIR/subquery.out"
-EXPLAIN (ANALYZE, COSTS ON) SELECT count(*) FROM (SELECT mcp_demo.echo(x) AS r FROM (VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('g'), ('h'), ('i'), ('j')) v(x)) s;
+EXPLAIN (ANALYZE, COSTS ON) SELECT count(*) FROM (SELECT mcp_demo.now() AS r FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) v(x)) s;
 SQL
 grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/subquery.out"
+"${PSQL[@]}" <<'SQL' | tee "$RUNDIR/rows.out"
+CREATE TABLE mcp_rows (x text);
+INSERT INTO mcp_rows SELECT 'a' FROM generate_series(1, 10);
+EXPLAIN SELECT mcp_demo.now() FROM mcp_rows;
+SQL
+grep -q 'rows=10' "$RUNDIR/rows.out"
+if grep -q 'rows=1360' "$RUNDIR/rows.out"; then
+  echo "scan still estimates the 10-page floor" >&2
+  exit 1
+fi
 "${PSQL[@]}" -c "REFRESH FOREIGN TOOLS FROM SERVER demo;" 2>&1 | tee "$RUNDIR/refresh.out"
 grep -q 'unchanged' "$RUNDIR/refresh.out"
 

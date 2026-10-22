@@ -559,6 +559,13 @@ pub fn apply_costs(node: Node<'_>) {
         };
         unsafe {
             let _ = node.with_plan_mut(|p| {
+                // COST 1000000 was multiplied by the 10-page floor. Scale
+                // that cost with the row count the EXPLAIN line will show.
+                if mcp && p.qual.is_nil() && p.plan_rows > 0.0 && (rows - p.plan_rows).abs() > 0.5 {
+                    let scale = rows / p.plan_rows;
+                    p.startup_cost *= scale;
+                    p.total_cost *= scale;
+                }
                 p.total_cost += added;
                 if est.filters || (mcp && p.qual.is_nil()) {
                     p.plan_rows = rows;
@@ -569,8 +576,21 @@ pub fn apply_costs(node: Node<'_>) {
             if let Some(child) = plan.lefttree {
                 if child.as_plan().is_some_and(|p| p.qual.is_nil()) {
                     if let Some(counted) = counted_scan_rows(child) {
-                        unsafe {
-                            let _ = child.with_plan_mut(|p| p.plan_rows = counted);
+                        // A child that is itself an MCP estimate scales its
+                        // own cost when this walk reaches it. Scaling here
+                        // too would apply the ratio twice.
+                        let child_mcp = node_estimate(child).is_some_and(|est| mcp_only_model(&est.model));
+                        if !child_mcp {
+                            unsafe {
+                                let _ = child.with_plan_mut(|p| {
+                                    if p.plan_rows > 0.0 && (counted - p.plan_rows).abs() > 0.5 {
+                                        let scale = counted / p.plan_rows;
+                                        p.startup_cost *= scale;
+                                        p.total_cost *= scale;
+                                    }
+                                    p.plan_rows = counted;
+                                });
+                            }
                         }
                     }
                 }

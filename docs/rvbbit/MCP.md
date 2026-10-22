@@ -117,8 +117,9 @@ A value the batcher just prefetched is not logged twice.
 `EXPLAIN` prints `MCP Provider Calls`, `MCP Latency`, `MCP Server`, and
 `MCP Tool` when the node's model is only `mcp:<server>/<tool>`.
 A qual-free scan prices those calls from the planner's live tuple count
-when it has one, instead of the 10-page floor, and that count is also the
-scan's `rows=` estimate. MCP latency uses the per-tool p50 from
+when it has one, instead of the 10-page floor. That count replaces the
+scan's `rows=` estimate, and the `COST 1000000` total is scaled by the
+same ratio so an un-analyzed table is not costed as 1360 rows. MCP latency uses the per-tool p50 from
 `rvbbit.calls` when that tool has been called; otherwise the seed is 50 ms
 per wave. `EXPLAIN ANALYZE` adds
 `Actual MCP Calls`, `Actual Cache Hits`, `Actual MCP Latency`, and
