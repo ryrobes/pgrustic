@@ -734,14 +734,20 @@ fn copy_target_entry<'mcx>(
     )
 }
 
-/// `count(*)` over a subquery can leave a volatile tool on the Aggregate
-/// target list as resjunk. That is not a Result, so the MCP batcher never
-/// sees it and each row opens its own stdio process. Move those resjunk
-/// calls onto a Result under the aggregate. The aggregate still counts
-/// every child row, and it does not evaluate the tool a second time.
+/// An aggregate does not put a tool on its own Result. `count(*)` leaves
+/// an unused call as resjunk. `count(tool(...))`, `count(r)` after
+/// subquery pull-up, and `count(*) FILTER (WHERE r IS NOT NULL)` leave
+/// the call inside the Aggref argument or filter. The scan underneath
+/// only has the input columns, so the lift sees `Aggregate -> Seq Scan`
+/// and each row opens its own stdio process. Copy every project call
+/// onto a Result under the aggregate. setrefs then turns the aggregate's
+/// copy into a Var of that Result, and the tool runs in one batch.
 fn sink_agg_project<'mcx>(mcx: Mcx<'mcx>, agg: Node<'mcx>) -> PgResult<Node<'mcx>> {
     let base = agg.as_plan().expect("agg");
-    if !tlist_contains_project(&base.targetlist) {
+    let mut roots = Vec::new();
+    collect_project_roots_list(&base.targetlist, &mut roots);
+    collect_project_roots_list(&base.qual, &mut roots);
+    if roots.is_empty() {
         return Ok(agg);
     }
     let Some(child) = base.lefttree else {
@@ -750,21 +756,7 @@ fn sink_agg_project<'mcx>(mcx: Mcx<'mcx>, agg: Node<'mcx>) -> PgResult<Node<'mcx
     if !is_base_scan(child) && child.node_tag() != NodeTag::T_Result {
         return Ok(agg);
     }
-    let extras: Vec<Node<'mcx>> = base
-        .targetlist
-        .iter()
-        .filter_map(|tle_node| {
-            let tle = tle_node.as_target_entry()?;
-            if tle.resjunk && expr_contains_project(tle.expr) {
-                Some(tle.expr)
-            } else {
-                None
-            }
-        })
-        .collect();
-    if extras.is_empty() {
-        return Ok(agg);
-    }
+    let extras = dedup_exprs(roots);
     let mut child_tlist = child.as_plan().expect("child").targetlist.clone_in(mcx)?;
     let mut resno = 1i16;
     for tle in child_tlist.iter() {
@@ -774,6 +766,9 @@ fn sink_agg_project<'mcx>(mcx: Mcx<'mcx>, agg: Node<'mcx>) -> PgResult<Node<'mcx
         }
     }
     for expr in extras {
+        if tlist_has_expr(&child_tlist, expr) {
+            continue;
+        }
         let tle = Node::mk(
             mcx,
             TargetEntry {
@@ -783,7 +778,7 @@ fn sink_agg_project<'mcx>(mcx: Mcx<'mcx>, agg: Node<'mcx>) -> PgResult<Node<'mcx
                 ressortgroupref: 0,
                 resorigtbl: 0,
                 resorigcol: 0,
-                resjunk: true,
+                resjunk: false,
             },
         )?;
         child_tlist.lappend(mcx, tle)?;
@@ -806,6 +801,92 @@ fn sink_agg_project<'mcx>(mcx: Mcx<'mcx>, agg: Node<'mcx>) -> PgResult<Node<'mcx
     }
     unsafe { agg.with_plan_mut(|p| p.targetlist = kept) }.expect("agg");
     Ok(agg)
+}
+
+fn collect_project_roots_list<'mcx>(list: &NodeList<'mcx>, out: &mut Vec<Node<'mcx>>) {
+    for node in list.iter() {
+        collect_project_roots(node, out);
+    }
+}
+
+/// The project call itself, not a function that merely contains one.
+/// An aggregate argument, FILTER, or `IS NOT NULL` wraps that call.
+fn collect_project_roots<'mcx>(node: Node<'mcx>, out: &mut Vec<Node<'mcx>>) {
+    match node.node_tag() {
+        NodeTag::T_FuncExpr => {
+            let func = node.as_func_expr().expect("FuncExpr");
+            if func_is_native_project(func) || func_is_user_project(func) || func_is_mcp_project(func) {
+                out.push(node);
+                return;
+            }
+            for arg in func.args.iter() {
+                collect_project_roots(arg, out);
+            }
+        }
+        NodeTag::T_TargetEntry => {
+            collect_project_roots(node.as_target_entry().expect("TargetEntry").expr, out);
+        }
+        NodeTag::T_Aggref => {
+            let agg = node.as_aggref().expect("Aggref");
+            for arg in agg.args.iter() {
+                collect_project_roots(arg, out);
+            }
+            for arg in agg.aggdirectargs.iter() {
+                collect_project_roots(arg, out);
+            }
+            if let Some(filter) = agg.aggfilter {
+                collect_project_roots(filter, out);
+            }
+        }
+        NodeTag::T_RelabelType => collect_project_roots(node.as_relabel_type().expect("Relabel").arg, out),
+        NodeTag::T_CoerceViaIO => collect_project_roots(node.as_coerce_via_io().expect("CoerceViaIO").arg, out),
+        NodeTag::T_NamedArgExpr => {
+            if let Some(arg) = node.as_named_arg_expr().expect("NamedArgExpr").arg {
+                collect_project_roots(arg, out);
+            }
+        }
+        NodeTag::T_OpExpr => {
+            for arg in node.as_op_expr().expect("OpExpr").args.iter() {
+                collect_project_roots(arg, out);
+            }
+        }
+        NodeTag::T_BoolExpr => {
+            for arg in node.as_bool_expr().expect("BoolExpr").args.iter() {
+                collect_project_roots(arg, out);
+            }
+        }
+        NodeTag::T_NullTest => {
+            if let Some(arg) = node.as_null_test().expect("NullTest").arg {
+                collect_project_roots(arg, out);
+            }
+        }
+        NodeTag::T_BooleanTest => {
+            if let Some(arg) = node.as_boolean_test().expect("BooleanTest").arg {
+                collect_project_roots(arg, out);
+            }
+        }
+        NodeTag::T_List => {
+            if let Some(list) = node.as_list() {
+                collect_project_roots_list(list, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dedup_exprs<'mcx>(roots: Vec<Node<'mcx>>) -> Vec<Node<'mcx>> {
+    let mut out = Vec::new();
+    for expr in roots {
+        if out.iter().any(|kept| types_nodes::equal(*kept, expr)) {
+            continue;
+        }
+        out.push(expr);
+    }
+    out
+}
+
+fn tlist_has_expr(tlist: &NodeList<'_>, expr: Node<'_>) -> bool {
+    tlist.iter().any(|tle| tle.as_target_entry().is_some_and(|te| types_nodes::equal(te.expr, expr)))
 }
 
 fn wrap_project<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {
@@ -896,6 +977,25 @@ fn collect_vars<'mcx>(node: Node<'mcx>, out: &mut Vec<Node<'mcx>>) {
             let f: &FuncExpr<'_> = node.as_func_expr().expect("FuncExpr");
             for arg in f.args.iter() {
                 collect_vars(arg, out);
+            }
+        }
+        NodeTag::T_NamedArgExpr => {
+            if let Some(arg) = node.as_named_arg_expr().expect("NamedArgExpr").arg {
+                collect_vars(arg, out);
+            }
+        }
+        NodeTag::T_NullTest => {
+            if let Some(arg) = node.as_null_test().expect("NullTest").arg {
+                collect_vars(arg, out);
+            }
+        }
+        NodeTag::T_Aggref => {
+            let agg = node.as_aggref().expect("Aggref");
+            for arg in agg.args.iter() {
+                collect_vars(arg, out);
+            }
+            if let Some(filter) = agg.aggfilter {
+                collect_vars(filter, out);
             }
         }
         NodeTag::T_RelabelType => {
