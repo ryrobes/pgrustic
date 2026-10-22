@@ -1396,7 +1396,7 @@ pub fn ExplainNode<'mcx>(
                 show_instrumentation_count("Rows Removed by Filter", 1, &instrument, es);
             }
             if rvbbit_plan::qual_contains_means(&plan.qual) {
-                ExplainPropertyText("Semantic", "means", es);
+                ExplainPropertyText("Semantic", rvbbit_plan::qual_semantic_name(&plan.qual), es);
                 ExplainPropertyInteger(
                     "Batch Size",
                     None,

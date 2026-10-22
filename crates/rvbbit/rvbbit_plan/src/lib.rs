@@ -15,12 +15,22 @@ mod place;
 use mcx::Mcx;
 use types_error::PgResult;
 use types_nodes::list::NodeList;
-use types_nodes::plannodes::{Append, MergeAppend, Result as ResultPlan, SubqueryScan};
+use types_nodes::jointype::JoinType;
+use types_nodes::plannodes::{Append, HashJoin, MergeAppend, MergeJoin, NestLoop, Result as ResultPlan, SubqueryScan};
 use types_nodes::primnodes::{FuncExpr, RelabelType, TargetEntry, Var};
 use types_nodes::{Node, NodeTag};
 
 pub fn qual_contains_means(qual: &NodeList<'_>) -> bool {
     qual.iter().any(expr_contains_means)
+}
+
+/// `about` when the qual embeds, otherwise `means`.
+pub fn qual_semantic_name(qual: &NodeList<'_>) -> &'static str {
+    if qual.iter().any(expr_contains_about) {
+        "about"
+    } else {
+        "means"
+    }
 }
 
 pub fn expr_contains_means(node: Node<'_>) -> bool {
@@ -79,11 +89,15 @@ fn lift_tree<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Node<'mcx>> {
     // columns, and the Result evaluates the tree. Leaving the call on the
     // scan would make setrefs turn the Result expression into a plain Var
     // of an already-computed column, and the batcher would never see it.
-    let plan = if is_base_scan(plan) && qual_contains_means(&plan.as_plan().expect("plan").qual) {
+    let plan = if let Some(wrapped) = lift_about_join(mcx, plan)? {
+        wrapped
+    } else if is_base_scan(plan) && qual_contains_means(&plan.as_plan().expect("plan").qual) {
         wrap_scan(mcx, plan)?
     } else if is_base_scan(plan) && tlist_contains_decide(&plan.as_plan().expect("plan").targetlist) {
         wrap_decide(mcx, plan)?
     } else if is_base_scan(plan) && tlist_contains_project(&plan.as_plan().expect("plan").targetlist) {
+        wrap_project(mcx, plan)?
+    } else if is_join(plan) && tlist_contains_project(&plan.as_plan().expect("plan").targetlist) {
         wrap_project(mcx, plan)?
     } else {
         plan
@@ -91,6 +105,135 @@ fn lift_tree<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Node<'mcx>> {
     strip_child_decide(mcx, plan)?;
     strip_child_project(mcx, plan)?;
     Ok(plan)
+}
+
+fn is_join(plan: Node<'_>) -> bool {
+    matches!(
+        plan.node_tag(),
+        NodeTag::T_NestLoop | NodeTag::T_HashJoin | NodeTag::T_MergeJoin
+    )
+}
+
+/// Move an inner join's ABOUT quals onto a Result so the pair list is
+/// embedded in one batch. Outer joins keep the qual on the join: lifting
+/// it would drop the preserved side.
+fn lift_about_join<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Option<Node<'mcx>>> {
+    if !is_join(plan) {
+        return Ok(None);
+    }
+    let (jointype, clauses) = match plan.node_tag() {
+        NodeTag::T_NestLoop => {
+            let join = &plan.as_nest_loop().expect("NestLoop").join;
+            (join.jointype, join.joinqual.iter().collect::<Vec<_>>())
+        }
+        NodeTag::T_HashJoin => {
+            let join = &plan.as_hash_join().expect("HashJoin").join;
+            (join.jointype, join.joinqual.iter().collect::<Vec<_>>())
+        }
+        NodeTag::T_MergeJoin => {
+            let join = &plan.as_merge_join().expect("MergeJoin").join;
+            (join.jointype, join.joinqual.iter().collect::<Vec<_>>())
+        }
+        _ => return Ok(None),
+    };
+    if jointype != JoinType::JOIN_INNER || !clauses.iter().copied().any(expr_contains_about) {
+        return Ok(None);
+    }
+    let mut keep = NodeList::nil();
+    let mut about = NodeList::nil();
+    for clause in clauses {
+        if expr_contains_about(clause) {
+            about.lappend(mcx, clause)?;
+        } else {
+            keep.lappend(mcx, clause)?;
+        }
+    }
+    if about.is_nil() {
+        return Ok(None);
+    }
+    match plan.node_tag() {
+        NodeTag::T_NestLoop => {
+            unsafe { plan.with_mut::<NestLoop, _>(|n| n.join.joinqual = keep) }.expect("NestLoop");
+        }
+        NodeTag::T_HashJoin => {
+            unsafe { plan.with_mut::<HashJoin, _>(|n| n.join.joinqual = keep) }.expect("HashJoin");
+        }
+        NodeTag::T_MergeJoin => {
+            unsafe { plan.with_mut::<MergeJoin, _>(|n| n.join.joinqual = keep) }.expect("MergeJoin");
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(wrap_filter(mcx, plan, about)?))
+}
+
+fn expr_contains_about(node: Node<'_>) -> bool {
+    match node.node_tag() {
+        NodeTag::T_FuncExpr => {
+            let func = node.as_func_expr().expect("FuncExpr");
+            func_is_about(func) || func.args.iter().any(expr_contains_about)
+        }
+        NodeTag::T_BoolExpr => node
+            .as_bool_expr()
+            .expect("BoolExpr")
+            .args
+            .iter()
+            .any(expr_contains_about),
+        NodeTag::T_RelabelType => expr_contains_about(node.as_relabel_type().expect("Relabel").arg),
+        NodeTag::T_CoerceViaIO => expr_contains_about(node.as_coerce_via_io().expect("CoerceViaIO").arg),
+        NodeTag::T_OpExpr => node
+            .as_op_expr()
+            .expect("OpExpr")
+            .args
+            .iter()
+            .any(expr_contains_about),
+        _ => false,
+    }
+}
+
+fn func_is_about(func: &FuncExpr<'_>) -> bool {
+    if rvbbit_resolve::is_semantic_func(func.funcid) {
+        let ep = rvbbit_resolve::endpoint_for(func.funcid);
+        if ep.fn_name.eq_ignore_ascii_case("about") {
+            return true;
+        }
+    }
+    if !syscache_seams::pg_proc_proname::is_installed() {
+        return false;
+    }
+    let Ok(Some(name)) = syscache_seams::pg_proc_proname::call(func.funcid) else {
+        return false;
+    };
+    name.name_str() == b"about"
+}
+
+fn wrap_filter<'mcx>(mcx: Mcx<'mcx>, child: Node<'mcx>, semantic: NodeList<'mcx>) -> PgResult<Node<'mcx>> {
+    let base = child.as_plan().expect("plan");
+    let result_tlist = base.targetlist.clone_in(mcx)?;
+    let mut child_tlist = base.targetlist.clone_in(mcx)?;
+    add_junk_inputs(mcx, &semantic, &mut child_tlist)?;
+    let startup_cost = base.startup_cost;
+    let total_cost = base.total_cost;
+    let plan_rows = base.plan_rows;
+    let plan_width = base.plan_width;
+    unsafe {
+        child.with_plan_mut(|p| {
+            p.targetlist = child_tlist;
+            p.parallel_safe = false;
+        })
+    }
+    .expect("plan");
+    let mut result = Node::build::<ResultPlan<'mcx>>(mcx)?;
+    result.plan.targetlist = result_tlist;
+    result.plan.qual = semantic;
+    result.plan.lefttree = Some(child);
+    result.plan.startup_cost = startup_cost;
+    result.plan.total_cost = total_cost;
+    result.plan.plan_rows = plan_rows;
+    result.plan.plan_width = plan_width;
+    result.plan.parallel_aware = false;
+    result.plan.parallel_safe = false;
+    result.resconstantqual = None;
+    Ok(result.seal())
 }
 
 fn is_base_scan(plan: Node<'_>) -> bool {
@@ -435,6 +578,7 @@ fn func_is_native_project(func: &FuncExpr<'_>) -> bool {
     let native = match (name.name_str(), nargs) {
         (b"classify" | b"classify_enum" | b"extract_typed" | b"extract_many", 3) => true,
         (b"rerank" | b"rerank_for", 2 | 3) => true,
+        (b"semantic_similarity", 2) => true,
         _ => false,
     };
     if !native {

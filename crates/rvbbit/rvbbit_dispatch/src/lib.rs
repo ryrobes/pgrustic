@@ -24,7 +24,8 @@ use std::time::Duration;
 use rvbbit_contract::{
     cache_header, client_cache_key_hex, BatchRequest, BatchResponse, CacheKeyParts,
     CacheLookupRequest, CacheLookupResponse, CacheMode, CallMeter, DecisionStack, ItemRequest,
-    Operation, CONTRACT_VERSION, HEADER_AUTHORIZATION, HEADER_CACHE, HEADER_CONTRACT,
+    Operation, ABOUT_THRESHOLD, CONTRACT_VERSION, EMBED_MODEL, HEADER_AUTHORIZATION, HEADER_CACHE,
+    HEADER_CONTRACT,
 };
 use rvbbit_tree::{AskAns, AskReq, ChoiceAns, ChoiceReq, Decisions};
 use rvbbit_oids::POOL_THREADS;
@@ -358,6 +359,149 @@ pub fn means_score(func_oid: u32, input: &str, criterion: &str) -> PgResult<f64>
     )?;
     let raw = wait_raw(ticket)?;
     decode_score(&raw.body).map_err(pg)
+}
+
+/// ABOUT: embed the row and the criterion, then cosine against
+/// [`ABOUT_THRESHOLD`] or the function threshold. One `/v1/embed` carries
+/// every distinct text in the batch. The query embedding is cached with
+/// the row embeddings, keyed by text and model.
+pub fn about_batch(func_oid: u32, items: &[(String, String)]) -> PgResult<BatchReply> {
+    if items.is_empty() {
+        return Ok(BatchReply { matched: Vec::new(), http_calls: 0 });
+    }
+    let ep = rvbbit_resolve::endpoint_for(func_oid);
+    let threshold = ep.threshold.unwrap_or(ABOUT_THRESHOLD);
+    let (map, http_calls) = embed_map(&ep, pair_texts(items))?;
+    let matched = items
+        .iter()
+        .map(|(left, right)| {
+            let a = map.get(left).map(Vec::as_slice).unwrap_or(&[]);
+            let b = map.get(right).map(Vec::as_slice).unwrap_or(&[]);
+            rvbbit_contract::cosine(a, b) >= threshold
+        })
+        .collect();
+    Ok(BatchReply { matched, http_calls })
+}
+
+/// Cosine of each pair. Texts are embedded once per distinct value.
+pub fn similarity_many(pairs: &[(String, String)]) -> PgResult<ManyReply> {
+    if pairs.is_empty() {
+        return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
+    }
+    let ep = embed_source_endpoint();
+    let (map, http_calls) = embed_map(&ep, pair_texts(pairs))?;
+    let mut values = Vec::with_capacity(pairs.len());
+    for (left, right) in pairs {
+        let a = map.get(left).map(Vec::as_slice).unwrap_or(&[]);
+        let b = map.get(right).map(Vec::as_slice).unwrap_or(&[]);
+        values.push(Ok(rvbbit_contract::cosine(a, b).to_string()));
+    }
+    Ok(ManyReply { values, http_calls })
+}
+
+pub fn scalar_key_similarity() -> String {
+    let ep = embed_source_endpoint();
+    format!("sim\u{1e}{}", embed_model_name(&ep.model))
+}
+
+fn pair_texts(items: &[(String, String)]) -> Vec<String> {
+    let mut texts = Vec::new();
+    for (left, right) in items {
+        if !texts.iter().any(|t| t == left) {
+            texts.push(left.clone());
+        }
+        if !texts.iter().any(|t| t == right) {
+            texts.push(right.clone());
+        }
+    }
+    texts
+}
+
+fn embed_map(ep: &Endpoint, texts: Vec<String>) -> PgResult<(HashMap<String, Vec<f64>>, u32)> {
+    let (vectors, http_calls) = embed_vectors(ep, &texts)?;
+    let mut map = HashMap::new();
+    for (text, vector) in texts.into_iter().zip(vectors) {
+        map.insert(text, vector);
+    }
+    Ok((map, http_calls))
+}
+
+fn embed_vectors(ep: &Endpoint, texts: &[String]) -> PgResult<(Vec<Vec<f64>>, u32)> {
+    if texts.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let ep = embed_endpoint(ep);
+    let inputs: Vec<serde_json::Value> = texts.iter().map(|text| serde_json::json!({ "input": text })).collect();
+    let body = encode_items(&ep, Operation::Embed, &inputs).map_err(pg)?;
+    let raw = post_op(&ep, "embed", body)?;
+    let parsed = parsed_batch(&raw.body).map_err(pg)?;
+    if parsed.outputs.len() != texts.len() {
+        return Err(pg(format!(
+            "hutch embed returned {} vectors for {} texts",
+            parsed.outputs.len(),
+            texts.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(texts.len());
+    for (i, item) in parsed.outputs.iter().enumerate() {
+        if let Some(err) = &item.error {
+            return Err(pg(format!("hutch embed item {i}: {} {}", err.code, err.message)));
+        }
+        let Some(vector) = item.value.as_ref().and_then(json_vector) else {
+            return Err(pg(format!("hutch embed item {i} has no vector")));
+        };
+        out.push(vector);
+    }
+    Ok((out, raw.http_calls))
+}
+
+fn json_vector(value: &serde_json::Value) -> Option<Vec<f64>> {
+    let rows = value.as_array()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(row.as_f64()?);
+    }
+    Some(out)
+}
+
+fn embed_source_endpoint() -> Endpoint {
+    let oid = rvbbit_resolve::func_oid("about")
+        .or_else(|| rvbbit_resolve::func_oid("means"))
+        .unwrap_or(rvbbit_oids::MEANS_OID);
+    rvbbit_resolve::endpoint_for(oid)
+}
+
+fn embed_endpoint(ep: &Endpoint) -> Endpoint {
+    let mut out = ep.clone();
+    out.fn_name = "embed".into();
+    out.fn_version = 1;
+    out.system_prompt.clear();
+    out.user_prompt.clear();
+    out.labels.clear();
+    out.label_descriptions.clear();
+    out.threshold = None;
+    out.default_clauses = None;
+    out.extract_mode = None;
+    out.arg_names = vec!["input".into()];
+    out.return_type = "vector".into();
+    out.user_fn = false;
+    out.model = embed_model_name(&ep.model);
+    out.temperature = 0.0;
+    out.max_tokens = None;
+    out
+}
+
+fn embed_model_name(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("mock")
+        || trimmed.eq_ignore_ascii_case("default")
+        || trimmed.eq_ignore_ascii_case("jev")
+    {
+        EMBED_MODEL.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn cache_mode_of(ep: &Endpoint) -> CacheMode {
@@ -1247,6 +1391,11 @@ fn decode_text_items(text: &str) -> Result<Vec<Result<String, String>>, String> 
 
 /// One pair through the pool. Used by the per-row builtin fallback.
 pub fn means_oid(func_oid: u32, input: &str, criterion: &str) -> PgResult<bool> {
+    let ep = rvbbit_resolve::endpoint_for(func_oid);
+    if ep.fn_name.eq_ignore_ascii_case("about") {
+        let reply = about_batch(func_oid, &[(input.to_string(), criterion.to_string())])?;
+        return Ok(reply.matched.first().copied().unwrap_or(false));
+    }
     let ticket = submit(func_oid, &[(input.to_string(), criterion.to_string())])?;
     let got = wait(ticket)?;
     Ok(got.matched.first().copied().unwrap_or(false))

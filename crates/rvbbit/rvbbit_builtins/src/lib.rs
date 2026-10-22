@@ -15,7 +15,7 @@ use rvbbit_oids::{
     GETDEF_OID, MEANS_NAME, MEANS_OID, MEANS_SCORE_NAME, MEANS_SCORE_OID, RERANK_FOR_NAME,
     RERANK_FOR_OID, RERANK_NAME, RERANK_OID, RESTORE_NAME, RESTORE_OID, SUMMARIZE_FINAL_NAME,
     SUMMARIZE_FINAL_OID, SUMMARIZE_TEXT_NAME, SUMMARIZE_TEXT_OID, SUMMARIZE_TRANS_NAME,
-    SUMMARIZE_TRANS_OID, USER_NAME, USER_OID,
+    SUMMARIZE_TRANS_OID, USER_NAME, USER_OID, SIMILARITY_NAME, SIMILARITY_OID,
 };
 use types_error::PgResult;
 use types_fmgr::{
@@ -295,6 +295,29 @@ fn rerank_datum(fcinfo: &mut Fcinfo, model: &str) -> PgResult<Datum> {
         })?
     };
     Ok(Datum::from_f64(score))
+}
+
+/// Cosine of the two texts' embeddings. The project batcher fills the
+/// memo first; a miss embeds on its own.
+pub fn rvbbit_semantic_similarity(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    rvbbit_resolve::ensure()?;
+    let left = arg_text(fcinfo, 0)?.unwrap_or_default();
+    let right = arg_text(fcinfo, 1)?.unwrap_or_default();
+    let key = rvbbit_dispatch::scalar_key_similarity();
+    let input = format!("{left}\u{1e}{right}");
+    if let Some(hit) = rvbbit_dispatch::recall_scalar(&key, &input) {
+        return score_hit(hit);
+    }
+    let reply = rvbbit_dispatch::similarity_many(&[(left, right)])?;
+    let text = reply
+        .values
+        .into_iter()
+        .next()
+        .ok_or_else(|| Box::new(types_error::PgError::error("semantic_similarity returned no score")) as Box<types_error::PgError>)?
+        .map_err(|message| Box::new(types_error::PgError::error(message)) as Box<types_error::PgError>)?;
+    text.parse::<f64>()
+        .map(Datum::from_f64)
+        .map_err(|_| Box::new(types_error::PgError::error("semantic_similarity returned no score")) as Box<types_error::PgError>)
 }
 
 fn score_hit(hit: rvbbit_dispatch::ScalarHit) -> PgResult<Datum> {
@@ -717,5 +740,13 @@ pub static MEANS_BUILTINS: &[FmgrBuiltin] = &[
         strict: false,
         retset: false,
         func: rvbbit_clause_text as PGFunction,
+    },
+    FmgrBuiltin {
+        foid: SIMILARITY_OID,
+        name: SIMILARITY_NAME,
+        nargs: 2,
+        strict: true,
+        retset: false,
+        func: rvbbit_semantic_similarity as PGFunction,
     },
 ];

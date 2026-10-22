@@ -308,11 +308,19 @@ CREATE SEMANTIC OPERATOR means (
 ```
 
 The operator value wins when both are set. An absent operator uses the
-function threshold. Both absent means the server default. The first
-`ensure` also creates `about` as a copy of `means`
-with `THRESHOLD 0.9`. 0.9 still matches a criterion that scores 0.92, so
-raise it when a loose predicate should reject those rows. Replacing
-`means` does not refresh `about`.
+function threshold. Both absent means the server default.
+
+`ABOUT` does not use that noul cutoff. It embeds the row and the
+criterion (`POST /v1/embed`, model `openai/text-embedding-3-small`) and
+keeps the row when cosine similarity is at least 0.40. That default is
+the gap on the mock embedding fixtures: a biped note against `biped`
+scores about 0.54, and an invoice against `biped` scores about 0.26.
+`rvbbit.semantic_similarity(a, b)` returns the cosine. An inner join
+`WHERE a.body ABOUT b.note` is batched the same way as a scan filter.
+Vectors are cached per normalized text and model, so the criterion is
+embedded once and reused. Cost is an `embed` row in `rvbbit.calls` and
+an M8 `Semantic USD` line priced at $0.02 per million input tokens
+(32-token seed per text until a call row replaces it).
 
 Catalog `EXTRACT` still requires JSON. `extract_mode = scalar` on an
 item accepts a JSON scalar or plain text and caches that string. A JSON

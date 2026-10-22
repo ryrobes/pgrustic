@@ -304,6 +304,9 @@ fn classify(oid: u32, name: &str, in_qual: bool, in_agg: bool) -> Option<(Op, bo
         }
         if rvbbit_resolve::is_semantic_func(oid) {
             let ep = rvbbit_resolve::endpoint_for(oid);
+            if ep.fn_name.eq_ignore_ascii_case("about") || name_is(name, &["about"]) {
+                return Some((Op::Embed, in_qual, 1.0, grouping));
+            }
             if ep.user_prompt.starts_with(rvbbit_resolve::TREE_PREFIX) {
                 return Some((Op::Decide, false, 3.0, grouping));
             }
@@ -342,6 +345,10 @@ fn classify(oid: u32, name: &str, in_qual: bool, in_agg: bool) -> Option<(Op, bo
         }
         _ if name_is(name, &["summarize", "rvbbit_summarize", "rvbbit_summarize_text"]) => {
             Some((Op::Summarize, false, 1.0, Grouping::PerGroup))
+        }
+        _ if name_is(name, &["about"]) => Some((Op::Embed, in_qual, 1.0, grouping)),
+        _ if name_is(name, &["semantic_similarity", "rvbbit_semantic_similarity"]) => {
+            Some((Op::Embed, false, 2.0, grouping))
         }
         _ => None,
     }

@@ -43,6 +43,7 @@ fn harness_rerank(api_key: Option<&str>, rerank_model: &str) -> Harness {
         default_model: "openai/gpt-4o-mini".into(),
         decision_model: "typesafe/jev-1.14".into(),
         rerank_model: rerank_model.to_string(),
+        embed_model: "openai/text-embedding-3-small".into(),
         decision_takes: 1,
         decision_combine: "mean".into(),
         decision_threshold: 0.5,
@@ -179,6 +180,46 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
     }
 }
 
+fn openrouter_embed_payload(text: &str) -> (u16, String) {
+    if text.contains("LEAK") {
+        return (500, r#"{"error":{"message":"echo leaked"}}"#.into());
+    }
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (400, r#"{"error":{"message":"embed json"}}"#.into());
+    };
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or(rvbbit_contract::EMBED_MODEL);
+    let inputs: Vec<String> = match body.get("input") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(rows)) => rows
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        _ => return (400, r#"{"error":{"message":"embed input"}}"#.into()),
+    };
+    let mut data = Vec::new();
+    let mut tokens = 0u64;
+    for (index, input) in inputs.iter().enumerate() {
+        tokens += 32;
+        data.push(serde_json::json!({
+            "object": "embedding",
+            "index": index,
+            "embedding": rvbbit_contract::mock_embedding(input),
+        }));
+    }
+    let payload = serde_json::json!({
+        "id": "embd-test",
+        "object": "list",
+        "model": model,
+        "data": data,
+        "usage": {
+            "prompt_tokens": tokens,
+            "total_tokens": tokens,
+            "cost": tokens as f64 * rvbbit_contract::EMBED_USD_PER_MILLION / 1_000_000.0
+        }
+    });
+    (200, payload.to_string())
+}
+
 fn openrouter_rerank_payload(text: &str) -> (u16, String) {
     if text.contains("LEAK") {
         return (500, format!(r#"{{"error":{{"message":"echo leaked"}}}}"#));
@@ -219,6 +260,9 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
     let request = header.lines().next().unwrap_or("");
     if request.contains("/rerank") {
         return openrouter_rerank_payload(text);
+    }
+    if request.contains("/embeddings") {
+        return openrouter_embed_payload(text);
     }
     if text.contains("LEAK") {
         return (500, format!("{{\"error\":{{\"message\":\"echo {auth}\"}}}}"));
@@ -543,12 +587,56 @@ fn predict_extract_cache_and_errors() {
     assert_eq!(mixed.outputs[1].error.as_ref().unwrap().code, "parse");
 
     let embed = post(&format!("{}/v1/embed", h.hutch), "off", &predict("TRUE_CASE", "x"));
-    assert_eq!(embed.outputs[0].error.as_ref().unwrap().code, "unsupported");
+    assert!(embed.outputs[0].error.is_none(), "{:?}", embed.outputs[0].error);
+    let vector = embed.outputs[0].value.as_ref().unwrap().as_array().unwrap();
+    assert!(vector.len() > 1, "embed returns a vector");
 
     let before = h.provider_hits.load(Ordering::SeqCst);
     let _ = post(&format!("{}/v1/predict", h.hutch), "off", &predict("TRUE_CASE", "biped"));
     let _ = post(&format!("{}/v1/predict", h.hutch), "off", &predict("TRUE_CASE", "biped"));
     assert_eq!(h.provider_hits.load(Ordering::SeqCst), before + 2, "mode=off does not cache");
+}
+
+#[test]
+fn embed_caches_one_vector_per_text_and_model() {
+    let h = harness(Some("test-key"));
+    let mut first = predict("large hairy biped crossed the road", "ignored");
+    first.operation = Operation::Embed;
+    first.model = "openai/text-embedding-3-small".into();
+    first.items[0].cache_key = "client-key-a".into();
+    let url = format!("{}/v1/embed", h.hutch);
+    let got = post(&url, "read-write", &first);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    let call = &got.outputs[0].calls.as_ref().unwrap()[0];
+    assert_eq!(call.op, "embed");
+    assert!(call.cost_usd.unwrap() > 0.0, "embed records USD");
+    assert_eq!(call.cache, "miss");
+    let again = {
+        let mut second = first.clone();
+        second.items[0].cache_key = "client-key-b".into();
+        post(&url, "read-write", &second)
+    };
+    assert_eq!(again.outputs[0].calls.as_ref().unwrap()[0].cache, "hit");
+    assert_eq!(again.outputs[0].value, got.outputs[0].value);
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), 1, "same text and model is one embeddings call");
+
+    let mut other = first.clone();
+    other.items[0].inputs = serde_json::json!({"input": "invoice 12 for services rendered"});
+    other.items[0].cache_key = "client-key-c".into();
+    let invoice = post(&url, "read-write", &other);
+    let left = got.outputs[0].value.as_ref().unwrap();
+    let right = invoice.outputs[0].value.as_ref().unwrap();
+    let left: Vec<f64> = left.as_array().unwrap().iter().map(|n| n.as_f64().unwrap()).collect();
+    let right: Vec<f64> = right.as_array().unwrap().iter().map(|n| n.as_f64().unwrap()).collect();
+    let score = rvbbit_contract::cosine(&left, &right);
+    assert!(score < rvbbit_contract::ABOUT_THRESHOLD, "unrelated cosine {score}");
+    assert_eq!(h.provider_hits.load(Ordering::SeqCst), 2);
+
+    let logged = calls_of(&h.hutch, 8);
+    assert!(
+        logged.iter().any(|row| row["op"] == "embed" && row["cost_usd"].as_f64().unwrap_or(0.0) > 0.0),
+        "{logged:?}"
+    );
 }
 
 #[test]
@@ -999,6 +1087,7 @@ fn spawn_hutch(store: &str, dir: &std::path::Path) -> Spawned {
         default_model: "openai/gpt-4o-mini".into(),
         decision_model: "typesafe/jev-1.14".into(),
         rerank_model: String::new(),
+        embed_model: "openai/text-embedding-3-small".into(),
         decision_takes: 1,
         decision_combine: "mean".into(),
         decision_threshold: 0.5,

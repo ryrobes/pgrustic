@@ -1257,6 +1257,17 @@ fn ensure_schema() -> PgResult<()> {
             ))?;
         }
     }
+    if scalar(
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'rvbbit' AND p.proname = 'semantic_similarity'",
+    )?
+    .is_none()
+    {
+        exec(
+            "CREATE FUNCTION rvbbit.semantic_similarity(a text, b text) RETURNS float8 \
+             LANGUAGE internal STRICT VOLATILE PARALLEL UNSAFE COST 1000000 AS 'rvbbit_semantic_similarity'",
+        )?;
+    }
     ensure_m6_ops()?;
     if scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
@@ -1920,44 +1931,50 @@ pub fn hutch_urls() -> PgResult<Vec<String>> {
     Ok(urls)
 }
 
-/// `about` is MEANS with a higher noul cutoff. Broad criteria score in
-/// the 0.9s, so the server default of 0.5 matches them. Copy the current
-/// `means` row the first time so ABOUT uses the same model and prompts.
+/// `about` embeds both sides and keeps a row when cosine similarity is at
+/// least 0.40. That cutoff is the gap measured on the mock embedding
+/// fixtures (`rvbbit_contract::ABOUT_THRESHOLD`): related notes sit above
+/// it and invoices sit below it. A row that already uses an embedding
+/// model is left alone, so a changed threshold sticks. A leftover noul
+/// copy (the old 0.9 means clone) is replaced.
 fn ensure_about() -> PgResult<()> {
-    if scalar("SELECT 1 FROM rvbbit.semfn WHERE nsp = 'rvbbit' AND name = 'about'")?.is_some() {
+    if let Some(kind) = scalar(
+        "SELECT COALESCE(m.kind, '') FROM rvbbit.semfn f \
+         LEFT JOIN rvbbit.model m ON m.name = f.model_name \
+         WHERE f.nsp = 'rvbbit' AND f.name = 'about'",
+    )? {
+        if kind == "embedding" {
+            return Ok(());
+        }
+    }
+    if scalar("SELECT 1 FROM rvbbit.backend WHERE name = 'hutch'")?.is_none() {
         return Ok(());
     }
-    let rows = query(
-        "SELECT model_name, system_prompt, user_prompt, max_tokens::text, temperature::text, \
-                cache_mode, argnames::text, argtypes::text, rettype \
-         FROM rvbbit.semfn WHERE nsp = 'rvbbit' AND name = 'means'",
-    )?;
-    let Some(r) = rows.into_iter().next() else {
-        return Ok(());
-    };
-    let names = parse_pg_array(&cell(&r, 6));
-    let types = parse_pg_array(&cell(&r, 7));
-    if names.len() != types.len() || names.is_empty() {
-        return Ok(());
-    }
+    apply(Command::CreateModel {
+        or_replace: false,
+        if_not_exists: true,
+        embedding: true,
+        name: "embed".into(),
+        backend: "hutch".into(),
+        remote: "openai/text-embedding-3-small".into(),
+        dimensions: Some(1536),
+        cost_input: Some(0.02),
+        cost_output: Some(0.0),
+        version: Some(1),
+    })?;
     let mut clauses = FnClauses::default();
-    clauses.model = cell_opt(&r, 0);
-    clauses.system = cell_opt(&r, 1);
-    clauses.prompt = cell_opt(&r, 2);
-    clauses.max_tokens = cell_opt(&r, 3).and_then(|s| s.parse().ok());
-    clauses.temperature = cell_opt(&r, 4).and_then(|s| s.parse().ok());
-    clauses.cache = cell_opt(&r, 5);
-    clauses.threshold = Some(0.9);
-    let args = names
-        .into_iter()
-        .zip(types)
-        .map(|(name, typ)| Arg { name, typ })
-        .collect();
+    clauses.model = Some("embed".into());
+    clauses.temperature = Some(0.0);
+    clauses.cache = Some("memoize".into());
+    clauses.threshold = Some(0.40);
     apply(Command::CreateFunction {
         or_replace: true,
         name: "about".into(),
-        args,
-        returns: cell(&r, 8),
+        args: vec![
+            Arg { name: "text".into(), typ: "text".into() },
+            Arg { name: "criterion".into(), typ: "text".into() },
+        ],
+        returns: "boolean".into(),
         clauses,
     })?;
     apply(Command::CreateOperator {

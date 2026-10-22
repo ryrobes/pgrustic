@@ -121,12 +121,14 @@ enum Kind {
     ExtractMany,
     Rerank,
     User,
+    Similarity,
 }
 
 fn accepts_project(kind: Kind, nargs: usize) -> bool {
     match kind {
         Kind::Rerank => nargs == 2 || nargs == 3,
         Kind::User => (1..=8).contains(&nargs),
+        Kind::Similarity => nargs == 2,
         _ => nargs == 3,
     }
 }
@@ -141,6 +143,7 @@ fn project_kind<'mcx>(mcx: Mcx<'mcx>, funcid: Oid) -> PgResult<Option<Kind>> {
         "extract_typed" => Some(Kind::Extract),
         "extract_many" => Some(Kind::ExtractMany),
         "rerank" | "rerank_for" => Some(Kind::Rerank),
+        "semantic_similarity" => Some(Kind::Similarity),
         _ => None,
     };
     let nsp = get_func_namespace(funcid)?;
@@ -172,6 +175,7 @@ enum PendingCall {
     ExtractMany { key: String, kind: String, input: String },
     Rerank { key: String, model: String, query: String, input: String },
     User { oid: u32, values: Vec<String> },
+    Similarity { left: String, right: String },
 }
 
 struct Pending {
@@ -481,6 +485,15 @@ impl<'mcx> ProjectState<'mcx> {
             let first = texts.first().cloned().flatten();
             let second = texts.get(1).cloned().flatten();
             let extra = texts.get(2).cloned().flatten().unwrap_or_default();
+            if matches!(site.kind, Kind::Similarity) {
+                match (texts.first().cloned().flatten(), texts.get(1).cloned().flatten()) {
+                    (Some(left), Some(right)) => {
+                        calls.push(Some(PendingCall::Similarity { left, right }));
+                    }
+                    _ => calls.push(None),
+                }
+                continue;
+            }
             if matches!(site.kind, Kind::User) {
                 if texts.iter().any(|text| text.is_none()) {
                     calls.push(None);
@@ -591,6 +604,18 @@ impl<'mcx> ProjectState<'mcx> {
                         });
                         group.inputs.push(input.clone());
                     }
+                    PendingCall::Similarity { left, right } => {
+                        let key = rvbbit_dispatch::scalar_key_similarity();
+                        let group = grouped.entry(key).or_insert_with(|| Group {
+                            labels: None,
+                            kind: None,
+                            lists: false,
+                            rerank: None,
+                            inputs: Vec::new(),
+                            user_rows: Vec::new(),
+                        });
+                        group.user_rows.push(vec![left.clone(), right.clone()]);
+                    }
                     PendingCall::User { oid, values } => {
                         let key = rvbbit_dispatch::user_memo_key(*oid);
                         let group = grouped.entry(key).or_insert_with(|| Group {
@@ -622,6 +647,31 @@ impl<'mcx> ProjectState<'mcx> {
                     }
                 }
                 self.memo_hits += (group.user_rows.len() - unique.len()) as u64;
+                if key.starts_with("sim\u{1e}") {
+                    let pairs: Vec<(String, String)> = unique
+                        .iter()
+                        .map(|row| (row.first().cloned().unwrap_or_default(), row.get(1).cloned().unwrap_or_default()))
+                        .collect();
+                    let reply = rvbbit_dispatch::similarity_many(&pairs)?;
+                    self.http_calls += reply.http_calls as u64;
+                    if reply.values.len() != unique.len() {
+                        return Err(err(format!(
+                            "semantic batch returned {} values for {} inputs",
+                            reply.values.len(),
+                            unique.len()
+                        )));
+                    }
+                    for (row, value) in unique.iter().zip(reply.values.into_iter()) {
+                        let input = row.join("\u{1e}");
+                        let hit = match value {
+                            Ok(text) => rvbbit_dispatch::ScalarHit::Value(text),
+                            Err(message) => rvbbit_dispatch::ScalarHit::Failed(message),
+                        };
+                        rvbbit_dispatch::remember_scalar(key, &input, hit);
+                        forget.0.push((key.clone(), input));
+                    }
+                    continue;
+                }
                 let reply = rvbbit_dispatch::user_eval_many(oid, &unique)?;
                 self.http_calls += reply.http_calls as u64;
                 if reply.values.len() != unique.len() {

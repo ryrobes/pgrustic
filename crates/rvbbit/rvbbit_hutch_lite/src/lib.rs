@@ -7,7 +7,9 @@
 //! label set, still call an OpenAI-compatible chat endpoint. Rerank is a
 //! noul relevance score on the decision model unless the request or
 //! `HUTCH_RERANK_MODEL` names a dedicated OpenRouter reranker.
-//! Embed is rejected per item.
+//! Embed posts one OpenRouter `{base}/embeddings` for the cache misses in
+//! the batch (`openai/text-embedding-3-small` unless the request names
+//! another slug). Vectors are cached per normalized text and model.
 //! `TAKES` / `PICK` are not parsed in SQL; a request may still send
 //! `decision` to stack models or repeats.
 //!
@@ -29,9 +31,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rvbbit_contract::{
-    BatchRequest, BatchResponse, CacheHit, CacheLookupRequest, CacheLookupResponse, CacheMode,
-    CachePurgeRequest, CachePurgeResponse, CachePutRequest, CachePutResponse, CacheStatsResponse,
-    CallMeter, DecisionStack, ItemError, ItemRequest, ItemResponse, Operation, CONTRACT_VERSION,
+    client_cache_key_hex, BatchRequest, BatchResponse, CacheHit, CacheKeyParts, CacheLookupRequest,
+    CacheLookupResponse, CacheMode, CachePurgeRequest, CachePurgeResponse, CachePutRequest,
+    CachePutResponse, CacheStatsResponse, CallMeter, DecisionStack, ItemError, ItemRequest,
+    ItemResponse, Operation, CONTRACT_VERSION, EMBED_MODEL, EMBED_USD_PER_MILLION,
     PATH_CACHE_LOOKUP, PATH_CACHE_PURGE, PATH_CACHE_PUT, PATH_CACHE_STATS,
 };
 
@@ -71,6 +74,10 @@ pub struct Config {
     /// the noul fallback. `nvidia/nemotron-3.5-rerank-8b:free` and
     /// `voyageai/rerank-3` call OpenRouter `POST /rerank`.
     pub rerank_model: String,
+    /// Embeddings slug (`HUTCH_EMBED_MODEL`). Empty, `mock`, `default`,
+    /// and `jev` on a request use this. Default is
+    /// `openai/text-embedding-3-small`.
+    pub embed_model: String,
     pub decision_takes: u32,
     /// `mean` or `vote`.
     pub decision_combine: String,
@@ -143,6 +150,10 @@ impl Config {
             decision_model: std::env::var("HUTCH_DECISION_MODEL")
                 .unwrap_or_else(|_| DEFAULT_DECISION_MODEL.to_string()),
             rerank_model: std::env::var("HUTCH_RERANK_MODEL").unwrap_or_default(),
+            embed_model: std::env::var("HUTCH_EMBED_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| EMBED_MODEL.to_string()),
             decision_takes,
             decision_combine: if combine == "vote" { "vote".into() } else { "mean".into() },
             decision_threshold,
@@ -507,6 +518,276 @@ fn dedicated_rerank_slug(decision_model: &str, env_model: &str, requested: &str)
     }
 }
 
+fn choose_embed_model(cfg: &Config, requested: &str) -> String {
+    let requested = requested.trim();
+    if requested.is_empty()
+        || requested == "mock"
+        || requested == "default"
+        || requested.eq_ignore_ascii_case("jev")
+    {
+        cfg.embed_model.clone()
+    } else {
+        requested.to_string()
+    }
+}
+
+/// Storage key for one text and model. The client cache key is ignored so
+/// ABOUT and `semantic_similarity` share a vector.
+fn embed_storage(model: &str, text: &str, tenant: &str) -> String {
+    let norm = rvbbit_contract::normalize_embed_text(text);
+    let inputs = serde_json::json!({ "input": norm });
+    let hex = client_cache_key_hex(&CacheKeyParts {
+        fn_name: "embed",
+        fn_version: 1,
+        system_prompt: "",
+        user_prompt: "",
+        return_schema: "vector",
+        model,
+        temperature: 0.0,
+        max_tokens: None,
+        take_index: 0,
+        seed: "",
+        opts: &serde_json::json!({}),
+        threshold: None,
+        extract_mode: "",
+        inputs: &inputs,
+    });
+    storage_for(&hex, tenant, None, &[], &[])
+}
+
+fn embed_item_text(item: &ItemRequest) -> String {
+    json_str(&item.inputs, "input")
+        .or_else(|| json_str(&item.inputs, "text"))
+        .unwrap_or_else(|| item.inputs.to_string())
+}
+
+/// One OpenRouter `POST /embeddings` for every distinct text that missed
+/// the per-text cache. `value` is the vector. Cost is the provider
+/// `usage.cost`, or tokens times the published $0.02 per million.
+fn embed_via_openrouter(
+    server: &Server,
+    tenant: &str,
+    mode: ParsedCache,
+    req: &BatchRequest,
+) -> BatchResponse {
+    let model = choose_embed_model(&server.cfg, &req.model);
+    let ttl = mode.ttl.unwrap_or(server.cfg.default_ttl);
+    let mut outputs = Vec::with_capacity(req.items.len());
+    let mut pending: Vec<EmbedPending> = Vec::new();
+    for (index, item) in req.items.iter().enumerate() {
+        let text = embed_item_text(item);
+        if rvbbit_contract::normalize_embed_text(&text).is_empty() {
+            outputs.push(scored_item(
+                item,
+                Scored::from_calls(serde_json::json!([]), None, None, Vec::new()),
+            ));
+            continue;
+        }
+        let storage = embed_storage(&model, &text, tenant);
+        if mode.mode == CacheMode::ReadWrite {
+            let started = Instant::now();
+            let hit = {
+                let mut cache = lock(&server.cache);
+                fresh(server, &mut cache, &storage).map(|hit| {
+                    cache.hits += 1;
+                    hit
+                })
+            };
+            if let Some(hit) = hit {
+                let scored = meter_cached(server, Operation::Embed, tenant, &hit, "hit", started, item.node.clone());
+                outputs.push(scored_item(item, scored));
+                continue;
+            }
+        }
+        pending.push(EmbedPending {
+            index,
+            storage,
+            text: rvbbit_contract::normalize_embed_text(&text),
+            node: item.node.clone(),
+        });
+        outputs.push(ItemResponse {
+            key: item.key.clone(),
+            value: None,
+            score: None,
+            scores: None,
+            calls: None,
+            error: Some(item_err("provider", "embed pending")),
+            identical_takes: None,
+        });
+    }
+    if pending.is_empty() {
+        return BatchResponse {
+            contract: CONTRACT_VERSION.to_string(),
+            outputs,
+        };
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for (slot, row) in pending.iter().enumerate() {
+        if let Some((_, group)) = seen.iter().find(|(text, _)| text == &row.text) {
+            groups[*group].push(slot);
+        } else {
+            seen.push((row.text.clone(), groups.len()));
+            groups.push(vec![slot]);
+        }
+    }
+    let unique: Vec<String> = groups
+        .iter()
+        .map(|slots| pending[slots[0]].text.clone())
+        .collect();
+    let node = pending.iter().find_map(|row| row.node.clone());
+    match post_openrouter_embed(server, tenant, &model, &unique, node) {
+        Ok((vectors, meter)) => {
+            let n_out = pending.len().max(1);
+            for (offset, slots) in groups.iter().enumerate() {
+                let vector = &vectors[offset];
+                for slot in slots {
+                    let row = &pending[*slot];
+                    let mut call = meter.clone();
+                    call.score = None;
+                    call.items = u32::try_from(n_out).unwrap_or(u32::MAX);
+                    if n_out > 1 {
+                        if let Some(cost) = call.cost_usd {
+                            call.cost_usd = Some(cost / n_out as f64);
+                        }
+                        if let Some(tokens) = call.tokens_in {
+                            call.tokens_in = Some(tokens / n_out as u64);
+                        }
+                    }
+                    let scored = Scored::from_calls(serde_json::json!(vector), None, None, vec![call]);
+                    if mode.mode != CacheMode::Off {
+                        store(server, &row.storage, &scored, ttl);
+                    }
+                    outputs[row.index] = scored_item(&req.items[row.index], scored);
+                }
+            }
+        }
+        Err(err) => {
+            for row in &pending {
+                outputs[row.index].error = Some(err.clone());
+            }
+        }
+    }
+    BatchResponse {
+        contract: CONTRACT_VERSION.to_string(),
+        outputs,
+    }
+}
+
+struct EmbedPending {
+    index: usize,
+    storage: String,
+    text: String,
+    node: Option<String>,
+}
+
+fn post_openrouter_embed(
+    server: &Server,
+    tenant: &str,
+    model: &str,
+    texts: &[String],
+    node: Option<String>,
+) -> Result<(Vec<Vec<f64>>, CallMeter), ItemError> {
+    if texts.is_empty() {
+        return Err(item_err("invalid", "embed needs text"));
+    }
+    let url = format!("{}/embeddings", server.cfg.openai_base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "input": texts,
+    });
+    let payload = serde_json::to_string(&body).map_err(|e| item_err("provider", &e.to_string()))?;
+    {
+        let mut cache = lock(&server.cache);
+        cache.provider_calls += 1;
+        cache.misses += 1;
+    }
+    let started = Instant::now();
+    let text = match post_json(&server.cfg, &server.agent, &url, &payload) {
+        Ok(text) => text,
+        Err(message) => {
+            let ms = elapsed_ms(started);
+            let meter = miss_meter(
+                Operation::Embed,
+                tenant,
+                model,
+                &ProviderUsage::default(),
+                ms,
+                ms,
+                node,
+                None,
+            );
+            record_call(server, &meter);
+            return Err(item_err("provider", &message));
+        }
+    };
+    let provider_ms = elapsed_ms(started);
+    let mut usage = usage_from_body(&text);
+    if usage.model.is_none() {
+        usage.model = Some(model.to_string());
+    }
+    if usage.cost_usd.is_none() {
+        fill_generation(server, &mut usage);
+    }
+    if usage.cost_usd.is_none() {
+        if let Some(tokens) = usage.tokens_in.or(usage.tokens_out) {
+            usage.cost_usd = Some(tokens as f64 * EMBED_USD_PER_MILLION / 1_000_000.0);
+        }
+    }
+    let latency_ms = elapsed_ms(started);
+    let mut meter = miss_meter(
+        Operation::Embed,
+        tenant,
+        model,
+        &usage,
+        provider_ms,
+        latency_ms,
+        node,
+        None,
+    );
+    meter.items = u32::try_from(texts.len()).unwrap_or(u32::MAX);
+    record_call(server, &meter);
+    let vectors = parse_embeddings(&text, texts.len()).map_err(|message| item_err("parse", &message))?;
+    Ok((vectors, meter))
+}
+
+fn parse_embeddings(body: &str, n: usize) -> Result<Vec<Vec<f64>>, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("embed json: {e}"))?;
+    if let Some(msg) = v.pointer("/error/message").and_then(|m| m.as_str()) {
+        return Err(format!("upstream error: {msg}"));
+    }
+    let data = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or("embeddings response has no data")?;
+    let mut out: Vec<Option<Vec<f64>>> = vec![None; n];
+    for (fallback, row) in data.iter().enumerate() {
+        let index = row.get("index").and_then(|i| i.as_u64()).unwrap_or(fallback as u64) as usize;
+        let nums = row
+            .get("embedding")
+            .and_then(|e| e.as_array())
+            .ok_or("embedding missing")?;
+        let mut vector = Vec::with_capacity(nums.len());
+        for number in nums {
+            let Some(x) = number.as_f64() else {
+                return Err("embedding is not a numeric vector".into());
+            };
+            vector.push(x);
+        }
+        if vector.is_empty() {
+            return Err("embedding is empty".into());
+        }
+        if index >= n {
+            return Err(format!("embedding index {index} is outside {n} texts"));
+        }
+        out[index] = Some(vector);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, vector)| vector.ok_or_else(|| format!("embedding missing vector {i}")))
+        .collect()
+}
+
 /// One OpenRouter `POST /rerank` for every document that shares a query.
 /// Jev noul does not come through here.
 fn rerank_via_openrouter(
@@ -720,6 +1001,9 @@ fn run_batch(
     req: &BatchRequest,
     audit: bool,
 ) -> BatchResponse {
+    if operation == Operation::Embed {
+        return embed_via_openrouter(server, tenant, mode, req);
+    }
     if operation == Operation::Rerank {
         if let Some(model) = dedicated_rerank_model(&server.cfg, &req.model) {
             return rerank_via_openrouter(server, tenant, mode, req, &model);
@@ -806,7 +1090,7 @@ fn run_item(
     }
     match operation {
         Operation::Embed => {
-            return Err(item_err("unsupported", "embed is not implemented in hutch-lite"));
+            return Err(item_err("unsupported", "embed is handled before per-item dispatch"));
         }
         Operation::Predict | Operation::Decide | Operation::Extract | Operation::Classify | Operation::Rerank => {}
     }

@@ -333,9 +333,12 @@ fn transform_means<'mcx>(
         "MEANS",
     )?;
     // Catalog chain: operator word -> semantic function -> model -> backend.
+    // ABOUT is the embedding predicate. MEANS stays the decision predicate.
     // The oid-9020 builtin remains the fallback before the first MEANS.
     rvbbit_resolve::ensure()?;
-    let funcid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
+    let about = a.name.first().and_then(|n| n.as_string()).is_some_and(|s| s.sval.eq_ignore_ascii_case("about"));
+    let funcid = rvbbit_resolve::func_oid(if about { "about" } else { "means" })
+        .unwrap_or(rvbbit_oids::MEANS_OID);
     Node::mk(
         mcx,
         types_nodes::primnodes::FuncExpr {
