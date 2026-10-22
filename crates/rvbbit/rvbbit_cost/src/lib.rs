@@ -12,6 +12,11 @@ use std::sync::{LazyLock, Mutex};
 pub const JEV_USD_PER_MILLION: f64 = 0.042;
 /// Billed input tokens for one jev noul call.
 pub const JEV_BILLED_TOKENS: f64 = 300.0;
+/// Billed input tokens for one jev CLASSIFY choice call.
+/// A 12-row live gate billed $0.000246 against the 300-token estimate of
+/// $0.000166 (that estimate already includes the 10% retake). 444 tokens
+/// is that ratio, so 12 * 1.10 * 444 * $0.042 / 1e6 lands on $0.000246.
+pub const JEV_CHOICE_BILLED_TOKENS: f64 = 444.0;
 
 const MINI_USD_PER_MILLION_IN: f64 = 0.15;
 const MINI_USD_PER_MILLION_OUT: f64 = 0.60;
@@ -374,8 +379,13 @@ fn seed_for(model: &str, op: Op) -> Seed {
             latency_ms: EMBED_LATENCY_MS,
         };
     }
+    let tokens = if op == Op::Classify && (m.contains("jev") || m.is_empty()) {
+        JEV_CHOICE_BILLED_TOKENS
+    } else {
+        JEV_BILLED_TOKENS
+    };
     Seed {
-        usd_per_item: JEV_BILLED_TOKENS * JEV_USD_PER_MILLION / 1_000_000.0,
+        usd_per_item: tokens * JEV_USD_PER_MILLION / 1_000_000.0,
         latency_ms: JEV_LATENCY_MS,
     }
 }
@@ -1477,6 +1487,36 @@ mod tests {
         });
         let with_retake = 2000.0 * (1.0 + CHOICE_RETAKE_FRACTION);
         assert!((classify.items - with_retake).abs() < 1e-6);
+        let per_choice = JEV_CHOICE_BILLED_TOKENS * JEV_USD_PER_MILLION / 1_000_000.0;
+        assert!((classify.usd - with_retake * per_choice).abs() < 1e-9);
+
+        let live = estimate(&Work {
+            op: Op::Classify,
+            model: "jev".into(),
+            rows: 12.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        assert!((live.usd - 0.000246).abs() < 1e-6, "classify usd {}", live.usd);
+        let means = estimate(&Work {
+            op: Op::Predict,
+            model: "jev".into(),
+            rows: 12.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        let noul = 12.0 * JEV_BILLED_TOKENS * JEV_USD_PER_MILLION / 1_000_000.0;
+        assert!((means.usd - noul).abs() < 1e-12, "means stays on the 300-token seed");
 
         let mut knobs = Knobs::default();
         knobs.takes = 2;

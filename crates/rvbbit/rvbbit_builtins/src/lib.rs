@@ -226,6 +226,9 @@ pub fn rvbbit_extract_typed(_flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo)
         Ok(raw) => raw,
         Err(err) => return fallback_or(fcinfo, fallback, err),
     };
+    if raw == rvbbit_dispatch::EXTRACT_ABSENT {
+        return Ok(fcinfo.return_null());
+    }
     match typed_text(&kind, &raw) {
         Ok(value) => Ok(text_datum(fcinfo, &value)?),
         Err(message) => {
@@ -340,6 +343,9 @@ fn score_hit(hit: rvbbit_dispatch::ScalarHit) -> PgResult<Datum> {
         rvbbit_dispatch::ScalarHit::Value(value) => value.parse::<f64>().map(Datum::from_f64).map_err(|_| {
             Box::new(types_error::PgError::error(format!("rerank memo {value}"))) as Box<types_error::PgError>
         }),
+        rvbbit_dispatch::ScalarHit::Missing => {
+            Err(Box::new(types_error::PgError::error("rerank memo was missing")) as Box<types_error::PgError>)
+        }
         rvbbit_dispatch::ScalarHit::Failed(message) => {
             Err(Box::new(types_error::PgError::error(message)) as Box<types_error::PgError>)
         }
@@ -458,6 +464,7 @@ fn apply_scalar(
 ) -> PgResult<Datum> {
     match hit {
         rvbbit_dispatch::ScalarHit::Value(value) => text_datum(fcinfo, &value),
+        rvbbit_dispatch::ScalarHit::Missing => Ok(fcinfo.return_null()),
         rvbbit_dispatch::ScalarHit::Failed(message) => {
             fallback_or(fcinfo, fallback, Box::new(types_error::PgError::error(message)))
         }
@@ -491,6 +498,7 @@ pub fn rvbbit_user(flinfo: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResu
 fn user_datum(fcinfo: &mut Fcinfo, oid: u32, hit: rvbbit_dispatch::ScalarHit) -> PgResult<Datum> {
     match hit {
         rvbbit_dispatch::ScalarHit::Value(value) => user_value(fcinfo, oid, &value),
+        rvbbit_dispatch::ScalarHit::Missing => Ok(fcinfo.return_null()),
         rvbbit_dispatch::ScalarHit::Failed(message) => Err(Box::new(types_error::PgError::error(message))),
     }
 }

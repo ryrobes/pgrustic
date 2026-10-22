@@ -494,6 +494,69 @@ fn write_canon(out: &mut String, value: &serde_json::Value) {
     }
 }
 
+/// A scalar EXTRACT answer that names nothing. Case-insensitive, with
+/// trailing punctuation stripped. The kind word itself (`person` for
+/// kind `person`) is the same drop as EXTRACT MANY's generic-kind filter.
+/// A real name (`Ken Lay`) and a non-placeholder miss (`Gas Basis`) stay.
+pub fn placeholder_extract(kind: &str, text: &str) -> bool {
+    let folded = fold_extract_phrase(text);
+    if folded.is_empty() {
+        return true;
+    }
+    const STOP: &[&str] = &[
+        "none",
+        "null",
+        "nil",
+        "n/a",
+        "na",
+        "unknown",
+        "unknown person",
+        "no person named",
+        "no name provided",
+        "no name",
+        "no person",
+        "nobody",
+        "no one",
+        "no one named",
+        "unnamed",
+        "not found",
+        "not specified",
+        "not available",
+        "not provided",
+        "none found",
+        "nothing",
+        "empty",
+        "no person found",
+    ];
+    if STOP.iter().any(|s| *s == folded) {
+        return true;
+    }
+    let kind_f = fold_extract_phrase(kind);
+    if kind_f.is_empty() {
+        return false;
+    }
+    if folded == kind_f {
+        return true;
+    }
+    folded == format!("no {kind_f}")
+        || folded == format!("no {kind_f} named")
+        || folded == format!("unknown {kind_f}")
+        || folded == format!("no {kind_f} provided")
+        || folded == format!("no {kind_f} found")
+}
+
+fn fold_extract_phrase(text: &str) -> String {
+    let mut raw = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c.is_whitespace() {
+            raw.push(c.to_ascii_lowercase());
+        } else if c == '/' {
+            raw.push('/');
+        }
+    }
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,5 +668,28 @@ mod tests {
         other.user_prompt = "q";
         other.take_index = 2;
         assert_ne!(client_cache_key(&base), client_cache_key(&other));
+    }
+
+    #[test]
+    fn scalar_extract_placeholders_are_not_values() {
+        for junk in [
+            "None",
+            "none",
+            "No person named",
+            "Unknown person",
+            "No name provided.",
+            "N/A",
+            "not found",
+            "unknown",
+            "",
+            "   ",
+        ] {
+            assert!(placeholder_extract("person", junk), "{junk:?}");
+        }
+        assert!(placeholder_extract("person", "person"));
+        assert!(placeholder_extract("person", "no person"));
+        assert!(!placeholder_extract("person", "Ken Lay"));
+        assert!(!placeholder_extract("person", "Gas Basis"));
+        assert!(!placeholder_extract("", "Gas Basis"));
     }
 }

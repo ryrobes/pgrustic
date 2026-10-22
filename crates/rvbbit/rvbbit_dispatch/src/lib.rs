@@ -667,7 +667,22 @@ pub fn extract_many(kind: &str, inputs: &[String]) -> PgResult<ManyReply> {
             inputs.len()
         )));
     }
+    let values = values
+        .into_iter()
+        .map(|item| item.map(|raw| scrub_scalar_value(kind, &raw)))
+        .collect();
     Ok(ManyReply { values, http_calls })
+}
+
+/// Wire value for a scalar miss. Not an error, so `ON ERROR` does not fire.
+pub const EXTRACT_ABSENT: &str = "\u{1}absent";
+
+fn scrub_scalar_value(kind: &str, raw: &str) -> String {
+    if raw == EXTRACT_ABSENT || rvbbit_contract::placeholder_extract(kind, raw) {
+        EXTRACT_ABSENT.to_string()
+    } else {
+        raw.to_string()
+    }
 }
 
 /// Chunked HTTP extract. Each value is a JSON array of strings
@@ -796,22 +811,48 @@ pub fn scalar_key_extract_many(kind: &str) -> String {
     format!("m\u{1e}{}\u{1e}mock\u{1e}{kind}", ep.base_url)
 }
 
+fn scalar_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["found", "value"],
+        "properties": {
+            "found": {
+                "type": "boolean",
+                "description": "False when the text does not name the requested kind."
+            },
+            "value": {
+                "type": "string",
+                "description": "The name copied from the text, or empty when found is false."
+            }
+        }
+    })
+}
+
 fn typed_extract_endpoint(kind: &str) -> Endpoint {
     let mut ep = decision_endpoint();
     ep.model = "mock".into();
     ep.labels.clear();
     ep.label_descriptions.clear();
     ep.fn_name = "extract_typed".into();
-    ep.return_type = "text".into();
-    // Scalar mode caches a bare noun. JSON mode rejected every plain-text
-    // answer and the row fell through ON ERROR.
+    // Same lock as EXTRACT MANY: temperature 0, seed 0, strict object.
+    // found=false is a successful miss (SQL NULL), not a placeholder and
+    // not an error, so ON ERROR does not replace it.
+    ep.temperature = 0.0;
+    let schema_text = scalar_schema().to_string();
+    ep.return_type = schema_text.clone();
     ep.extract_mode = Some("scalar".into());
     ep.system_prompt = format!(
-        "Name the {kind} in at most three words. A short noun or literal only. \
-         No sentence, no description, no markdown, no quotes."
+        "Name the {kind} in at most three words. JSON only, no markdown, schema {schema_text}. \
+         Set found to true and value to the name only when the text names a {kind}. \
+         If it does not, set found to false and value to \"\". \
+         Do not invent a placeholder such as None, Unknown, No person named, or No name provided. \
+         Leave out anything that is not a {kind}."
     );
-    ep.user_prompt = format!("What {kind} does this text name?\n{{{{input}}}}");
-    ep.max_tokens = Some(16);
+    ep.user_prompt = format!(
+        "What {kind} does this text name? If none, found is false and value is \"\".\n{{{{input}}}}"
+    );
+    ep.max_tokens = Some(64);
     ep
 }
 
@@ -869,11 +910,19 @@ fn many_schema(kind: &str) -> serde_json::Value {
     })
 }
 
-fn response_schema(ep: &Endpoint) -> Option<serde_json::Value> {
-    if ep.extract_mode.as_deref() != Some("many") {
-        return None;
+fn extract_cache_seed(mode: Option<&str>) -> &'static str {
+    if matches!(mode, Some("many") | Some("scalar")) {
+        "0"
+    } else {
+        ""
     }
-    serde_json::from_str(&ep.return_type).ok()
+}
+
+fn response_schema(ep: &Endpoint) -> Option<serde_json::Value> {
+    match ep.extract_mode.as_deref() {
+        Some("many") | Some("scalar") => serde_json::from_str(&ep.return_type).ok(),
+        _ => None,
+    }
 }
 
 fn many_endpoint(kind: &str) -> Endpoint {
@@ -1945,7 +1994,7 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
             take_index: 0,
             // EXTRACT MANY chats are seeded. The key has to change with that
             // seed, or a temperature-0 reply from an unseeded call is reused.
-            seed: if ep.extract_mode.as_deref() == Some("many") { "0" } else { "" },
+            seed: extract_cache_seed(ep.extract_mode.as_deref()),
             opts: &opts,
             threshold: ep.threshold,
             extract_mode: ep.extract_mode.as_deref().unwrap_or(""),
@@ -2771,6 +2820,8 @@ fn decode_clause(text: &str) -> Result<ClauseHit, String> {
 #[derive(Clone, Debug)]
 pub enum ScalarHit {
     Value(String),
+    /// Scalar EXTRACT found nothing. SQL NULL, not `ON ERROR`.
+    Missing,
     Failed(String),
 }
 
@@ -2934,19 +2985,38 @@ mod tests {
 
     #[test]
     fn typed_extract_asks_for_a_short_noun() {
-        let ep = typed_extract_endpoint("creature");
+        let ep = typed_extract_endpoint("person");
         assert_eq!(ep.extract_mode.as_deref(), Some("scalar"));
+        assert_eq!(ep.temperature, 0.0);
         assert!(ep.system_prompt.contains("at most three words"));
-        assert!(ep.system_prompt.contains("No sentence"));
+        assert!(ep.system_prompt.contains("found to false"));
+        assert!(ep.system_prompt.contains("No person named"));
+        assert!(ep.system_prompt.contains("not a person"));
         let body = encode_items(
             &ep,
             Operation::Extract,
             &[serde_json::json!({ "input": "a tall hairy figure" })],
         )
         .unwrap();
-        assert!(body.contains("\"extract_mode\":\"scalar\""));
-        assert!(body.contains("What creature does this text name?"));
-        assert!(!body.contains("large, black-brown"));
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["temperature"].as_f64(), Some(0.0));
+        assert_eq!(parsed["items"][0]["extract_mode"], "scalar");
+        assert_eq!(parsed["items"][0]["response_schema"]["required"][0], "found");
+        assert_eq!(parsed["items"][0]["response_schema"]["required"][1], "value");
+        assert!(body.contains("What person does this text name?"));
+        assert_eq!(super::extract_cache_seed(Some("scalar")), "0");
+        assert_eq!(super::extract_cache_seed(Some("many")), "0");
+        assert_eq!(super::extract_cache_seed(Some("summary")), "");
+        assert_eq!(super::scrub_scalar_value("person", "None"), super::EXTRACT_ABSENT);
+        assert_eq!(super::scrub_scalar_value("person", "No person named"), super::EXTRACT_ABSENT);
+        assert_eq!(super::scrub_scalar_value("person", "Unknown person"), super::EXTRACT_ABSENT);
+        assert_eq!(
+            super::scrub_scalar_value("person", "No name provided."),
+            super::EXTRACT_ABSENT
+        );
+        assert_eq!(super::scrub_scalar_value("person", "person"), super::EXTRACT_ABSENT);
+        assert_eq!(super::scrub_scalar_value("person", "Ken Lay"), "Ken Lay");
+        assert_eq!(super::scrub_scalar_value("person", "Gas Basis"), "Gas Basis");
     }
 
     #[test]

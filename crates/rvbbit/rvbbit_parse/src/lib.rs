@@ -1817,7 +1817,13 @@ mod lexer {
             // Model slugs (`typesafe/jev-1.14`, `~typesafe/jev-latest`) are one
             // ident. `/`, `-`, `.`, and `~` continue a word; a bare `.` stays
             // skipped punctuation so it is not a schema separator token.
-            if c.is_ascii_alphabetic() || c == '_' || c == '~' {
+            // A bare `~` is the regex operator (`~`, `~*`, `!~`, `!~*`), not
+            // a slug. Entering this arm and then failing to consume it spins
+            // forever and the token vec grows until the backend is OOM-killed.
+            let slug_tilde = c == '~'
+                && i + 1 < b.len()
+                && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_');
+            if c.is_ascii_alphabetic() || c == '_' || slug_tilde {
                 let start = i;
                 while i < b.len()
                     && (b[i].is_ascii_alphanumeric()
@@ -1827,6 +1833,10 @@ mod lexer {
                             && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_' || b[i + 1] == b'~')))
                 {
                     i += 1;
+                }
+                if i == start {
+                    i += 1;
+                    continue;
                 }
                 let raw = &sql[start..i];
                 let folded = raw.to_ascii_lowercase();
@@ -1888,6 +1898,27 @@ fn normalize_returns(raw: &str) -> Result<(String, bool), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_regex_operators_do_not_stall_the_lexer() {
+        for sql in [
+            "SELECT 'None' ~* '^(none|unknown)'",
+            "SELECT 'None' ~ '^(none|unknown)'",
+            "SELECT 'None' !~* '^(none|unknown)'",
+            "SELECT 'None' !~ '^(none|unknown)'",
+            "SELECT lower(body) LIKE 'none%'",
+            "SELECT lower(body) ~ '^(none|unknown)'",
+        ] {
+            let toks = lexer::tokenize(sql);
+            assert!(toks.len() < 24, "{sql} produced {} tokens", toks.len());
+            assert!(split_if_rvbbit(sql).is_none(), "{sql}");
+        }
+        let slug = lexer::tokenize("MODEL ~typesafe/jev-latest NAME 'x'");
+        assert!(
+            slug.iter().any(|t| matches!(&t.kind, Kind::Ident(s) if s == "~typesafe/jev-latest")),
+            "{slug:?}"
+        );
+    }
 
     #[test]
     fn ordinary_sql_is_not_split() {

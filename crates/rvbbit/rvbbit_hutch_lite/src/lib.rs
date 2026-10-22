@@ -1285,7 +1285,12 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
             Operation::Predict => "Answer with only true or false.".into(),
             Operation::Extract => match item.extract_mode.as_deref() {
                 Some("scalar") => {
-                    "Return one short noun or literal, at most three words. No sentence, no description, no markdown, no quotes.".into()
+                    "Return JSON {\"found\":bool,\"value\":string} and no markdown. \
+                     Set found to true only when the text names that kind, and copy the name into value. \
+                     If it does not, set found to false and value to \"\". \
+                     Do not invent a placeholder such as None, Unknown, No person named, or No name provided. \
+                     Leave out anything that is not that kind."
+                        .into()
                 }
                 Some("summary") => "Summarize the notes in one or two sentences. No markdown.".into(),
                 Some("many") => {
@@ -1325,7 +1330,9 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                      Leave out anything that is not that kind. If there are none, mentions is [].\n{input}"
                 )
             } else if item.extract_mode.as_deref() == Some("scalar") {
-                format!("Extract one short value from this text:\n{input}")
+                format!(
+                    "What value does this text name? If none, found is false and value is \"\".\n{input}"
+                )
             } else {
                 format!("Extract JSON from this text:\n{input}")
             }
@@ -2075,7 +2082,7 @@ pub struct ChoiceAnswer {
 /// EXTRACT MANY is sampled at seed 0. Temperature 0 alone still moved
 /// between `black dog` and `dog` across two cache-off passes.
 fn chat_seed(extract_mode: Option<&str>) -> Option<u32> {
-    if extract_mode == Some("many") {
+    if matches!(extract_mode, Some("many") | Some("scalar")) {
         Some(0)
     } else {
         None
@@ -2160,10 +2167,19 @@ fn chat_payload(
         body["seed"] = serde_json::json!(seed);
     }
     if let Some(schema) = response_schema {
+        let name = if schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .is_some_and(|fields| fields.iter().any(|field| field.as_str() == Some("found")))
+        {
+            "extract_scalar"
+        } else {
+            "extract_many"
+        };
         body["response_format"] = serde_json::json!({
             "type": "json_schema",
             "json_schema": {
-                "name": "extract_many",
+                "name": name,
                 "strict": true,
                 "schema": schema
             }
@@ -2695,25 +2711,50 @@ fn majority_text(texts: &[String]) -> String {
     best.clone()
 }
 
-/// Typed scalar extract. A JSON string, number, bool, or null is that
-/// value. Any other non-empty answer is the trimmed text, so a model
-/// that returns `sasquatch` instead of a JSON string still caches.
-/// A JSON object or array is an error: that is the json mode's job.
+/// Typed scalar extract. `{found:false}` and placeholder strings become
+/// JSON null (SQL NULL, not an error). A plain noun still caches. A JSON
+/// object that is not the found/value schema is an error.
 pub fn parse_scalar_value(text: &str) -> Result<serde_json::Value, String> {
     let stripped = strip_fences(text.trim());
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stripped) {
         return match v {
-            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                Err("scalar extract got a JSON object or array".into())
-            }
+            serde_json::Value::Object(map) => scalar_found_object(&map),
+            serde_json::Value::Array(_) => Err("scalar extract got a JSON object or array".into()),
+            serde_json::Value::Null => Ok(serde_json::Value::Null),
+            serde_json::Value::String(s) => Ok(scalar_or_null(&s)),
             other => Ok(other),
         };
     }
-    let trimmed = stripped.trim();
+    let trimmed = unwrap_quotes(stripped.trim());
     if trimmed.is_empty() {
         return Err("scalar extract was empty".into());
     }
-    Ok(serde_json::Value::String(unwrap_quotes(trimmed).to_string()))
+    Ok(scalar_or_null(trimmed))
+}
+
+fn scalar_or_null(text: &str) -> serde_json::Value {
+    let text = text.trim();
+    if text.is_empty() || rvbbit_contract::placeholder_extract("", text) {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text.to_string())
+    }
+}
+
+fn scalar_found_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let Some(found) = map.get("found").and_then(|v| v.as_bool()) else {
+        return Err("scalar extract got a JSON object or array".into());
+    };
+    if !found {
+        return Ok(serde_json::Value::Null);
+    }
+    let value = map.get("value").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if value.is_empty() || rvbbit_contract::placeholder_extract("", value) {
+        return Ok(serde_json::Value::Null);
+    }
+    Ok(serde_json::Value::String(value.to_string()))
 }
 
 fn unwrap_quotes(text: &str) -> &str {
@@ -3267,6 +3308,7 @@ mod tests {
         assert!(plain.get("response_format").is_none());
         assert!(plain.get("seed").is_none());
         assert_eq!(chat_seed(Some("many")), Some(0));
+        assert_eq!(chat_seed(Some("scalar")), Some(0));
         assert_eq!(chat_seed(Some("summary")), None);
     }
 
@@ -3581,6 +3623,44 @@ mod tests {
         assert_eq!(parse_scalar_value("12").unwrap(), serde_json::json!(12));
         assert_eq!(parse_scalar_value("true").unwrap(), serde_json::json!(true));
         assert!(parse_scalar_value("{\"creature\":\"sasquatch\"}").is_err());
+        assert_eq!(
+            parse_scalar_value("{\"found\":false,\"value\":\"None\"}").unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            parse_scalar_value("{\"found\":true,\"value\":\"Ken Lay\"}").unwrap(),
+            serde_json::json!("Ken Lay")
+        );
+        assert_eq!(
+            parse_scalar_value("{\"found\":true,\"value\":\"None\"}").unwrap(),
+            serde_json::Value::Null
+        );
+        for junk in ["None", "No person named", "Unknown person", "No name provided.", "null"] {
+            assert_eq!(parse_scalar_value(junk).unwrap(), serde_json::Value::Null, "{junk}");
+        }
+        assert_eq!(parse_scalar_value("Gas Basis").unwrap(), serde_json::json!("Gas Basis"));
+        let scalar_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["found", "value"],
+            "properties": {
+                "found": {"type": "boolean"},
+                "value": {"type": "string"}
+            }
+        });
+        let scalar_chat = chat_payload(
+            "openai/gpt-4o-mini",
+            0.0,
+            Some(64),
+            "extract",
+            "text",
+            Some(&scalar_schema),
+            Some(0),
+        );
+        assert_eq!(scalar_chat["temperature"].as_f64(), Some(0.0));
+        assert_eq!(scalar_chat["seed"].as_u64(), Some(0));
+        assert_eq!(scalar_chat["response_format"]["json_schema"]["name"], "extract_scalar");
+        assert_eq!(scalar_chat["response_format"]["json_schema"]["strict"], true);
         assert!(parse_json_value("sasquatch").is_err());
         assert_eq!(
             parse_json_value("{\"creature\":\"sasquatch\"}").unwrap()["creature"],
