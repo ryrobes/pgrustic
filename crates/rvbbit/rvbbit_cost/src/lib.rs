@@ -1054,7 +1054,7 @@ mod tests {
             threshold: None,
             filters: false,
         });
-        let doc = 200.0 * 0.05 / 1_000_000.0;
+        let doc = VOYAGE_TOKENS_PER_DOC * VOYAGE_USD_PER_MILLION / 1_000_000.0;
         assert!((voyage.usd - 10.0 * doc).abs() < 1e-12);
         assert_eq!(voyage.calls, 1.0);
 

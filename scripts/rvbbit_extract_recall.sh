@@ -8,7 +8,8 @@
 #   RVBBIT_EXTRACT_LIVE=1 bash scripts/rvbbit_extract_recall.sh
 # Requires OPENROUTER_API_KEY. Two runs with semantic.cache off must agree.
 # Row 3605 must include Bigfoot. Row 23987 must include gray. A note with
-# neither stays empty.
+# neither stays empty. Rows 1198, 40714, 67412, and 3386 must keep the
+# concrete animals (black dog, deer, buck, big buck, hunting dog, bird dog).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -17,10 +18,12 @@ cd "$ROOT"
 cargo test -p rvbbit_dispatch -p rvbbit_hutch_lite --profile fast-profile --offline \
   --lib --test fake_openai -- \
   extract_many_asks_only_for_the_requested_kind \
+  extract_many_keeps_proper_nouns_drops_generics_and_dedupes \
   extract_many_keeps_only_strings_and_allows_an_empty_list \
   extract_many_chat_sends_temperature_zero_and_a_strict_schema \
   extract_many_structured_output_unwraps_mentions_and_retries_without_schema \
-  rerank_summary_and_extract_many
+  rerank_summary_and_extract_many \
+  summary_batch_overlaps_slow_chats
 echo "extract recall: prompt examples, temperature 0, and structured output passed"
 
 if [[ "${RVBBIT_EXTRACT_LIVE:-}" != "1" ]]; then
@@ -157,7 +160,11 @@ INSERT INTO notes VALUES
   (3605, 'My story of Bigfoot...'),
   (23987, 'Large gray triangular aircraft'),
   (1, 'The invoice was paid on Tuesday.'),
-  (2, 'A sasquatch crossed the road.');
+  (2, 'A sasquatch crossed the road.'),
+  (1198, 'A black dog ran through the yard.'),
+  (40714, 'We saw a deer and a buck at the tree line.'),
+  (67412, 'A big buck crossed the field.'),
+  (3386, 'The hunting dog and the bird dog worked the brush.');
 SQL
 "${PSQL[@]}" -d rvbbit_extract -f "$RUNDIR/setup.sql"
 
@@ -167,7 +174,7 @@ SET semantic.cache = 'off';
 SELECT 'CREATURE';
 SELECT id::text || E'\t' || coalesce(string_agg(lower(creature), '|' ORDER BY lower(creature)), '')
 FROM (
-  SELECT id, EXTRACT MANY creature FROM body FROM notes WHERE id IN (3605, 1, 2)
+  SELECT id, EXTRACT MANY creature FROM body FROM notes WHERE id IN (3605, 1, 2, 1198, 40714, 67412, 3386)
 ) s
 GROUP BY id
 ORDER BY id;
@@ -234,21 +241,45 @@ def empty(label, text):
     if got:
         raise SystemExit(f"{label} should be empty, got {got}")
 
-if set(creature) != {"1", "2", "3605"}:
+if set(creature) != {"1", "2", "1198", "3386", "3605", "40714", "67412"}:
     raise SystemExit(f"creature ids: {sorted(creature)}")
 if set(color) != {"1", "23987"}:
     raise SystemExit(f"color ids: {sorted(color)}")
 
+JUNK = {
+    "animal", "animals", "man", "men", "person", "people", "human", "humans",
+    "creature", "creatures", "thing", "things", "figure", "figures", "shellfish",
+    "sea life", "human like figure", "humanlike figure", "night", "bright",
+}
+
+def forbid_junk(label, text):
+    got = parts(text)
+    for p in got:
+        if p in JUNK:
+            raise SystemExit(f"{label} included junk {p!r}")
+
 require("3605 creature", creature["3605"], "bigfoot")
 forbid("3605 creature", creature["3605"], ["story", "road", "gray", "grey", "aircraft", "sasquatch"])
+forbid_junk("3605 creature", creature["3605"])
 require("2 creature", creature["2"], "sasquatch")
 forbid("2 creature", creature["2"], ["road", "crossed"])
+forbid_junk("2 creature", creature["2"])
 empty("1 creature", creature["1"])
+require("1198 creature", creature["1198"], "black dog")
+forbid_junk("1198 creature", creature["1198"])
+require("40714 creature", creature["40714"], "deer")
+require("40714 creature", creature["40714"], "buck")
+forbid_junk("40714 creature", creature["40714"])
+require("67412 creature", creature["67412"], "big buck")
+forbid_junk("67412 creature", creature["67412"])
+require("3386 creature", creature["3386"], "hunting dog")
+require("3386 creature", creature["3386"], "bird dog")
+forbid_junk("3386 creature", creature["3386"])
 
 require("23987 color", color["23987"], "gray")
 forbid("23987 color", color["23987"], ["aircraft", "triangular", "large", "bigfoot", "story"])
 empty("1 color", color["1"])
-print("extract recall live: Bigfoot, gray, sasquatch, and the empty note agreed across two passes")
+print("extract recall live: Bigfoot, gray, sasquatch, black dog, deer, buck, and the empty note agreed across two passes")
 PY
 
 echo "=== done. RVBBIT_HUTCH_URL=$RVBBIT_HUTCH_URL ==="

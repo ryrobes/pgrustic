@@ -5,6 +5,8 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static VARY_N: AtomicU64 = AtomicU64::new(0);
+static SLOW_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+static SLOW_MAX: AtomicU64 = AtomicU64::new(0);
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -121,7 +123,12 @@ fn serve_fake(listener: TcpListener, hits: Arc<AtomicU64>) {
                 return;
             }
             let text = String::from_utf8_lossy(&body);
-            if text.contains("SLOW") {
+            if text.contains("SLOWCHAT") {
+                let now = SLOW_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                SLOW_MAX.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(400));
+                SLOW_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+            } else if text.contains("SLOW") {
                 thread::sleep(Duration::from_millis(250));
             }
             // Echo the bearer so a redact test can prove the key does not
@@ -1347,4 +1354,53 @@ fn live_openrouter_means() {
         }
         Err(e) => panic!("live transport: {e}"),
     }
+}
+
+/// Three summary chats against a slow provider must overlap. Serial
+/// execution would sleep 400ms three times (1200ms). The batch gate is 4,
+/// so the wall time stays under one wave plus a little scheduling slack,
+/// and at least two provider calls are in flight together.
+#[test]
+fn summary_batch_overlaps_slow_chats() {
+    let h = harness(Some("test-key"));
+    SLOW_INFLIGHT.store(0, Ordering::SeqCst);
+    SLOW_MAX.store(0, Ordering::SeqCst);
+    let mut req = predict("SLOWCHAT group one about a road", "ignored");
+    req.operation = Operation::Extract;
+    req.max_tokens = Some(64);
+    req.items[0].extract_mode = Some("summary".into());
+    req.items[0].system = Some("Summarize the notes in one or two sentences. No markdown.".into());
+    req.items[0].criterion = None;
+    for (n, note) in ["SLOWCHAT group two about a field", "SLOWCHAT group three about a ridge"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut extra = item(note, None);
+        extra.key = format!("{}", n + 1);
+        extra.extract_mode = Some("summary".into());
+        extra.system = Some("Summarize the notes in one or two sentences. No markdown.".into());
+        req.items.push(extra);
+    }
+    let per_call = Duration::from_millis(400);
+    let started = std::time::Instant::now();
+    let got = post(&format!("{}/v1/extract", h.hutch), "off", &req);
+    let elapsed = started.elapsed();
+    assert_eq!(got.outputs.len(), 3, "{got:?}");
+    for output in &got.outputs {
+        assert!(output.error.is_none(), "{:?}", output.error);
+        assert_eq!(output.value, Some(serde_json::json!("a short summary of the notes")));
+        assert_eq!(output.calls.as_ref().unwrap()[0].op, "summarize");
+    }
+    let sum = per_call * 3;
+    assert!(
+        elapsed < sum,
+        "summary chats ran serially: wall {:?} was not under the sum of per-call sleeps {:?}",
+        elapsed,
+        sum
+    );
+    assert!(
+        SLOW_MAX.load(Ordering::SeqCst) >= 2,
+        "summary chats did not overlap; max in flight {}",
+        SLOW_MAX.load(Ordering::SeqCst)
+    );
 }

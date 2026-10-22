@@ -683,8 +683,10 @@ struct Mention {
     proper: bool,
 }
 
-/// Keep, drop, or ask jev. A marked proper noun is never dropped. A
-/// generic word for the kind (`animal`, `man`, `sea life`) is never kept.
+/// Keep, drop, or ask jev. A marked proper noun is never dropped. An
+/// exact generic (`animal`, `creature`, `sea life`) is never kept. A
+/// concrete species or type, including `black dog` and `big buck`, is
+/// kept without asking. Jev only sees a leftover that is neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MentionFate {
     Keep,
@@ -696,8 +698,11 @@ fn mention_fate(kind: &str, text: &str, proper: bool) -> MentionFate {
     if proper {
         return MentionFate::Keep;
     }
-    if generic_kind_word(kind, text) {
+    if generic_kind_word(kind, text) || vague_only(text) {
         return MentionFate::Drop;
+    }
+    if concrete_mention(kind, text) {
+        return MentionFate::Keep;
     }
     MentionFate::Ask
 }
@@ -734,6 +739,102 @@ fn generic_kind_word(kind: &str, text: &str) -> bool {
     GENERIC.contains(&folded.as_str())
 }
 
+/// Tokens that are not a species, breed, or color by themselves.
+/// A mention made only of these is junk (`night`, `human like figure`)
+/// and is dropped before jev. A mention that also has a concrete word
+/// (`big buck`, `black dog`) is kept whole.
+fn is_stop_or_vague(word: &str) -> bool {
+    const VAGUE: &[&str] = &[
+        "a",
+        "an",
+        "and",
+        "animal",
+        "animals",
+        "being",
+        "big",
+        "bright",
+        "creature",
+        "creatures",
+        "critter",
+        "crossed",
+        "dark",
+        "dim",
+        "entity",
+        "figure",
+        "figures",
+        "giant",
+        "huge",
+        "human",
+        "humans",
+        "life",
+        "light",
+        "like",
+        "little",
+        "large",
+        "man",
+        "men",
+        "my",
+        "night",
+        "of",
+        "people",
+        "person",
+        "road",
+        "round",
+        "sea",
+        "shellfish",
+        "small",
+        "some",
+        "story",
+        "the",
+        "thing",
+        "things",
+        "triangle",
+        "triangular",
+        "tiny",
+        "very",
+    ];
+    VAGUE.contains(&word)
+}
+
+fn is_color_word(word: &str) -> bool {
+    const COLORS: &[&str] = &[
+        "auburn", "beige", "black", "blond", "blonde", "blue", "brown", "chestnut", "cream",
+        "gold", "golden", "gray", "green", "grey", "ivory", "khaki", "maroon", "navy", "olive",
+        "orange", "pink", "purple", "red", "roan", "russet", "silver", "tan", "teal", "white",
+        "yellow",
+    ];
+    COLORS.contains(&word)
+}
+
+fn is_color_kind(kind: &str) -> bool {
+    let kind = fold_words(kind);
+    kind == "color" || kind == "colour"
+}
+
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+/// Every token is a generic or a modifier, so the mention is not a
+/// creature or a color (`night`, `bright`, `human like figure`).
+fn vague_only(text: &str) -> bool {
+    let words = tokens(text);
+    !words.is_empty() && words.iter().all(|w| is_stop_or_vague(w))
+}
+
+/// A concrete species, breed, type, or color name. Modified names count.
+/// Anything else is ambiguous and can go to jev.
+fn concrete_mention(kind: &str, text: &str) -> bool {
+    let words = tokens(text);
+    if is_color_kind(kind) {
+        return words.iter().any(|w| is_color_word(w));
+    }
+    words.iter().any(|w| !is_stop_or_vague(w))
+}
+
 fn fold_words(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
@@ -748,7 +849,9 @@ fn specific_question(kind: &str, cand: &str, input: &str) -> String {
     let cand = cand.replace('"', "'");
     let excerpt: String = input.chars().take(400).collect();
     format!(
-        "Text: {excerpt}. In this text, does \"{cand}\" name a specific {kind}, rather than a generic word for the kind itself?"
+        "Text: {excerpt}. In this text, does \"{cand}\" name a specific {kind}, rather than a generic word for the kind itself? \
+         Answer yes for a concrete species, breed, color, or type name, including a modified one. \
+         Answer no only when it is not a {kind}."
     )
 }
 
@@ -2403,10 +2506,19 @@ mod tests {
             super::mention_fate("creature", "human like figure", false),
             super::MentionFate::Drop
         );
-        assert_eq!(super::mention_fate("creature", "black dog", false), super::MentionFate::Ask);
-        assert_eq!(super::mention_fate("creature", "sasquatch", false), super::MentionFate::Ask);
-        assert_eq!(super::mention_fate("creature", "deer", false), super::MentionFate::Ask);
-        assert_eq!(super::mention_fate("color", "gray", false), super::MentionFate::Ask);
+        assert_eq!(super::mention_fate("creature", "black dog", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "sasquatch", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "deer", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "buck", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "big buck", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "hunting dog", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "bird dog", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "night", false), super::MentionFate::Drop);
+        assert_eq!(super::mention_fate("creature", "bright", false), super::MentionFate::Drop);
+        assert_eq!(super::mention_fate("color", "gray", false), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("color", "night", false), super::MentionFate::Drop);
+        assert_eq!(super::mention_fate("color", "bright", false), super::MentionFate::Drop);
+        assert_eq!(super::mention_fate("color", "aircraft", false), super::MentionFate::Ask);
         let marked = super::parse_mentions(
             r#"[{"text":"Bigfoot","proper":true},{"text":"animal","proper":false},{"text":"Deer","proper":false},{"text":"deer","proper":false}]"#,
         )
