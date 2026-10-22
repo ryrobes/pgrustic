@@ -418,15 +418,36 @@ fn create_fn(schema: &str, sql_name: &str, server: &str, tool: &ListedTool, spec
         qident(sql_name),
         shape.return_sql,
     );
-    exec("SELECT set_config('rvbbit.mcp_import_error', '', true)")?;
     let name_lit = qlit(&tool.name);
-    exec(&format!(
-        "DO $try$ BEGIN\n{create_sql};\nEXCEPTION WHEN OTHERS THEN\n\
-         PERFORM set_config('rvbbit.mcp_import_error', SQLERRM, true);\n\
-         RAISE WARNING 'skipping MCP tool %: %', {name_lit}, SQLERRM;\n\
-         END $try$;"
-    ))?;
-    let import_error = scalar("SELECT NULLIF(current_setting('rvbbit.mcp_import_error', true), '')")?;
+    // `name` truncates at 63 bytes and still creates the function, so a
+    // too-long tool would import under a different identifier. Refuse it
+    // before CREATE and keep the rest of the server.
+    let too_long = sql_name.len() > 63;
+    let preset_error = too_long.then(|| {
+        format!(
+            "SQL name \"{sql_name}\" is {} bytes; Postgres identifiers are at most 63 bytes",
+            sql_name.len()
+        )
+    });
+    if let Some(message) = &preset_error {
+        exec(&format!(
+            "DO $try$ BEGIN RAISE WARNING 'skipping MCP tool %: %', {name_lit}, {}; END $try$;",
+            qlit(message)
+        ))?;
+    } else {
+        exec("SELECT set_config('rvbbit.mcp_import_error', '', true)")?;
+        exec(&format!(
+            "DO $try$ BEGIN\n{create_sql};\nEXCEPTION WHEN OTHERS THEN\n\
+             PERFORM set_config('rvbbit.mcp_import_error', SQLERRM, true);\n\
+             RAISE WARNING 'skipping MCP tool %: %', {name_lit}, SQLERRM;\n\
+             END $try$;"
+        ))?;
+    }
+    let import_error = if let Some(message) = preset_error {
+        Some(message)
+    } else {
+        scalar("SELECT NULLIF(current_setting('rvbbit.mcp_import_error', true), '')")?
+    };
     let oid = if import_error.is_some() {
         None
     } else {
