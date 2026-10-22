@@ -75,12 +75,16 @@ not the spike's JSON array.
 `prompt` on an item are optional overrides; MEANS leaves them null and
 puts the pair in `inputs`. `response_schema` is an optional JSON Schema.
 Hutch-lite sends it as strict `response_format.json_schema` on the chat
-call. EXTRACT MANY uses an object schema with a `mentions` array of
-strings and stores that array, so a bare JSON array still decodes. A
-provider error that rejects the schema is retried once without
-`response_format`. Temperature on that call is 0 unless a clause tail
-sets one. pgrustic then asks Jev `is <candidate> a <kind>?` once per
-mention and drops the ones that come back false. That check fails open.
+call. EXTRACT MANY uses an object schema whose `mentions` items are
+`{mention, category}`. `category` is `specific_instance_of_kind`,
+`generic_kind_word`, `attribute_or_part`, `place`, `sound_or_event`,
+or `other`. pgrustic keeps only `specific_instance_of_kind`, drops the
+generic stoplist, and drops a shorter phrase contained in a longer one.
+A bare JSON array still decodes and runs that filter. A provider error
+that rejects the schema is retried once without `response_format`.
+Temperature on that call is 0 and the chat `seed` is 0. Known live
+gaps, warned rather than failed by the recall script: note 40714
+(`deer`, `buck`) and `hunting dog` on note 3386.
 
 Response. `outputs[i]` answers `items[i]`. The `key` is echoed. A failed
 item sets `error` and leaves `value` null. Siblings may still succeed.

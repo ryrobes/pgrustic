@@ -85,16 +85,19 @@ aborts the session when
 transition concatenates the group; the final calls hutch once.
 `SUMMARIZE` is a chat summary. `CONSENSUS` is one Jev yes/no over the
 joined text. `EXTRACT MANY kind FROM expr` asks for every mention of that kind.
-A proper noun counts, a descriptive word or short phrase counts, and a
-synonym counts even when the text never uses the kind word. Anything
-that is not that kind stays out, and the list is empty when the text
-has none. The chat call uses temperature 0 and a strict JSON Schema
-whose `mentions` array is what SQL explodes. A provider that rejects
-the schema is retried once without it. The examples in the prompt are
-short on purpose. After the list comes back, each candidate is one
-batched Jev question, `is <candidate> a <kind>?`, against the source
-text. A false answer is dropped. A Jev error keeps the original list,
-so a noul outage does not erase recall. The array is one batched extract, the same Semantic
+The model returns `{mention, category}`. `category` is
+`specific_instance_of_kind`, `generic_kind_word`, `attribute_or_part`,
+`place`, `sound_or_event`, or `other`. Only `specific_instance_of_kind`
+is kept. A generic stoplist (`animal`, `creature`, `man`, `person`,
+`figure`, `sea life`, and vague-only phrases such as `night`) still
+drops a mention the model marked specific, and a shorter phrase inside
+a longer one is dropped (`black dog` over `dog`). The chat call uses
+temperature 0, seed 0, and a strict JSON Schema. A provider that
+rejects the schema is retried once without it; a bare string array
+still runs the same filter. Two live misses are known recall gaps:
+row 40714 can come back without `deer` and `buck`, and row 3386 can
+miss `hunting dog`. `scripts/rvbbit_extract_recall.sh` warns on those
+and still passes. Junk mentions fail that script. The array is one batched extract, the same Semantic
 Project shape as `CLASSIFY` and typed `EXTRACT`, then a `LEFT JOIN
 LATERAL` explodes each value onto its source row. The helper list
 column stays inside that subquery. An empty array keeps the row with a
