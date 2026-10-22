@@ -3,6 +3,8 @@
 //! `echo` and `now` are ordinary scalars. `fail` is a tool error. `people`
 //! returns an array of objects so IMPORT can build `RETURNS TABLE`.
 
+use std::time::Duration;
+
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, Json, ServiceExt};
 use schemars::JsonSchema;
@@ -37,6 +39,15 @@ pub struct BagArgs {
 impl DemoServer {
     #[tool(description = "Return the text argument")]
     fn echo(&self, Parameters(EchoArgs { text }): Parameters<EchoArgs>) -> String {
+        text
+    }
+
+    /// About 200ms, and async so one stdio session can overlap calls.
+    /// A serial `count(*)` over 8 rows is ~1.6s. One batch is one wave
+    /// or two, well under that.
+    #[tool(description = "Wait 200ms, then return the text")]
+    async fn slow(&self, Parameters(EchoArgs { text }): Parameters<EchoArgs>) -> String {
+        tokio::time::sleep(Duration::from_millis(200)).await;
         text
     }
 

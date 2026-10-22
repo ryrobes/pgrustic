@@ -87,6 +87,9 @@ pub const FLOW_OID: u32 = 9046;
 /// The SQL name is `rvbbit.mcp_invoke_text`. Not strict: `ON ERROR NULL`
 /// passes a null fallback.
 pub const MCP_INVOKE_OID: u32 = 9047;
+/// `rvbbit_last_actual() -> text`. `calls,usd` captured from the previous
+/// statement when `semantic.capture_actual` was on.
+pub const LAST_ACTUAL_OID: u32 = 9048;
 
 pub const DUMP_NAME: &str = "rvbbit_dump_sql";
 pub const RESTORE_NAME: &str = "rvbbit_restore_sql";
@@ -115,6 +118,7 @@ pub const USER_NAME: &str = "rvbbit_user";
 pub const SIMILARITY_NAME: &str = "rvbbit_semantic_similarity";
 pub const FLOW_NAME: &str = "rvbbit_flow";
 pub const MCP_INVOKE_NAME: &str = "rvbbit_mcp_invoke_text";
+pub const LAST_ACTUAL_NAME: &str = "rvbbit_last_actual";
 
 /// Rows pulled into one semantic batch before an HTTP call.
 pub const BATCH_ROWS: usize = 32;

@@ -207,6 +207,9 @@ BEGIN;
 SET LOCAL ROLE sem_reader;
 SELECT count(*) > 0 FROM rvbbit.semfn;
 SELECT 'reader alpha' MEANS 'alpha';
+SELECT CLASSIFY('a small bird' INTO 'bird', 'plane');
+SELECT rvbbit.extract_typed('text', 'reader note', 'kept');
+SELECT rvbbit.rerank('a small bird', 'bird');
 SELECT count(*) FROM rvbbit.my_calls;
 COMMIT;
 ",
@@ -226,6 +229,28 @@ COMMIT;
     assert_eq!(other, "0", "{other}");
     let owner = psql(pg_port, "SELECT count(*) FROM rvbbit.calls WHERE tenant = 'sem_reader'");
     assert!(owner.parse::<i64>().unwrap_or(0) >= 1, "{owner}");
+    let attributed = psql(
+        pg_port,
+        "SELECT count(*) FROM rvbbit.calls \
+         WHERE tenant = 'sem_reader' AND role = 'sem_reader' \
+           AND op IN ('predict', 'classify', 'extract', 'rerank')",
+    );
+    assert!(
+        attributed.parse::<i64>().unwrap_or(0) >= 4,
+        "provider calls were not attributed to the role: {attributed}"
+    );
+    let local = psql(
+        pg_port,
+        "SELECT count(*) FROM rvbbit.calls WHERE tenant = 'local' AND op IN ('predict', 'classify', 'extract', 'rerank')",
+    );
+    assert_eq!(local, "0", "worker meters fell back to tenant local: {local}");
+    let mine_role = psql(
+        pg_port,
+        "BEGIN; SET LOCAL ROLE sem_reader; \
+         SELECT count(*) FROM rvbbit.my_calls WHERE role = current_user AND tenant = current_user; \
+         COMMIT;",
+    );
+    assert!(mine_role.parse::<i64>().unwrap_or(0) >= 4, "{mine_role}");
 
     let denied = Command::new(format!("{}/psql", pg_bin()))
         .args([
@@ -267,6 +292,201 @@ COMMIT;
         "no semantic node under the aggregate:\n{plan}"
     );
 
+    // A FILTER the planner does not price still calls the provider.
+    // last_actual is that run, not the EXPLAIN estimate.
+    psql(
+        pg_port,
+        "CREATE TABLE filt (x text); \
+         INSERT INTO filt SELECT 'note-' || g::text FROM generate_series(1, 12) g;",
+    );
+    let actual = psql(
+        pg_port,
+        "BEGIN; \
+         SET LOCAL semantic.capture_actual = 'on'; \
+         SELECT count(*) FILTER (WHERE x MEANS 'alpha') FROM filt; \
+         SET LOCAL semantic.capture_actual = 'off'; \
+         SELECT rvbbit.last_actual(); \
+         COMMIT;",
+    );
+    let actual = actual.lines().last().unwrap_or("").trim().to_string();
+    let (calls, usd) = actual.split_once(',').unwrap_or_else(|| panic!("last_actual: {actual}"));
+    let calls: f64 = calls.trim().parse().unwrap_or_else(|_| panic!("calls: {actual}"));
+    let usd: f64 = usd.trim().parse().unwrap_or_else(|_| panic!("usd: {actual}"));
+    assert_eq!(calls, 12.0, "FILTER MEANS actuals were {actual}");
+    let expect = 12.0 * 300.0 * 0.042 / 1_000_000.0;
+    assert!((usd - expect).abs() < 1e-9, "cost {usd} vs {expect} ({actual})");
+
+    // Setup already created the catalog. Bootstrap after that must grant
+    // rvbbit_auth, and a second run must not notice about existing columns.
+    psql(pg_port, "CREATE ROLE rvbbit_auth LOGIN NOSUPERUSER NOINHERIT;");
+    let before = psql(pg_port, "SELECT has_table_privilege('rvbbit_auth', 'rvbbit.semfn', 'SELECT')");
+    assert_eq!(before, "f", "semfn was granted before bootstrap: {before}");
+    let bootstrap = include_str!("../sql/bootstrap.sql");
+    let boot_path = format!("/tmp/rvbbit-ro-{pg_port}-boot.sql");
+    std::fs::write(&boot_path, bootstrap).unwrap();
+    let first = psql_file_output(pg_port, &boot_path);
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    let after = psql(pg_port, "SELECT has_table_privilege('rvbbit_auth', 'rvbbit.semfn', 'SELECT')");
+    assert_eq!(after, "t", "{after}");
+    assert_eq!(
+        psql(pg_port, "BEGIN; SET LOCAL ROLE rvbbit_auth; SELECT count(*) >= 0 FROM rvbbit.semfn; COMMIT;"),
+        "t"
+    );
+    psql(
+        pg_port,
+        "BEGIN; SET LOCAL ROLE rvbbit_auth; \
+         INSERT INTO rvbbit.oauth_client (client_id, secret_hash, redirect_uris) \
+         VALUES ('order-b', NULL, '[]'::jsonb); COMMIT;",
+    );
+    psql(pg_port, "REVOKE SELECT ON rvbbit.semfn FROM rvbbit_auth;");
+    psql(
+        pg_port,
+        "BEGIN; SET LOCAL ROLE rvbbit_auth; \
+         INSERT INTO rvbbit.oauth_client (client_id, secret_hash, redirect_uris) \
+         VALUES ('order-b-noread', NULL, '[]'::jsonb); COMMIT;",
+    );
+    let denied = Command::new(format!("{}/psql", pg_bin()))
+        .args([
+            "-h",
+            "/tmp",
+            "-p",
+            &pg_port.to_string(),
+            "-U",
+            "postgres",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "BEGIN; SET LOCAL ROLE rvbbit_auth; SELECT count(*) FROM rvbbit.semfn; COMMIT;",
+        ])
+        .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "revoked semfn should be unreadable");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).to_ascii_lowercase().contains("permission denied"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let second = psql_file_output(pg_port, &boot_path);
+    assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+    assert!(
+        !column_skip_notice(&String::from_utf8_lossy(&second.stderr)),
+        "bootstrap re-run noticed a column: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !column_skip_notice(&log),
+        "catalog re-run noticed a column:\n{log}"
+    );
+
+    drop(postgres);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+fn psql_file_output(port: u16, path: &str) -> std::process::Output {
+    Command::new(format!("{}/psql", pg_bin()))
+        .args(["-h", "/tmp", "-p", &port.to_string(), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-f", path])
+        .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+        .output()
+        .expect("psql")
+}
+
+fn column_skip_notice(text: &str) -> bool {
+    text.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("column") && lower.contains("already exists, skipping")
+    })
+}
+
+/// Bootstrap before rvbbit setup. Default privileges plus the setup grants
+/// let rvbbit_auth read semfn, and OAuth does not need that read.
+#[test]
+fn bootstrap_before_setup_grants_auth() {
+    let pg_port = free_port();
+    let hutch_port = free_port();
+    assert_ne!(pg_port, 55432);
+    assert_ne!(hutch_port, 8099);
+    let listener = TcpListener::bind(("127.0.0.1", hutch_port)).unwrap();
+    thread::spawn(move || {
+        let cfg = hutch_mock::Config {
+            latency: Duration::ZERO,
+            fail_every: 0,
+            timeout_every: 0,
+            expect_auth: None,
+        };
+        let _ = hutch_mock::serve_listener(listener, cfg);
+    });
+    let data = format!("/tmp/rvbbit-boot-{pg_port}");
+    let _ = std::fs::remove_dir_all(&data);
+    let init = Command::new(format!("{}/initdb", pg_bin()))
+        .args(["-D", &data, "--no-locale", "--encoding=UTF8", "--auth-local=trust", "-U", "postgres"])
+        .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+        .output()
+        .expect("initdb");
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    let log_path = format!("/tmp/rvbbit-boot-{pg_port}.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let postgres = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "ulimit -s 65520; exec \"{bin}\" -D \"{data}\" -k /tmp -p {pg_port} -c listen_addresses=127.0.0.1 -c io_method=sync -c max_stack_depth=60000",
+            bin = format!(
+                "{}/postgres",
+                std::env::var("CARGO_MANIFEST_DIR").unwrap().replace("/crates/rvbbit/hutch_mcp", "/target/fast-profile")
+            ),
+        ))
+        .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+        .env("PGRUST_TZDIR", "/usr/share/zoneinfo")
+        .env("RUST_MIN_STACK", "33554432")
+        .env("RVBBIT_HUTCH_URL", format!("http://127.0.0.1:{hutch_port}"))
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("postgres");
+    let postgres = ChildGuard(postgres);
+    let mut up = false;
+    for _ in 0..80 {
+        if Command::new(format!("{}/psql", pg_bin()))
+            .args(["-h", "/tmp", "-p", &pg_port.to_string(), "-U", "postgres", "-c", "SELECT 1"])
+            .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            up = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(up, "postgres did not start:\n{}", std::fs::read_to_string(&log_path).unwrap_or_default());
+
+    psql(pg_port, "CREATE ROLE rvbbit_auth LOGIN NOSUPERUSER NOINHERIT;");
+    let boot_path = format!("/tmp/rvbbit-boot-{pg_port}.sql");
+    std::fs::write(&boot_path, include_str!("../sql/bootstrap.sql")).unwrap();
+    let loaded = psql_file_output(pg_port, &boot_path);
+    assert!(loaded.status.success(), "{}", String::from_utf8_lossy(&loaded.stderr));
+    assert_eq!(psql(pg_port, "SELECT 'hello alpha' MEANS 'alpha'"), "t");
+    assert_eq!(psql(pg_port, "SELECT has_table_privilege('rvbbit_auth', 'rvbbit.semfn', 'SELECT')"), "t");
+    assert_eq!(
+        psql(pg_port, "BEGIN; SET LOCAL ROLE rvbbit_auth; SELECT count(*) >= 0 FROM rvbbit.semfn; COMMIT;"),
+        "t"
+    );
+    psql(
+        pg_port,
+        "BEGIN; SET LOCAL ROLE rvbbit_auth; \
+         INSERT INTO rvbbit.oauth_client (client_id, secret_hash, redirect_uris) \
+         VALUES ('order-a', NULL, '[]'::jsonb); COMMIT;",
+    );
+    let again = psql_file_output(pg_port, &boot_path);
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    assert!(
+        !column_skip_notice(&String::from_utf8_lossy(&again.stderr)),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
     drop(postgres);
     let _ = std::fs::remove_dir_all(&data);
 }

@@ -287,6 +287,7 @@ mod tests {
             cache: "miss".into(),
             items: 1,
             tenant: "local".into(),
+            role: String::new(),
             timestamp: "2026-10-21T00:00:00.000Z".into(),
             generation_id: None,
             node: None,

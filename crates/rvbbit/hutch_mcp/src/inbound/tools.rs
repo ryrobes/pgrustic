@@ -193,20 +193,25 @@ impl Warehouse {
             one_statement(&sql)?;
             read_only_sql(&sql)?;
             if is_explain(&sql) {
+                let _ = conn.exec("SET LOCAL semantic.capture_actual = 'on'");
                 let rows = conn.query(sql.trim().trim_end_matches(';').trim())?;
+                let _ = conn.exec("SET LOCAL semantic.capture_actual = 'off'");
                 let plan = explain_lines(&rows);
-                return Ok((plan.clone(), rows.rows.len() as i64, total_usd(&plan), semantic_calls(&plan)));
+                let (calls, usd) = executed_actuals(conn, &plan);
+                return Ok((plan, rows.rows.len() as i64, usd, calls));
             }
             let statement = capped(&sql, limit);
             let plan = explain_text(conn, &statement)?;
-            let usd = total_usd(&plan);
-            let calls = semantic_calls(&plan);
+            let estimate = total_usd(&plan);
             if let Some(cap) = id.max_cost {
-                if usd > cap + 1e-12 {
-                    return Err(format!("semantic estimate {usd:.8} USD exceeds budget {cap:.8}"));
+                if estimate > cap + 1e-12 {
+                    return Err(format!("semantic estimate {estimate:.8} USD exceeds budget {cap:.8}"));
                 }
             }
+            let _ = conn.exec("SET LOCAL semantic.capture_actual = 'on'");
             let rows = conn.query(&statement)?;
+            let _ = conn.exec("SET LOCAL semantic.capture_actual = 'off'");
+            let (calls, usd) = executed_actuals(conn, "");
             Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, usd, calls))
         })
         .await
@@ -295,17 +300,19 @@ impl Warehouse {
         as_validate: bool,
     ) -> ToolOut {
         let sql = sql.to_string();
-        self.finish(ctx, tool, Some(sql.clone()), move |_id, conn| {
+        self.finish(ctx, tool, Some(sql.clone()), move |id, conn| {
             match one_statement(&sql).and_then(|_| read_only_sql(&sql)).and_then(|_| explain_text(conn, &sql)) {
                 Ok(plan) => {
                     let usd = total_usd(&plan);
-                    let calls = semantic_calls(&plan);
+                    let over_budget = id.max_cost.is_some_and(|cap| usd > cap + 1e-12);
+                    // EXPLAIN does not call the provider. Audit actuals stay 0.
+                    // The estimate and over_budget flag are in the tool result.
                     let body = if as_validate {
-                        json!({"ok": true, "plan": plan, "usd": usd}).to_string()
+                        json!({"ok": true, "plan": plan, "usd": usd, "over_budget": over_budget}).to_string()
                     } else {
-                        plan
+                        format!("{plan}\nover_budget: {over_budget}")
                     };
-                    Ok((body, 1, usd, calls))
+                    Ok((body, 1, 0.0, 0.0))
                 }
                 Err(message) if as_validate => {
                     Ok((json!({"ok": false, "error": message}).to_string(), 0, 0.0, 0.0))
@@ -446,13 +453,27 @@ fn total_usd(plan: &str) -> f64 {
     plan_metric(plan, "total usd")
 }
 
-fn semantic_calls(plan: &str) -> f64 {
-    let semantic = plan_metric(plan, "semantic total provider calls");
-    if semantic > 0.0 {
-        semantic
-    } else {
-        plan_metric(plan, "mcp total provider calls")
+/// Provider calls and USD from the statement that just ran.
+/// `rvbbit.last_actual()` is the executor snapshot. EXPLAIN ANALYZE also
+/// prints the same numbers; a plain EXPLAIN has neither and stays at 0.
+fn executed_actuals(conn: &mut super::pg::Conn, plan: &str) -> (f64, f64) {
+    if let Ok(rows) = conn.query("SELECT rvbbit.last_actual()") {
+        if let Some(text) = rows.rows.first().and_then(|row| row.first()).and_then(|c| c.clone()) {
+            if let Some(parsed) = parse_actual(&text) {
+                if parsed.0 > 0.0 || parsed.1 > 0.0 || plan.is_empty() {
+                    return parsed;
+                }
+            }
+        }
     }
+    let calls = plan_metric(plan, "actual total calls");
+    let usd = plan_metric(plan, "actual total usd");
+    (calls, usd)
+}
+
+fn parse_actual(text: &str) -> Option<(f64, f64)> {
+    let (calls, usd) = text.split_once(',')?;
+    Some((calls.trim().parse().ok()?, usd.trim().parse().ok()?))
 }
 
 fn plan_metric(plan: &str, label: &str) -> f64 {

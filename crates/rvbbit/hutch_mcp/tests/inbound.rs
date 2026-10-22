@@ -497,6 +497,263 @@ INSERT INTO notes (owner, body) VALUES ('analyst', 'a-secret'), ('intern', 'i-se
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// FILTER (WHERE x MEANS ...) has no planner estimate. The audit row must
+/// still be the provider calls from the run. validate/explain flag
+/// over_budget against the token's cap and record 0 calls.
+#[test]
+fn audit_actuals_and_over_budget() {
+    let pg_port = free_port();
+    let http_port = free_port();
+    let hutch_port = free_port();
+    assert_ne!(pg_port, 55432);
+    assert_ne!(http_port, 8099);
+    assert_ne!(hutch_port, 8099);
+    let listener = TcpListener::bind(("127.0.0.1", hutch_port)).unwrap();
+    thread::spawn(move || {
+        let cfg = hutch_mock::Config {
+            latency: Duration::ZERO,
+            fail_every: 0,
+            timeout_every: 0,
+            expect_auth: None,
+        };
+        let _ = hutch_mock::serve_listener(listener, cfg);
+    });
+    let data = format!("/tmp/rvbbit-audit-{pg_port}");
+    let _ = std::fs::remove_dir_all(&data);
+    let init = Command::new(format!("{}/initdb", pg_bin()))
+        .args(["-D", &data, "--no-locale", "--encoding=UTF8", "--auth-local=trust", "--auth-host=trust", "-U", "postgres"])
+        .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+        .output()
+        .expect("initdb");
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    std::fs::write(
+        format!("{data}/pg_hba.conf"),
+        "\
+local all postgres trust
+local all rvbbit_auth trust
+host all postgres 127.0.0.1/32 trust
+host all rvbbit_auth 127.0.0.1/32 trust
+host all all 127.0.0.1/32 scram-sha-256
+",
+    )
+    .unwrap();
+    let log_path = format!("/tmp/rvbbit-audit-{pg_port}.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let postgres = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "ulimit -s 65520; exec \"{bin}\" -D \"{data}\" -k /tmp -p {pg_port} -c listen_addresses=127.0.0.1 -c io_method=sync -c max_stack_depth=60000",
+            bin = format!("{}/postgres", std::env::var("CARGO_MANIFEST_DIR").unwrap().replace("/crates/rvbbit/hutch_mcp", "/target/fast-profile")),
+        ))
+        .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+        .env("PGRUST_TZDIR", "/usr/share/zoneinfo")
+        .env("RUST_MIN_STACK", "33554432")
+        .env("RVBBIT_HUTCH_URL", format!("http://127.0.0.1:{hutch_port}"))
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("postgres");
+    let postgres = ChildGuard(postgres);
+    let mut up = false;
+    for _ in 0..80 {
+        if Command::new(format!("{}/psql", pg_bin()))
+            .args(["-h", "/tmp", "-p", &pg_port.to_string(), "-U", "postgres", "-c", "SELECT 1"])
+            .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            up = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(up, "postgres did not start:\n{}", std::fs::read_to_string(&log_path).unwrap_or_default());
+    psql(pg_port, "\
+CREATE ROLE rvbbit_auth LOGIN NOSUPERUSER NOINHERIT;
+CREATE ROLE analyst LOGIN PASSWORD 'analyst-secret' NOSUPERUSER;
+CREATE ROLE tight LOGIN PASSWORD 'tight-secret' NOSUPERUSER;
+CREATE ROLE broke LOGIN PASSWORD 'broke-secret' NOSUPERUSER;
+GRANT analyst, tight, broke TO rvbbit_auth;");
+    let boot = format!("/tmp/rvbbit-audit-{pg_port}.sql");
+    std::fs::write(&boot, include_str!("../sql/bootstrap.sql")).unwrap();
+    let loaded = Command::new(format!("{}/psql", pg_bin()))
+        .args(["-h", "/tmp", "-p", &pg_port.to_string(), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-f", &boot])
+        .env("PGRUST_PGSHAREDIR", "/usr/share/postgresql/18")
+        .output()
+        .unwrap();
+    assert!(loaded.status.success(), "{}", String::from_utf8_lossy(&loaded.stderr));
+    psql(pg_port, "\
+INSERT INTO rvbbit.users (role, max_cost) VALUES ('analyst', NULL), ('tight', 0.0000001), ('broke', 0);
+CREATE TABLE filt (x text);
+INSERT INTO filt SELECT 'note-' || g::text FROM generate_series(1, 12) g;
+GRANT SELECT ON filt TO analyst, tight, broke;
+SELECT 'hello alpha' MEANS 'alpha';");
+    assert_eq!(psql(pg_port, "SELECT has_table_privilege('rvbbit_auth', 'rvbbit.semfn', 'SELECT')"), "t");
+
+    let base = format!("http://127.0.0.1:{http_port}");
+    let server = Command::new(bin())
+        .args(["--inbound", &format!("127.0.0.1:{http_port}")])
+        .env("RVBBIT_PG_CONNINFO", format!("host=/tmp port={pg_port} dbname=postgres user=rvbbit_auth"))
+        .env("RVBBIT_PG_PASSWORD_HOST", "127.0.0.1")
+        .env("RVBBIT_PG_PASSWORD_PORT", pg_port.to_string())
+        .env("RVBBIT_PG_PASSWORD_DB", "postgres")
+        .env("RVBBIT_MCP_JWT_SECRET", "inbound-test-secret")
+        .env("RVBBIT_MCP_PUBLIC_URL", &base)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("inbound");
+    let server = ChildGuard(server);
+    let http = agent();
+    let mut healthy = false;
+    for _ in 0..50 {
+        if http.get(&format!("{base}/health")).call().is_ok() {
+            healthy = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(healthy, "inbound server did not listen");
+    let (status, reg, _) = call(
+        &http,
+        "POST",
+        &format!("{base}/register"),
+        "application/json",
+        &json!({"redirect_uris":["http://127.0.0.1:9/cb"],"client_name":"audit"}).to_string(),
+    );
+    assert_eq!(status, 201, "register after setup failed: {reg}");
+    let client_id = serde_json::from_str::<Value>(&reg).unwrap()["client_id"].as_str().unwrap().to_string();
+
+    let analyst = bearer(&http, &base, &client_id, "analyst", "analyst-secret");
+    let (_, _, session) = mcp(
+        &http,
+        &base,
+        &analyst,
+        None,
+        1,
+        "initialize",
+        json!({"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"audit","version":"0"}}),
+    );
+    let calls_before = psql(pg_port, "SELECT count(*) FROM rvbbit.calls WHERE op = 'predict'");
+    let (_, ran, _) = mcp(
+        &http,
+        &base,
+        &analyst,
+        session.as_deref(),
+        2,
+        "tools/call",
+        json!({"name":"run_sql","arguments":{"sql":"SELECT count(*) FILTER (WHERE x MEANS 'alpha') FROM filt"}}),
+    );
+    assert_ne!(ran["result"]["isError"], json!(true), "{ran}");
+    let audited = psql(
+        pg_port,
+        "SELECT semantic_calls::text || ',' || cost_usd::text FROM rvbbit.mcp_audit \
+         WHERE tool = 'run_sql' AND status = 'ok' AND subject = 'analyst' ORDER BY id DESC LIMIT 1",
+    );
+    let (calls, usd) = audited.split_once(',').unwrap_or_else(|| panic!("audit: {audited}"));
+    let calls: f64 = calls.trim().parse().unwrap_or_else(|_| panic!("{audited}"));
+    let usd: f64 = usd.trim().parse().unwrap_or_else(|_| panic!("{audited}"));
+    assert_eq!(calls, 12.0, "audit recorded an estimate, not the run: {audited}");
+    let expect = 12.0 * 300.0 * 0.042 / 1_000_000.0;
+    assert!((usd - expect).abs() < 1e-9, "audit usd {usd} vs {expect} ({audited})");
+    assert!(usd < 1.0, "audit looks like the 13.2 estimate: {audited}");
+
+    let tight = bearer(&http, &base, &client_id, "tight", "tight-secret");
+    let (_, _, tight_session) = mcp(
+        &http,
+        &base,
+        &tight,
+        None,
+        1,
+        "initialize",
+        json!({"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"tight","version":"0"}}),
+    );
+    let (_, validated, _) = mcp(
+        &http,
+        &base,
+        &tight,
+        tight_session.as_deref(),
+        2,
+        "tools/call",
+        json!({"name":"validate_sql","arguments":{"sql":"SELECT 'hello alpha' MEANS 'alpha'"}}),
+    );
+    let body: Value = serde_json::from_str(&tool_text(&validated)).unwrap_or_else(|_| panic!("{validated}"));
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["over_budget"], true, "{body}");
+    let plan = body["plan"].as_str().unwrap_or("").to_ascii_lowercase();
+    assert!(plan.contains("seq scan") || plan.contains("result"), "{plan}");
+    let (_, explained, _) = mcp(
+        &http,
+        &base,
+        &tight,
+        tight_session.as_deref(),
+        3,
+        "tools/call",
+        json!({"name":"explain","arguments":{"sql":"SELECT 'hello alpha' MEANS 'alpha'"}}),
+    );
+    let explain_text = tool_text(&explained).to_ascii_lowercase();
+    assert!(explain_text.contains("over_budget: true"), "{explain_text}");
+    assert!(explain_text.contains("seq scan") || explain_text.contains("result"), "{explain_text}");
+
+    let (_, open, _) = mcp(
+        &http,
+        &base,
+        &analyst,
+        session.as_deref(),
+        4,
+        "tools/call",
+        json!({"name":"validate_sql","arguments":{"sql":"SELECT 'hello alpha' MEANS 'alpha'"}}),
+    );
+    let open_body: Value = serde_json::from_str(&tool_text(&open)).unwrap_or_else(|_| panic!("{open}"));
+    assert_eq!(open_body["over_budget"], false, "{open_body}");
+    let estimates = psql(
+        pg_port,
+        "SELECT count(*) FROM rvbbit.mcp_audit \
+         WHERE tool IN ('validate_sql', 'explain') AND (COALESCE(semantic_calls, 0) <> 0 OR COALESCE(cost_usd, 0) <> 0)",
+    );
+    assert_eq!(estimates, "0", "explain/validate audited a provider call: {estimates}");
+
+    let broke = bearer(&http, &base, &client_id, "broke", "broke-secret");
+    let (_, _, broke_session) = mcp(
+        &http,
+        &base,
+        &broke,
+        None,
+        1,
+        "initialize",
+        json!({"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"broke","version":"0"}}),
+    );
+    let (_, blocked, _) = mcp(
+        &http,
+        &base,
+        &broke,
+        broke_session.as_deref(),
+        2,
+        "tools/call",
+        json!({"name":"run_sql","arguments":{"sql":"SELECT count(*) FILTER (WHERE x MEANS 'alpha') FROM filt"}}),
+    );
+    assert_eq!(blocked["result"]["isError"], true, "{blocked}");
+    assert!(tool_text(&blocked).to_ascii_lowercase().contains("budget"), "{blocked}");
+    let calls_after = psql(pg_port, "SELECT count(*) FROM rvbbit.calls WHERE op = 'predict'");
+    let before_n: i64 = calls_before.trim().parse().unwrap_or(0);
+    let after_n: i64 = calls_after.trim().parse().unwrap_or(0);
+    // The analyst statement added the 12 misses. The rejected statement adds none.
+    assert_eq!(after_n, before_n + 12, "budget pre-flight called the provider: before {calls_before} after {calls_after}");
+    let zero = psql(
+        pg_port,
+        "SELECT semantic_calls::text || ',' || cost_usd::text FROM rvbbit.mcp_audit \
+         WHERE tool = 'run_sql' AND status = 'error' AND subject = 'broke' ORDER BY id DESC LIMIT 1",
+    );
+    assert_eq!(zero, "0,0", "{zero}");
+
+    drop(server);
+    drop(postgres);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 fn bearer(agent: &ureq::Agent, base: &str, client_id: &str, user: &str, password: &str) -> String {
     let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";

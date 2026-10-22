@@ -159,6 +159,9 @@ CREATE SERVER demo FOREIGN DATA WRAPPER mcp OPTIONS (
   command '${HUTCH_BIN}',
   args '--mock-stdio'
 );
+-- Load the catalog before the tools exist. The next plan must refresh
+-- mcp.tool or count(*) stays on the serial path.
+SELECT 1;
 IMPORT FOREIGN TOOLS FROM SERVER demo INTO mcp_demo;
 SQL
 grep -q 'skipping MCP tool' "$RUNDIR/import.out"
@@ -247,6 +250,42 @@ EXPLAIN (ANALYZE, COSTS ON) SELECT count(*) FROM (SELECT mcp_demo.now() FROM mcp
 SQL
 grep -q 'MCP Provider Calls' "$RUNDIR/aggnow.out"
 grep -E -q 'MCP Batches: [1-9]' "$RUNDIR/aggnow.out"
+
+echo "=== slow stdio under count(*) overlaps ==="
+# 8 rows * 200ms is 1600ms when each row opens its own process. Concurrency 4
+# is two waves, plus one process start. The plan must show the MCP Result
+# under the aggregate; an instant echo can pass with a different path.
+"${PSQL[@]}" -c "EXPLAIN SELECT count(*) FROM (SELECT mcp_demo.slow(x) FROM mcp_agg) s;" | tee "$RUNDIR/slowplan.out"
+grep -q 'Aggregate' "$RUNDIR/slowplan.out"
+grep -q 'Result' "$RUNDIR/slowplan.out"
+grep -q 'MCP' "$RUNDIR/slowplan.out"
+START=$(date +%s%N)
+SLOW_N=$("${PSQL[@]}" -tA -c "SELECT count(*) FROM (SELECT mcp_demo.slow(x) FROM mcp_agg) s;")
+END=$(date +%s%N)
+ELAPSED_MS=$(( (END - START) / 1000000 ))
+echo "slow count=$SLOW_N elapsed_ms=$ELAPSED_MS"
+test "$SLOW_N" = "8"
+test "$ELAPSED_MS" -lt 1200
+
+echo "=== same plan without USAGE on schema mcp ==="
+"${PSQL[@]}" <<'SQL' | tee "$RUNDIR/norole.out"
+CREATE ROLE mcp_blind NOLOGIN;
+GRANT USAGE ON SCHEMA mcp_demo TO mcp_blind;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA mcp_demo TO mcp_blind;
+GRANT SELECT ON mcp_agg TO mcp_blind;
+GRANT USAGE ON SCHEMA rvbbit TO mcp_blind;
+GRANT SELECT ON rvbbit.semfn, rvbbit.semop, rvbbit.backend, rvbbit.model,
+  rvbbit.decision_tree, rvbbit.workflow TO mcp_blind;
+REVOKE ALL ON SCHEMA mcp FROM PUBLIC;
+REVOKE ALL ON SCHEMA mcp FROM mcp_blind;
+BEGIN;
+SET LOCAL ROLE mcp_blind;
+EXPLAIN SELECT count(*) FROM (SELECT mcp_demo.slow(x) FROM mcp_agg) s;
+COMMIT;
+SQL
+grep -q 'Aggregate' "$RUNDIR/norole.out"
+grep -q 'Result' "$RUNDIR/norole.out"
+grep -q 'MCP' "$RUNDIR/norole.out"
 "${PSQL[@]}" <<'SQL' | tee "$RUNDIR/rows.out"
 CREATE TABLE mcp_rows (x text);
 INSERT INTO mcp_rows SELECT 'a' FROM generate_series(1, 10);

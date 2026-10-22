@@ -108,6 +108,8 @@ fn lift_tree<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Node<'mcx>> {
         wrap_project(mcx, plan)?
     } else if is_join(plan) && tlist_contains_project(&plan.as_plan().expect("plan").targetlist) {
         wrap_project(mcx, plan)?
+    } else if plan.node_tag() == NodeTag::T_Agg {
+        sink_agg_project(mcx, plan)?
     } else {
         plan
     };
@@ -730,6 +732,80 @@ fn copy_target_entry<'mcx>(
             resjunk: src.resjunk,
         },
     )
+}
+
+/// `count(*)` over a subquery can leave a volatile tool on the Aggregate
+/// target list as resjunk. That is not a Result, so the MCP batcher never
+/// sees it and each row opens its own stdio process. Move those resjunk
+/// calls onto a Result under the aggregate. The aggregate still counts
+/// every child row, and it does not evaluate the tool a second time.
+fn sink_agg_project<'mcx>(mcx: Mcx<'mcx>, agg: Node<'mcx>) -> PgResult<Node<'mcx>> {
+    let base = agg.as_plan().expect("agg");
+    if !tlist_contains_project(&base.targetlist) {
+        return Ok(agg);
+    }
+    let Some(child) = base.lefttree else {
+        return Ok(agg);
+    };
+    if !is_base_scan(child) && child.node_tag() != NodeTag::T_Result {
+        return Ok(agg);
+    }
+    let extras: Vec<Node<'mcx>> = base
+        .targetlist
+        .iter()
+        .filter_map(|tle_node| {
+            let tle = tle_node.as_target_entry()?;
+            if tle.resjunk && expr_contains_project(tle.expr) {
+                Some(tle.expr)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if extras.is_empty() {
+        return Ok(agg);
+    }
+    let mut child_tlist = child.as_plan().expect("child").targetlist.clone_in(mcx)?;
+    let mut resno = 1i16;
+    for tle in child_tlist.iter() {
+        let te = tle.as_target_entry().expect("TargetEntry");
+        if te.resno >= resno {
+            resno = te.resno.saturating_add(1);
+        }
+    }
+    for expr in extras {
+        let tle = Node::mk(
+            mcx,
+            TargetEntry {
+                expr,
+                resno,
+                resname: None,
+                ressortgroupref: 0,
+                resorigtbl: 0,
+                resorigcol: 0,
+                resjunk: true,
+            },
+        )?;
+        child_tlist.lappend(mcx, tle)?;
+        resno = resno.saturating_add(1);
+    }
+    unsafe { child.with_plan_mut(|p| p.targetlist = child_tlist) }.expect("child");
+    let wrapped = if is_base_scan(child) {
+        wrap_project(mcx, child)?
+    } else {
+        child
+    };
+    unsafe { agg.with_plan_mut(|p| p.lefttree = Some(wrapped)) }.expect("agg");
+    let mut kept = NodeList::nil();
+    for tle_node in agg.as_plan().expect("agg").targetlist.iter() {
+        let tle = tle_node.as_target_entry().expect("TargetEntry");
+        if tle.resjunk && expr_contains_project(tle.expr) {
+            continue;
+        }
+        kept.lappend(mcx, tle_node)?;
+    }
+    unsafe { agg.with_plan_mut(|p| p.targetlist = kept) }.expect("agg");
+    Ok(agg)
 }
 
 fn wrap_project<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {

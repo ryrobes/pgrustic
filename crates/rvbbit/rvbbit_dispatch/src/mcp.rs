@@ -177,6 +177,7 @@ pub fn note_mcp_memo_hit(server: &str, tool: &str, ok: bool) {
         "cache": "hit",
         "items": 1,
         "tenant": crate::call_role(),
+        "role": crate::call_role(),
         "generation_id": status,
         "node": server,
         "score": null,

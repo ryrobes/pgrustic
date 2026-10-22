@@ -247,12 +247,18 @@ fn openrouter_rerank_payload(text: &str) -> (u16, String) {
 }
 
 fn post(url: &str, mode: &str, req: &BatchRequest) -> BatchResponse {
+    post_role(url, mode, None, req)
+}
+
+fn post_role(url: &str, mode: &str, role: Option<&str>, req: &BatchRequest) -> BatchResponse {
     let body = serde_json::to_string(req).unwrap();
-    let resp = ureq::post(url)
+    let mut req_http = ureq::post(url)
         .set("Content-Type", "application/json")
-        .set("X-Rvbbit-Cache", &format!("mode={mode}"))
-        .send_string(&body)
-        .unwrap();
+        .set("X-Rvbbit-Cache", &format!("mode={mode}"));
+    if let Some(role) = role {
+        req_http = req_http.set("X-Rvbbit-Role", role);
+    }
+    let resp = req_http.send_string(&body).unwrap();
     serde_json::from_str(&resp.into_string().unwrap()).unwrap()
 }
 
@@ -1540,4 +1546,59 @@ fn summary_batch_overlaps_slow_chats() {
         "summary chats did not overlap; max in flight {}",
         SLOW_MAX.load(Ordering::SeqCst)
     );
+}
+
+/// Worker threads do not inherit the request thread-local. MEANS, CLASSIFY,
+/// EXTRACT, and RERANK must still meter the SQL role, not the cache tenant.
+#[test]
+fn worker_calls_meter_the_role_header() {
+    let h = harness(Some("test-key"));
+    let role = "sem_reader";
+    let mut means = predict("TRUE_CASE role", "alpha");
+    means.items[0].cache_key = "c".repeat(8);
+    let got = post_role(&format!("{}/v1/means", h.hutch), "off", Some(role), &means);
+    assert!(got.outputs[0].error.is_none(), "{got:?}");
+    let call = &got.outputs[0].calls.as_ref().expect("means calls")[0];
+    assert_eq!(call.tenant, role, "{call:?}");
+    assert_eq!(call.role, role, "{call:?}");
+    assert_ne!(call.tenant, "local");
+
+    let mut kind = predict("BIGFOOT tracks role", "ignored");
+    kind.operation = Operation::Classify;
+    kind.model = "mock".into();
+    kind.items[0].labels = Some(labels());
+    kind.items[0].cache_key = "d".repeat(8);
+    let classified = post_role(&format!("{}/v1/classify", h.hutch), "off", Some(role), &kind);
+    assert!(classified.outputs[0].error.is_none(), "{classified:?}");
+    let call = &classified.outputs[0].calls.as_ref().expect("classify calls")[0];
+    assert_eq!(call.tenant, role, "{call:?}");
+    assert_eq!(call.role, role, "{call:?}");
+
+    let mut extracted = predict("JSON_CASE role", "creature");
+    extracted.operation = Operation::Extract;
+    extracted.items[0].cache_key = "e".repeat(8);
+    let extracted = post_role(&format!("{}/v1/extract", h.hutch), "off", Some(role), &extracted);
+    assert!(extracted.outputs[0].error.is_none(), "{extracted:?}");
+    let call = &extracted.outputs[0].calls.as_ref().expect("extract calls")[0];
+    assert_eq!(call.tenant, role, "{call:?}");
+    assert_eq!(call.role, role, "{call:?}");
+
+    let mut rank = predict("LOGGING road at dusk role", "logging road");
+    rank.operation = Operation::Rerank;
+    rank.model = "mock".into();
+    rank.items[0].system = Some("Is this document relevant to the query?".into());
+    rank.items[0].criterion = Some("logging road".into());
+    rank.items[0].cache_key = "f".repeat(8);
+    let ranked = post_role(&format!("{}/v1/rerank", h.hutch), "off", Some(role), &rank);
+    assert!(ranked.outputs[0].error.is_none(), "{ranked:?}");
+    let call = &ranked.outputs[0].calls.as_ref().expect("rerank calls")[0];
+    assert_eq!(call.tenant, role, "{call:?}");
+    assert_eq!(call.role, role, "{call:?}");
+
+    let logged = calls_of(&h.hutch, 20);
+    for op in ["predict", "classify", "extract", "rerank"] {
+        let row = logged.iter().find(|row| row["op"] == op && row["role"] == role);
+        assert!(row.is_some(), "missing {op} role row in {logged:?}");
+        assert_eq!(row.unwrap()["tenant"], role, "{row:?}");
+    }
 }
