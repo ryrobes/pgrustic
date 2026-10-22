@@ -382,6 +382,34 @@ The trimmed noul JSON for the fixed six-row fixture, criterion
 `a large hairy biped was seen`, prompt `Does the text match the
 criterion?`, model `typesafe/jev-1.14`, is 72–79 rough tokens and
 202–240 bytes (`rough_tokens` counts words plus punctuation). Row 1 is
-79 tokens and 240 bytes, down from the old 125-token body. Live
-provider `input_tokens` of 291–379 include Jev's own prompt on top of
-this JSON. That wrapper is not in the request we post.
+79 tokens and 240 bytes, down from the old 125-token body. A previous
+live run billed `input_tokens` of 291–379 for those calls. This
+environment's OpenRouter key is a dummy, so that billed range was not
+remeasured.
+
+The gap is Jev's prompt, which is not in the JSON we post. OpenRouter's
+decisions reference prints a three-question example whose compact JSON
+is 284 rough tokens and 892 bytes, and the response on that page reports
+`usage.input_tokens` 476. That pair is theirs, not a call we made. 476
+minus 284 is 192 tokens of wrapper on a much larger request than ours.
+Our row-1 body is 79 rough tokens, so a bill near 300 is about 220
+tokens of wrapper plus the body.
+
+Batching several rows into one decision call does not fit the schema.
+`POST /api/alpha/decisions` takes one `state` (a string, object, or
+array of related context) and one `questions` object. The answer map is
+for that state. An array state is still one context, not one answer per
+element. OpenRouter's classification cookbook runs one request per item
+and parallelizes the requests. Eight of our noul bodies are 640 rough
+tokens. One JSON that stuffs those eight strings into `state` and asks
+eight questions is 467 rough tokens, so the bytes we would upload drop,
+but every question would see every row. That is a different decision,
+and without a live key there is no billed-token number for it. Hutch
+still posts one string `state` per row. HTTP batches of 32 are separate
+decision calls, overlapped by concurrency.
+
+Shortening the criteria does not close the gap. Noul already omits
+`criteria`. The choice gloss for the bigfoot trio raised the scaffold
+from 85 rough tokens to 111. That is 26 tokens next to a wrapper of
+about 200. Dropping the gloss would not turn a ~300-token bill into the
+75-token body.
