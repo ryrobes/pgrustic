@@ -65,8 +65,19 @@ was the part we were sending twice.
 Fixed-label classify is one Decisions request per row, not one per label.
 Jev's `choice` question returns every label's probability. Output tokens
 are free; the charge is input tokens of the state and the criteria.
-A binary-only model would need three `noul` calls per row and then
-argmax. That fallback is not implemented.
+`CLASSIFY(notes INTO 'bigfoot', 'known animal', 'unclear')` sends a
+gloss for each label (an unidentified primate, a recognized species,
+tracks or sounds with no creature). The choice scaffold grew from 85
+tokens with the bare labels to 111 with the gloss, still under the
+legacy body at 124. Any other bare label is sent as itself. A custom
+`LABELS (... AS ...)` description replaces the gloss.
+When that single take's winning probability is below 0.60, hutch asks
+once more with `Scores were close. Match the description, not a nearby topic.`
+and averages the two probability maps. A winner at 0.75 does not.
+Stacked `TAKES`, models, or `PHRASINGS` are not asked a third time.
+The retry is a different body, so `identical` stays null. A binary-only
+model would need three `noul` calls per row and then argmax. That
+fallback is not implemented.
 
 `TAKES`, `PHRASINGS`, and `PICK` are clause tails. A call-site clause
 wins over `DEFAULT CLAUSES` on the function, which wins over the
@@ -78,8 +89,8 @@ it null. A live Jev run varied by about 0.03 across takes of one phrasing,
 so `identical` was false. A second phrasing moved UFO row 2 from about
 0.67 to about 0.83, more than extra takes moved it. `semantic.budget`
 aborts the session when
-`rvbbit.calls` cost would pass the cap. Embed is still per-item
-`unsupported`. Decide is the same `noul` path as predict.
+`rvbbit.calls` cost would pass the cap. Embed is `POST /v1/embed`.
+Decide is the same `noul` path as predict.
 
 `SUMMARIZE(expr)` and `CONSENSUS(expr, criterion)` are aggregates. The
 transition concatenates the group; the final calls hutch once.

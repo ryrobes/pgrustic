@@ -470,8 +470,23 @@ fn choice_json(text: &str) -> Result<String, String> {
         return Ok(r#"{"answers":{"label":{"type":"choice","choice":"unclear","confidence":0.5}}}"#.into());
     }
     let bigfoot = map.get("bigfoot").and_then(|v| v.as_str()).unwrap_or("");
-    if bigfoot != "bigfoot" && !text.contains("CUSTOMDESC") {
+    if !text.contains("CUSTOMDESC")
+        && bigfoot != "an unidentified large primate or sasquatch"
+        && bigfoot != "bigfoot"
+    {
         return Err(format!("default bigfoot description was {bigfoot}"));
+    }
+    if text.contains("AMBIG") {
+        if text.contains("Scores were close") {
+            return Ok(
+                r#"{"answers":{"label":{"type":"choice","choice":"bigfoot","probabilities":{"bigfoot":0.90,"known animal":0.05,"unclear":0.05},"confidence":0.5}}}"#
+                    .into(),
+            );
+        }
+        return Ok(
+            r#"{"answers":{"label":{"type":"choice","choice":"known animal","probabilities":{"bigfoot":0.42,"known animal":0.46,"unclear":0.12},"confidence":0.5}}}"#
+                .into(),
+        );
     }
     let state = body.get("state").ok_or("choice question has no state")?;
     if !state.is_string() {
@@ -1211,8 +1226,14 @@ fn decision_stack_alias_and_classify() {
     kind.operation = Operation::Classify;
     kind.model = "mock".into();
     kind.items[0].labels = Some(labels());
+    let before_kind = h.provider_hits.load(Ordering::SeqCst);
     let classified = post(&format!("{}/v1/classify", h.hutch), "off", &kind);
     assert_eq!(classified.outputs[0].value, Some(serde_json::json!("bigfoot")));
+    assert_eq!(
+        h.provider_hits.load(Ordering::SeqCst),
+        before_kind + 1,
+        "a 0.75 winner does not take a second pass"
+    );
     assert_eq!(classified.outputs[0].score, Some(0.75), "winning score is the probability");
     assert_ne!(classified.outputs[0].score, Some(0.5));
     let scores = classified.outputs[0].scores.as_ref().unwrap();
@@ -1287,6 +1308,29 @@ fn decision_stack_alias_and_classify() {
     assert_eq!(chat.tokens_out, Some(20));
     assert!(near(chat.cost_usd, 0.000027), "{:?}", chat.cost_usd);
     assert_eq!(chat.generation_id.as_deref(), Some("gen-chat-1"));
+}
+
+#[test]
+fn low_confidence_choice_takes_a_second_pass() {
+    let h = harness(Some("test-key"));
+    let mut kind = predict("AMBIG tracks in the snow and a distant howl", "ignored");
+    kind.operation = Operation::Classify;
+    kind.model = "mock".into();
+    kind.items[0].labels = Some(labels());
+    let before = h.provider_hits.load(Ordering::SeqCst);
+    let got = post(&format!("{}/v1/classify", h.hutch), "off", &kind);
+    assert!(got.outputs[0].error.is_none(), "{:?}", got.outputs[0].error);
+    assert_eq!(
+        h.provider_hits.load(Ordering::SeqCst),
+        before + 2,
+        "a 0.46 winner asks once more"
+    );
+    assert_eq!(got.outputs[0].calls.as_ref().unwrap().len(), 2);
+    // (0.42+0.90)/2 = 0.66 beats (0.46+0.05)/2 = 0.255.
+    assert_eq!(got.outputs[0].value, Some(serde_json::json!("bigfoot")));
+    let score = got.outputs[0].score.unwrap();
+    assert!((score - 0.66).abs() < 1e-9, "{score}");
+    assert!(got.outputs[0].identical_takes.is_none(), "the retry is not a repeated take");
 }
 
 #[test]

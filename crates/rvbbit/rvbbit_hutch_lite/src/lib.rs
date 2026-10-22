@@ -1532,23 +1532,54 @@ fn choice_scored(
             }
         }
     }
+    // One extra choice when a single take is a toss-up. Stacked takes,
+    // models, or phrasings already asked more than once, so they are left
+    // alone. The retry prompt is a different body, so it is not a repeat
+    // of the first take and does not set `identical`.
+    let single = plan.models.len() == 1 && plan.takes == 1 && plan.phrasings.is_empty();
+    if single {
+        let (_, best) = choice_winner(&labels, &sums, calls);
+        if best < CHOICE_RETRY_BELOW {
+            let model = &plan.models[0];
+            let mut asked = item.clone();
+            asked.prompt = Some(CHOICE_RETRY_PROMPT.to_string());
+            let (text, meter) = decision_http(
+                server,
+                tenant,
+                operation,
+                DecisionKind::Choice,
+                model,
+                1,
+                &asked,
+                memo,
+            )?;
+            meters.push(meter);
+            let hit = parse_choice(&text).map_err(map_decision_err)?;
+            let mut fp = String::new();
+            for label in &labels {
+                let p = hit.probabilities.get(label).copied().unwrap_or(0.0);
+                *sums.entry(label.clone()).or_insert(0.0) += p;
+                fp.push_str(&format!("{label}={p:.6};"));
+            }
+            prints.push((format!("{model}\n{CHOICE_RETRY_PROMPT}"), fp));
+            calls += 1.0;
+        }
+    }
     let identical = identical_prints(&prints);
-    if prints.len() >= 2 {
+    let repeated = prints
+        .iter()
+        .any(|(key, _)| prints.iter().filter(|(other, _)| other == key).count() >= 2);
+    if repeated {
         for meter in &mut meters {
             meter.identical = Some(identical);
         }
         stamp_logged_identical(server, &meters);
     }
     let mut scores = serde_json::Map::new();
-    let mut best_label = labels[0].clone();
-    let mut best = f64::NEG_INFINITY;
+    let (best_label, best) = choice_winner(&labels, &sums, calls);
     for label in &labels {
         let mean = sums.get(label).copied().unwrap_or(0.0) / calls;
         scores.insert(label.clone(), serde_json::json!(mean));
-        if mean > best {
-            best = mean;
-            best_label = label.clone();
-        }
     }
     let mut scored = Scored::from_calls(
         serde_json::Value::String(best_label),
@@ -1556,10 +1587,24 @@ fn choice_scored(
         Some(serde_json::Value::Object(scores)),
         meters,
     );
-    if prints.len() >= 2 {
+    if repeated {
         scored.identical_takes = Some(identical);
     }
     Ok(scored)
+}
+
+fn choice_winner(labels: &[String], sums: &HashMap<String, f64>, calls: f64) -> (String, f64) {
+    let mut best_label = labels[0].clone();
+    let mut best = f64::NEG_INFINITY;
+    let denom = if calls > 0.0 { calls } else { 1.0 };
+    for label in labels {
+        let mean = sums.get(label).copied().unwrap_or(0.0) / denom;
+        if mean > best {
+            best = mean;
+            best_label = label.clone();
+        }
+    }
+    (best_label, best)
 }
 
 fn combine_noul(combine: Combine, threshold: f64, scores: &[f64]) -> (bool, f64) {
@@ -1799,10 +1844,22 @@ fn choice_body(model: &str, item: &ItemRequest) -> Result<String, ItemError> {
     serde_json::to_string(&body).map_err(|e| item_err("provider", &e.to_string()))
 }
 
+/// Winning probability below this gets one extra `choice` call.
+/// Measured against the mock: a 0.46/0.42 split is a toss-up, and a
+/// 0.75 winner is not. Not a live calibration.
+const CHOICE_RETRY_BELOW: f64 = 0.60;
+
+/// Second-pass instruction. Short on purpose: the criteria object already
+/// carries the descriptions, and a long prompt is billed input tokens.
+const CHOICE_RETRY_PROMPT: &str = "Scores were close. Match the description, not a nearby topic.";
+
 /// Decisions `choice.criteria` is an object of label to description.
-/// An array is HTTP 400. A blank description is the label itself.
-/// SQL `LABELS ('bigfoot' AS '...')` still sends the custom text.
+/// An array is HTTP 400. A blank description is the label itself, except
+/// the bigfoot trio, which gets a fixed gloss so a sighting, a known
+/// species, and tracks-or-sounds are not the same string. SQL
+/// `LABELS ('bigfoot' AS '...')` still sends the custom text.
 fn choice_criteria(labels: &[String], descriptions: Option<&[String]>) -> serde_json::Map<String, serde_json::Value> {
+    let gloss = bare_bigfoot_gloss(labels, descriptions);
     labels
         .iter()
         .enumerate()
@@ -1813,11 +1870,41 @@ fn choice_criteria(labels: &[String], descriptions: Option<&[String]>) -> serde_
                 .filter(|s| !s.is_empty());
             let text = match custom {
                 Some(s) => s.to_string(),
-                None => label.clone(),
+                None => gloss
+                    .as_ref()
+                    .and_then(|rows| rows.get(i))
+                    .cloned()
+                    .unwrap_or_else(|| label.clone()),
             };
             (label.clone(), serde_json::Value::String(text))
         })
         .collect()
+}
+
+/// Gloss for `CLASSIFY(... INTO 'bigfoot', 'known animal', 'unclear')`
+/// when every description is blank. Any other label set stays as the
+/// label text. Order follows `labels`.
+fn bare_bigfoot_gloss(labels: &[String], descriptions: Option<&[String]>) -> Option<Vec<String>> {
+    let filled = descriptions.is_some_and(|rows| rows.iter().any(|s| !s.trim().is_empty()));
+    if filled || labels.len() != 3 {
+        return None;
+    }
+    let mut names: Vec<String> = labels.iter().map(|s| s.trim().to_ascii_lowercase()).collect();
+    names.sort();
+    if names != ["bigfoot", "known animal", "unclear"] {
+        return None;
+    }
+    Some(
+        labels
+            .iter()
+            .map(|label| match label.trim().to_ascii_lowercase().as_str() {
+                "bigfoot" => "an unidentified large primate or sasquatch",
+                "known animal" => "a recognized species such as a deer, bear, or owl",
+                _ => "no creature is identified; tracks, smells, or sounds alone",
+            })
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 fn choice_instructions(item: &ItemRequest, _labels: &[String]) -> String {
@@ -3140,6 +3227,20 @@ mod tests {
         assert_eq!(map["unclear"], serde_json::json!("unclear"));
         let plain = choice_criteria(&labels, None);
         assert_eq!(plain["bigfoot"], serde_json::json!("bigfoot"));
+        let trio = vec!["bigfoot".into(), "known animal".into(), "unclear".into()];
+        let gloss = choice_criteria(&trio, None);
+        assert_eq!(gloss["bigfoot"], serde_json::json!("an unidentified large primate or sasquatch"));
+        assert_eq!(
+            gloss["known animal"],
+            serde_json::json!("a recognized species such as a deer, bear, or owl")
+        );
+        assert_eq!(
+            gloss["unclear"],
+            serde_json::json!("no creature is identified; tracks, smells, or sounds alone")
+        );
+        let custom = choice_criteria(&trio, Some(&["CUSTOM".into(), String::new(), String::new()]));
+        assert_eq!(custom["bigfoot"], serde_json::json!("CUSTOM"));
+        assert_eq!(custom["unclear"], serde_json::json!("unclear"));
     }
 
     fn demo_item(input: &str, criterion: &str) -> ItemRequest {
@@ -3255,12 +3356,17 @@ mod tests {
         let old_choice_scaffold = scaffold_tokens(&old_choice, input);
         let new_choice_scaffold = scaffold_tokens(&new_choice, input);
         assert_eq!(old_choice_scaffold, 124, "{old_choice}");
-        assert_eq!(new_choice_scaffold, 85, "{new_choice}");
+        // Bare labels were 85 scaffold tokens. The gloss measured 111,
+        // still under the legacy 124 that repeated "best described as".
+        assert_eq!(new_choice_scaffold, 111, "{new_choice}");
         assert!(
-            new_choice_scaffold * 10 <= old_choice_scaffold * 8,
-            "choice scaffold tokens {old_choice_scaffold} -> {new_choice_scaffold}"
+            new_choice.contains(r#""bigfoot":"an unidentified large primate or sasquatch""#),
+            "{new_choice}"
         );
-        assert!(new_choice.contains(r#""bigfoot":"bigfoot""#), "{new_choice}");
+        assert!(
+            new_choice.contains("no creature is identified; tracks, smells, or sounds alone"),
+            "{new_choice}"
+        );
         assert!(!new_choice.contains("best described"), "{new_choice}");
     }
 
