@@ -306,11 +306,17 @@ pub struct Work {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Estimate {
     pub calls: f64,
+    /// USD after the cache hit rate. EXPLAIN prints this as the expected cost.
     pub usd: f64,
+    /// USD with the hit rate ignored. A miss costs this much. The cap uses it.
+    pub usd_worst: f64,
     pub latency_ms: f64,
     pub selectivity: f64,
     pub model: String,
+    /// Charged items, after the cache hit rate.
     pub items: f64,
+    /// Items with the hit rate ignored.
+    pub items_worst: f64,
 }
 
 impl Estimate {
@@ -318,18 +324,22 @@ impl Estimate {
         Self {
             calls: 0.0,
             usd: 0.0,
+            usd_worst: 0.0,
             latency_ms: 0.0,
             selectivity: 1.0,
             model: String::new(),
             items: 0.0,
+            items_worst: 0.0,
         }
     }
 
     pub fn add(&mut self, other: &Estimate) {
         self.calls += other.calls;
         self.usd += other.usd;
+        self.usd_worst += other.usd_worst;
         self.latency_ms += other.latency_ms;
         self.items += other.items;
+        self.items_worst += other.items_worst;
         if self.model.is_empty() {
             self.model = other.model.clone();
         } else if !other.model.is_empty() && !self.model.split(',').any(|m| m.trim() == other.model) {
@@ -643,10 +653,12 @@ pub fn estimate(work: &Work) -> Estimate {
     Estimate {
         calls,
         usd: charged * usd_per_item,
+        usd_worst: items * usd_per_item,
         latency_ms: waves * latency_per,
         selectivity: sel,
         model,
         items: charged,
+        items_worst: items,
     }
 }
 
@@ -1717,6 +1729,7 @@ mod tests {
         assert!((warm.usd).abs() < 1e-12, "{}", warm.usd);
         let priced = with_mcp_unit_usd(Some(0.001), || estimate(&work));
         assert!((priced.usd - 0.01).abs() < 1e-12, "{}", priced.usd);
+        assert!((priced.usd_worst - 0.01).abs() < 1e-12, "{}", priced.usd_worst);
         assert_eq!(priced.calls, 1.0);
         let still = estimate(&work);
         assert!((still.usd).abs() < 1e-12, "{}", still.usd);
@@ -1747,5 +1760,55 @@ mod tests {
         assert!(err.contains("no cost_usd"), "{err}");
         assert!(reject_unpriced_mcp("mcp:demo/slow", true).is_ok());
         set_guc_reader(guc_off);
+    }
+
+    /// A 60% hit rate prices 0.40 of a $0.001 call. The cap has to see the
+    /// full miss, or a $0.0008 budget lets the $0.001 call run.
+    #[test]
+    fn worst_case_ignores_the_cache_hit_rate() {
+        reset_history();
+        for _ in 0..6 {
+            note_observation("mcp", "mcp:demo/slow", 0.0, 0.0, true);
+        }
+        for _ in 0..4 {
+            note_observation("mcp", "mcp:demo/slow", 0.001, 10.0, false);
+        }
+        let work = |knobs: Knobs| Work {
+            op: Op::Mcp,
+            model: "mcp:demo/slow".into(),
+            rows: 1.0,
+            per_row: 1.0,
+            knobs,
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        };
+        let priced = with_mcp_unit_usd(Some(0.001), || estimate(&work(Knobs::default())));
+        assert!((priced.usd - 0.0004).abs() < 1e-12, "expected {}", priced.usd);
+        assert!((priced.items - 0.4).abs() < 1e-12, "items {}", priced.items);
+        assert!((priced.usd_worst - 0.001).abs() < 1e-12, "worst {}", priced.usd_worst);
+        assert!((priced.items_worst - 1.0).abs() < 1e-12);
+        assert!(priced.usd < priced.usd_worst);
+
+        let mut bare_knobs = Knobs::default();
+        bare_knobs.cache_off = true;
+        let bare = with_mcp_unit_usd(Some(0.001), || estimate(&work(bare_knobs)));
+        assert!((bare.usd - 0.001).abs() < 1e-12, "uncached expected {}", bare.usd);
+        assert!((bare.usd_worst - bare.usd).abs() < 1e-12);
+
+        disarm_query();
+        set_guc_reader(|name| (name == "semantic.max_cost").then(|| "0.0008".into()));
+        arm_query(priced.usd_worst, None);
+        let err = preflight().unwrap_err();
+        assert!(err.contains("exceeds budget"), "{err}");
+        assert!(err.contains("0.00100000"), "{err}");
+        disarm_query();
+        arm_query(priced.usd, None);
+        assert!(preflight().is_ok(), "the discounted estimate is under 0.0008");
+        disarm_query();
+        set_guc_reader(guc_off);
+        reset_history();
     }
 }

@@ -192,6 +192,13 @@ fn is_rvbbit(sql: &str) -> bool {
     if kw(0, Kw::Alter) && word_is(toks.get(1), "foreign") && word_is(toks.get(2), "tool") {
         return true;
     }
+    // ALTER SERVER only when it names cost_usd. A real FDW still reaches gram.y.
+    if kw(0, Kw::Alter) && word_is(toks.get(1), "server") {
+        return toks.iter().any(|t| match &t.kind {
+            Kind::Ident(s) => s.eq_ignore_ascii_case("cost_usd"),
+            _ => false,
+        });
+    }
     if kw(0, Kw::Alter) || kw(0, Kw::Drop) {
         let n = if kw(0, Kw::Drop) && kw(1, Kw::If) { 3 } else { 1 };
         return matches!(
@@ -454,6 +461,13 @@ pub enum Command {
         name: String,
         options: BTreeMap<String, String>,
     },
+    /// `ALTER SERVER name OPTIONS (SET|ADD|DROP cost_usd ...)`.
+    /// `cost_usd` is the new price. `drop_cost` clears it.
+    AlterMcpServer {
+        name: String,
+        cost_usd: Option<String>,
+        drop_cost: bool,
+    },
     RefreshMcpTools {
         server: String,
     },
@@ -707,6 +721,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_alter(&mut self) -> Result<Command, String> {
+        if self.eat_word("server") {
+            return self.parse_alter_mcp_server();
+        }
         if self.eat_word("foreign") {
             self.expect_word("tool")?;
             let qual = self.name()?;
@@ -1389,6 +1406,51 @@ impl<'a> Parser<'a> {
         self.expect_word("into")?;
         let schema = self.name()?;
         Ok(Command::ImportMcpTools { limit, except, server, schema })
+    }
+
+    fn parse_alter_mcp_server(&mut self) -> Result<Command, String> {
+        let name = self.name()?;
+        self.expect_word("options")?;
+        self.expect_sym('(')?;
+        let mut drop_cost = false;
+        let mut cost_usd: Option<String> = None;
+        let mut saw = false;
+        while !self.at_sym(')') && !self.at_end() {
+            self.eat_sym(',');
+            if self.at_sym(')') || self.at_end() {
+                break;
+            }
+            let action = self.word()?.to_ascii_lowercase();
+            let key = self.word()?.to_ascii_lowercase();
+            if key != "cost_usd" {
+                return Err(format!("ALTER SERVER for an MCP server only supports cost_usd, not {key}"));
+            }
+            saw = true;
+            match action.as_str() {
+                "drop" => {
+                    drop_cost = true;
+                    cost_usd = None;
+                }
+                "set" | "add" => {
+                    let val = if self.at_string() {
+                        self.string()?
+                    } else if matches!(self.peek_kind(), Some(Kind::Num(_))) {
+                        let n = self.number()?;
+                        if n.fract() == 0.0 { format!("{}", n as i64) } else { n.to_string() }
+                    } else {
+                        self.word()?
+                    };
+                    drop_cost = false;
+                    cost_usd = Some(val);
+                }
+                other => return Err(format!("expected ADD, SET, or DROP near {other}")),
+            }
+        }
+        self.expect_sym(')')?;
+        if !saw || (!drop_cost && cost_usd.is_none()) {
+            return Err("ALTER SERVER options are empty".into());
+        }
+        Ok(Command::AlterMcpServer { name, cost_usd, drop_cost })
     }
 
     fn parse_refresh_tools(&mut self) -> Result<Command, String> {
@@ -2434,6 +2496,30 @@ mod tests {
         }
         match parse_command("REFRESH FOREIGN TOOLS FROM SERVER demo").unwrap() {
             Command::RefreshMcpTools { server } => assert_eq!(server, "demo"),
+            other => panic!("{other:?}"),
+        }
+        assert!(split_if_rvbbit("ALTER SERVER mine OPTIONS (SET host 'localhost')").is_none());
+        match parse_command("ALTER SERVER mt OPTIONS (SET cost_usd '0.001')").unwrap() {
+            Command::AlterMcpServer { name, cost_usd, drop_cost } => {
+                assert_eq!(name, "mt");
+                assert_eq!(cost_usd.as_deref(), Some("0.001"));
+                assert!(!drop_cost);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_command("ALTER SERVER mt OPTIONS (DROP cost_usd)").unwrap() {
+            Command::AlterMcpServer { name, cost_usd, drop_cost } => {
+                assert_eq!(name, "mt");
+                assert!(cost_usd.is_none());
+                assert!(drop_cost);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_command("ALTER SERVER mt OPTIONS (ADD cost_usd '0.002')").unwrap() {
+            Command::AlterMcpServer { cost_usd, drop_cost, .. } => {
+                assert_eq!(cost_usd.as_deref(), Some("0.002"));
+                assert!(!drop_cost);
+            }
             other => panic!("{other:?}"),
         }
     }

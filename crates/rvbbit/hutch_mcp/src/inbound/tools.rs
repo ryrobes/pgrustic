@@ -764,6 +764,9 @@ mod tests {
         let mixed = "Semantic Total USD: 0.00001260\nMCP Total USD: 0.00800000\n";
         assert!((total_usd(mixed) - 0.008).abs() < 1e-9);
         assert!((total_usd("Seq Scan") - 0.0).abs() < 1e-12);
+        // The cap reads the larger total. A hit-rate discount must not hide the miss.
+        let conservative = "MCP Total USD: 0.00040000\nMCP Worst Total USD: 0.00100000\n";
+        assert!((total_usd(conservative) - 0.001).abs() < 1e-9, "{}", total_usd(conservative));
     }
 }
 
