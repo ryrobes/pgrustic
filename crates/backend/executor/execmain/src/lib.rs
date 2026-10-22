@@ -39,8 +39,14 @@ mod nodegather;
 mod nodegathermerge;
 mod nodeprojectset;
 mod noderesult;
+// Compiled into this crate so the batch loop can call exec_proc_node and
+// the Result lanes. A separate crate would cycle: this crate would depend
+// on it, and it would depend on this crate. The sources live under rvbbit.
+#[path = "../../../../rvbbit/rvbbit_batch/semantic.rs"]
 mod semantic;
+#[path = "../../../../rvbbit/rvbbit_batch/treebatch.rs"]
 mod treebatch;
+#[path = "../../../../rvbbit/rvbbit_batch/projbatch.rs"]
 mod projbatch;
 mod nodesubplan;
 pub mod p8census;

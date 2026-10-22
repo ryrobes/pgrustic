@@ -1,5 +1,7 @@
 //! Project batcher for native `CLASSIFY`, typed `EXTRACT`, and `EXTRACT MANY`.
 //!
+//! Compiled as `execmain::projbatch` via `#[path]`. Not a separate crate.
+//!
 //! A window of child rows is grouped by the scalar memo key, which is the
 //! means backend URL, the model (`typesafe/jev-1.14` for classify, `mock`
 //! for extract so chat uses `HUTCH_MODEL`), and the label set or extract

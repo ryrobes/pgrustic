@@ -8,9 +8,18 @@ set-once seams, and the Result executor is not a plugin.
 
 ## Upstream files touched
 
-19 existing or new files under the upstream tree (14 from the spike, 5 more
-for the catalog). Plus dependency lines in the manifests below and
-`Cargo.lock`. Manifest edits are path dependencies only.
+The batch loops are not upstream files anymore. They live in
+`crates/rvbbit/rvbbit_batch` and are compiled into `execmain` with
+`#[path]`, because a separate crate would depend on `execmain` while
+`execmain` depends on it. Counted from the first MEANS commit
+(`1e88fea04e^`), that leaves 24 Rust files under `crates/backend` and
+`crates/_support` (it was 27 while `semantic.rs`, `projbatch.rs`, and
+`treebatch.rs` sat in `execmain`). The rest have no extension point
+that already runs: the lexer, the pre-parse DDL rewrite, `ObjectType`,
+the planner lift, the Result state, the aggregate prefetcher, custom
+GUC replay, and EXPLAIN text. Install-once executor taps are already
+taken by `exec_hooks`, so the cost and stats calls stay as direct
+calls beside those taps. Manifest edits are path dependencies only.
 
 | File | Why |
 | --- | --- |
@@ -23,8 +32,8 @@ for the catalog). Plus dependency lines in the manifests below and
 | `crates/backend/executor/execmain/src/noderesult.rs` | `ResultState.rvbbit` holds the batch executor when the qual contains MEANS. |
 | `crates/backend/executor/execmain/src/procnode.rs` | `release_owned` drops that state before the node is forgotten. |
 | `crates/backend/executor/execmain/src/execmain.rs` | Clears per-query EXPLAIN counters at executor start. |
-| `crates/backend/executor/execmain/src/lib.rs` | Declares the `semantic` module. |
-| `crates/backend/executor/execmain/src/semantic.rs` | **New file in an upstream crate.** The batch loop has to call `exec_proc_node`, projection, and slots. Putting it in `execmain` avoids an `execmain` ↔ `rvbbit_exec` cycle. |
+| `crates/backend/executor/execmain/src/lib.rs` | `#[path]` to the batch sources under `crates/rvbbit/rvbbit_batch`. |
+| `crates/rvbbit/rvbbit_batch/` | The filter, project, and tree batch loops. Compiled as modules of `execmain` so they can call `exec_proc_node` and the Result lanes. A real crate would cycle. |
 | `crates/backend/commands/explain/src/node.rs` | A MEANS Result prints as `Semantic Filter`. Batch size and concurrency come from the catalog endpoint (32 and 4 after bootstrap). ANALYZE counters are unchanged. |
 | `crates/backend/utils/adt/ruleutils/src/lib.rs` | Deparse of oid 9020 still prints `rvbbit_means(...)` without a `pg_proc` lookup. A catalog oid deparses through the normal `pg_proc` path as `rvbbit.means(...)`. |
 | `crates/_support/seams_init/src/lib.rs` | Registers builtins 9020–9031, installs the catalog ensure/execute hooks, and starts the dispatch pool at server boot. |

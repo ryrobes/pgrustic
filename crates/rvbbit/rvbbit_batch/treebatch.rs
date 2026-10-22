@@ -1,5 +1,7 @@
 //! Batch executor for `rvbbit.decide(tree, input)` on a Result target list.
 //!
+//! Compiled as `execmain::treebatch` via `#[path]`. Not a separate crate.
+//!
 //! A window of child rows is evaluated for the tree name and the input
 //! only. Those pairs are grouped by tree and walked by
 //! [`rvbbit_dispatch::decide_texts`]: one HTTP batch per node per level,
