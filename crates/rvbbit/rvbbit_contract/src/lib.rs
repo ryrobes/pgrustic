@@ -165,6 +165,12 @@ pub struct ItemRequest {
     /// that change the mode also change the prompt, which is hashed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extract_mode: Option<String>,
+    /// JSON Schema for this item. Hutch-lite sends it as strict
+    /// `response_format.json_schema` on the chat call. Absent means the
+    /// provider is free-form. Callers fold the schema into the return
+    /// schema before the cache key, so this field is not hashed again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

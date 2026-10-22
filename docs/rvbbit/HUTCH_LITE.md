@@ -84,9 +84,13 @@ aborts the session when
 `SUMMARIZE(expr)` and `CONSENSUS(expr, criterion)` are aggregates. The
 transition concatenates the group; the final calls hutch once.
 `SUMMARIZE` is a chat summary. `CONSENSUS` is one Jev yes/no over the
-joined text. `EXTRACT MANY kind FROM expr` asks for the nouns and short
-descriptions that refer to that kind (`[]` when the text has none) and
-leaves out unrelated nouns. The array is one batched extract, the same Semantic
+joined text. `EXTRACT MANY kind FROM expr` asks for every mention of that kind.
+A proper noun counts, a descriptive word or short phrase counts, and a
+synonym counts even when the text never uses the kind word. Anything
+that is not that kind stays out, and the list is empty when the text
+has none. The chat call uses temperature 0 and a strict JSON Schema
+whose `mentions` array is what SQL explodes. A provider that rejects
+the schema is retried once without it. The array is one batched extract, the same Semantic
 Project shape as `CLASSIFY` and typed `EXTRACT`, then a `LEFT JOIN
 LATERAL` explodes each value onto its source row. The helper list
 column stays inside that subquery. An empty array keeps the row with a

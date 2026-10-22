@@ -168,6 +168,7 @@ fn item(input: &str, criterion: Option<&str>) -> ItemRequest {
         label_descriptions: None,
         node: None,
         extract_mode: None,
+        response_schema: None,
     }
 }
 
@@ -257,6 +258,25 @@ fn fake_payload(header: &str, text: &str, auth: &str) -> (u16, String) {
         "a short summary of the notes".into()
     } else if text.contains("JSON array of short") {
         "[\"sasquatch\",\"truck\"]".into()
+    } else if text.contains("REQUIRE_SCHEMA") {
+        let ok = serde_json::from_str::<serde_json::Value>(text).ok();
+        let temperature_zero = ok.as_ref().is_some_and(|v| v.get("temperature").and_then(|t| t.as_f64()) == Some(0.0));
+        let has_schema = ok.as_ref().is_some_and(|v| v.get("response_format").and_then(|f| f.get("type")).and_then(|t| t.as_str()) == Some("json_schema"));
+        if !temperature_zero || !has_schema {
+            return (
+                400,
+                r#"{"error":{"message":"response_format json_schema required"}}"#.into(),
+            );
+        }
+        "{\"mentions\":[\"Bigfoot\"]}".into()
+    } else if text.contains("REJECT_SCHEMA") {
+        if text.contains("\"response_format\"") {
+            return (
+                400,
+                r#"{"error":{"message":"response_format json_schema is not supported"}}"#.into(),
+            );
+        }
+        "[\"gray\"]".into()
     } else if text.contains("FALSE_CASE") {
         "false".into()
     } else if text.contains("TRUE_CASE") || text.contains("SLOW") {
@@ -740,6 +760,43 @@ fn rerank_summary_and_extract_many() {
     );
     let logged = calls_of(&h.hutch, 2);
     assert!(logged.iter().all(|c| c["identical"] == true), "{logged:?}");
+}
+
+#[test]
+fn extract_many_structured_output_unwraps_mentions_and_retries_without_schema() {
+    let h = harness(Some("test-key"));
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mentions"],
+        "properties": { "mentions": { "type": "array", "items": { "type": "string" } } }
+    });
+    let mut many = predict("My story of Bigfoot", "creature");
+    many.operation = Operation::Extract;
+    many.temperature = 0.0;
+    many.items[0].extract_mode = Some("many".into());
+    many.items[0].system = Some("REQUIRE_SCHEMA extract the creature".into());
+    many.items[0].prompt = Some("{{input}}".into());
+    many.items[0].response_schema = Some(schema.clone());
+    many.items[0].cache_key = format!("{}schema", many.items[0].cache_key);
+    let listed = post(&format!("{}/v1/extract", h.hutch), "off", &many);
+    assert!(listed.outputs[0].error.is_none(), "{:?}", listed.outputs[0].error);
+    assert_eq!(listed.outputs[0].value, Some(serde_json::json!(["Bigfoot"])));
+
+    let before = h.provider_hits.load(Ordering::SeqCst);
+    let mut rejected = many.clone();
+    rejected.items[0].system = Some("REJECT_SCHEMA extract the color".into());
+    rejected.items[0].response_schema = Some(schema);
+    rejected.items[0].cache_key = format!("{}reject", many.items[0].cache_key);
+    rejected.items[0].inputs = serde_json::json!({"input": "Large gray triangular aircraft"});
+    let fell_back = post(&format!("{}/v1/extract", h.hutch), "off", &rejected);
+    assert!(fell_back.outputs[0].error.is_none(), "{:?}", fell_back.outputs[0].error);
+    assert_eq!(fell_back.outputs[0].value, Some(serde_json::json!(["gray"])));
+    assert_eq!(
+        h.provider_hits.load(Ordering::SeqCst) - before,
+        2,
+        "a rejected schema is one retry without response_format"
+    );
 }
 
 #[test]

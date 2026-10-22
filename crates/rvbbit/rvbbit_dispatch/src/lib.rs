@@ -592,31 +592,69 @@ fn summary_endpoint() -> Endpoint {
     ep
 }
 
+/// Object schema so a provider can lock the reply with structured output.
+/// The root is an object because strict JSON Schema rejects a bare array.
+/// Hutch unwraps `mentions` back into the array SQL explodes.
+fn many_schema(kind: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mentions"],
+        "properties": {
+            "mentions": {
+                "type": "array",
+                "description": format!(
+                    "One string per {kind}. A proper noun, a short descriptive phrase, or a synonym. Empty when the text has none."
+                ),
+                "items": { "type": "string" }
+            }
+        }
+    })
+}
+
+fn response_schema(ep: &Endpoint) -> Option<serde_json::Value> {
+    if ep.extract_mode.as_deref() != Some("many") {
+        return None;
+    }
+    serde_json::from_str(&ep.return_type).ok()
+}
+
 fn many_endpoint(kind: &str) -> Endpoint {
     let mut ep = decision_endpoint();
     ep.model = "mock".into();
     ep.labels.clear();
     ep.label_descriptions.clear();
     ep.fn_name = "extract_many".into();
-    let schema = format!(
-        "{{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"description\":\"a noun or short description of one {kind}\"}}}}"
-    );
-    ep.return_type = schema.clone();
+    // The means row's temperature must not leak in. Sampling is why the
+    // same note returned Bigfoot one run and [] the next.
+    ep.temperature = 0.0;
+    let schema_text = many_schema(kind).to_string();
+    ep.return_type = schema_text.clone();
     ep.extract_mode = Some("many".into());
     ep.system_prompt = format!(
-        "Return the nouns and the short descriptions that refer to a {kind}. \
-         Each array item is one {kind}: the noun for it, or a short description of it, and nothing else. \
-         Include those references even when the text does not use the word \"{kind}\". \
-         Do not include unrelated nouns, places, people, objects, or adjectives. \
-         If the text names no {kind}, return []. \
-         Reply with a JSON array of strings and no markdown. Schema: {schema}"
+        "Extract every {kind} from the user text. \
+         Reply with JSON only, matching this schema, and no markdown: {schema_text} \
+         {} \
+         Those examples are not the user text. Every mention must appear in the user text. Do not copy the examples. \
+         Leave out anything that is not a {kind}. A color list does not include the aircraft, its size, or its shape. A creature list does not include the story or the road. \
+         If the text has no {kind}, mentions is [].",
+        many_examples(kind)
     );
     ep.user_prompt = format!(
-        "List the nouns and descriptions that refer to a {kind}. \
-         Leave out unrelated nouns. Return [] if there are none.\n{{{{input}}}}"
+        "List every {kind}. Proper nouns, descriptive phrases, and synonyms count. \
+         Leave out anything that is not a {kind}. If there are none, mentions is [].\n{{{{input}}}}"
     );
-    ep.max_tokens = Some(128);
+    ep.max_tokens = Some(256);
     ep
+}
+
+/// The two live misses, plus a synonym. They stay in every kind's prompt
+/// so a proper noun, a descriptive word, and a synonym are all shown.
+fn many_examples(_kind: &str) -> String {
+    "A proper noun counts. Asked for a creature, the text \"My story of Bigfoot\" yields Bigfoot. \
+     A descriptive word or short phrase counts. Asked for a color, the text \"Large gray triangular aircraft\" yields gray. \
+     A synonym counts even when the text never uses the kind word. Asked for a creature, \"a sasquatch crossed the road\" yields sasquatch."
+        .to_string()
 }
 
 fn empty_agg() -> serde_json::Value {
@@ -1104,6 +1142,7 @@ fn encode_items(ep: &Endpoint, operation: Operation, inputs: &[serde_json::Value
                 }
             },
             extract_mode: ep.extract_mode.clone(),
+            response_schema: response_schema(ep),
         });
     }
     let req = BatchRequest {
@@ -1520,6 +1559,7 @@ fn encode_tree_items(
             },
             node: Some(node_meter(node, question)),
             extract_mode: None,
+            response_schema: None,
         });
     }
     let guc = clauses::guc_clauses();
@@ -1936,15 +1976,34 @@ mod tests {
     fn extract_many_asks_only_for_the_requested_kind() {
         let ep = super::many_endpoint("creature");
         assert_eq!(ep.extract_mode.as_deref(), Some("many"));
-        assert!(ep.system_prompt.contains("nouns and the short descriptions that refer to a creature"), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("nothing else"), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("does not use the word \"creature\""), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("return []"), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("\"type\":\"array\""), "{}", ep.system_prompt);
-        assert!(ep.system_prompt.contains("Do not include unrelated nouns"), "{}", ep.system_prompt);
-        assert!(ep.user_prompt.contains("nouns and descriptions that refer to a creature"));
-        assert!(ep.user_prompt.contains("Return [] if there are none"));
-        assert!(ep.return_type.contains("one creature"));
+        assert_eq!(ep.temperature, 0.0);
+        assert_eq!(ep.max_tokens, Some(256));
+        assert!(ep.system_prompt.contains("proper noun"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("Bigfoot"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("descriptive word"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("gray"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("sasquatch"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("synonym"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("Do not copy the examples"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("must appear in the user text"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("not a creature"), "{}", ep.system_prompt);
+        assert!(ep.system_prompt.contains("mentions is []"), "{}", ep.system_prompt);
+        assert!(ep.user_prompt.contains("Proper nouns, descriptive phrases, and synonyms count"));
+        assert!(ep.user_prompt.contains("not a creature"));
+        assert!(ep.user_prompt.contains("mentions is []"));
+        let schema: serde_json::Value = serde_json::from_str(&ep.return_type).unwrap();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["mentions"]["type"], "array");
+        assert_eq!(schema["properties"]["mentions"]["items"]["type"], "string");
+        assert!(schema["properties"]["mentions"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("creature"));
+        let color = super::many_endpoint("color");
+        assert!(color.system_prompt.contains("Large gray triangular aircraft"));
+        assert!(color.system_prompt.contains("not a color"));
+        assert!(!color.system_prompt.contains("or adjectives"));
         let body = encode_items(
             &ep,
             Operation::Extract,
@@ -1955,12 +2014,18 @@ mod tests {
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["temperature"].as_f64(), Some(0.0));
         assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
         assert_eq!(parsed["items"][0]["extract_mode"], "many");
+        assert_eq!(parsed["items"][0]["response_schema"]["type"], "object");
+        assert_eq!(
+            parsed["items"][0]["response_schema"]["properties"]["mentions"]["items"]["type"],
+            "string"
+        );
         let system = parsed["items"][0]["system"].as_str().unwrap();
-        assert!(system.contains("refer to a creature"));
-        assert!(system.contains("unrelated nouns"));
-        assert!(system.contains("return []"));
+        assert!(system.contains("Bigfoot"));
+        assert!(system.contains("not a creature"));
+        assert!(system.contains("mentions is []"));
         assert_ne!(
             super::scalar_key_extract("creature"),
             super::scalar_key_extract_many("creature")

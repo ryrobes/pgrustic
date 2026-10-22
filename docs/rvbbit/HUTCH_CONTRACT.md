@@ -73,7 +73,13 @@ not the spike's JSON array.
 `operation` is one of `predict`, `classify`, `extract`, `embed`, `rerank`,
 `decide`. `max_tokens` is omitted when the function has none. `system` and
 `prompt` on an item are optional overrides; MEANS leaves them null and
-puts the pair in `inputs`.
+puts the pair in `inputs`. `response_schema` is an optional JSON Schema.
+Hutch-lite sends it as strict `response_format.json_schema` on the chat
+call. EXTRACT MANY uses an object schema with a `mentions` array of
+strings and stores that array, so a bare JSON array still decodes. A
+provider error that rejects the schema is retried once without
+`response_format`. Temperature on that call is 0 unless a clause tail
+sets one.
 
 Response. `outputs[i]` answers `items[i]`. The `key` is echoed. A failed
 item sets `error` and leaves `value` null. Siblings may still succeed.

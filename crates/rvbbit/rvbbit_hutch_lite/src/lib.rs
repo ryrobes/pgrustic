@@ -933,6 +933,7 @@ fn provider_call(
         &system,
         &user,
         item.node.clone(),
+        item.response_schema.as_ref(),
     )
         .map_err(|message| item_err("provider", &message))?;
     let value = match operation {
@@ -962,9 +963,12 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                 }
                 Some("summary") => "Summarize the notes in one or two sentences. No markdown.".into(),
                 Some("many") => {
-                    "Return a JSON array of strings. Include the nouns and short descriptions \
-                     that refer to the requested kind, even when the text does not use that word. \
-                     Do not include unrelated nouns. If there are none, return []. No markdown."
+                    "Return JSON {\"mentions\":[...]} and no markdown. Each string is one mention of the requested kind. \
+                     A proper noun counts: asked for a creature, \"My story of Bigfoot\" yields Bigfoot. \
+                     A descriptive word or short phrase counts: asked for a color, \"Large gray triangular aircraft\" yields gray. \
+                     A synonym counts even when the text does not use the kind word: asked for a creature, \"a sasquatch crossed the road\" yields sasquatch. \
+                     Those examples are not the user text. Every mention must appear in the user text. Do not copy the examples. \
+                     Leave out anything that is not that kind. If there are none, mentions is []."
                         .into()
                 }
                 _ => "Return only JSON. No markdown.".into(),
@@ -988,8 +992,8 @@ fn prompts(operation: Operation, item: &rvbbit_contract::ItemRequest) -> (String
                 input
             } else if item.extract_mode.as_deref() == Some("many") {
                 format!(
-                    "List the nouns and descriptions that refer to the requested kind. \
-                     Leave out unrelated nouns. Return [] when there are none.\n{input}"
+                    "List every mention of the requested kind. Proper nouns, descriptive phrases, and synonyms count. \
+                     Leave out anything that is not that kind. If there are none, mentions is [].\n{input}"
                 )
             } else if item.extract_mode.as_deref() == Some("scalar") {
                 format!("Extract one short value from this text:\n{input}")
@@ -1659,13 +1663,55 @@ fn chat(
     system: &str,
     user: &str,
     node: Option<String>,
+    response_schema: Option<&serde_json::Value>,
 ) -> Result<(String, CallMeter), String> {
-    let cfg = &server.cfg;
-    let key = cfg.api_key.as_deref().unwrap_or("");
-    let url = format!(
-        "{}/chat/completions",
-        cfg.openai_base.trim_end_matches('/')
-    );
+    match chat_once(
+        server,
+        operation,
+        tenant,
+        model,
+        temperature,
+        max_tokens,
+        system,
+        user,
+        node.clone(),
+        response_schema,
+    ) {
+        Err(message) if response_schema.is_some() && schema_rejected(&message) => chat_once(
+            server,
+            operation,
+            tenant,
+            model,
+            temperature,
+            max_tokens,
+            system,
+            user,
+            node,
+            None,
+        ),
+        other => other,
+    }
+}
+
+/// A model that cannot do strict JSON Schema still has the schema in the
+/// prompt. One retry without `response_format` keeps the row from failing
+/// closed into an empty extract.
+fn schema_rejected(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("response_format")
+        || message.contains("json_schema")
+        || message.contains("structured output")
+        || message.contains("invalid schema")
+}
+
+fn chat_payload(
+    model: &str,
+    temperature: f64,
+    max_tokens: Option<u32>,
+    system: &str,
+    user: &str,
+    response_schema: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "temperature": temperature,
@@ -1677,6 +1723,38 @@ fn chat(
     if let Some(n) = max_tokens {
         body["max_tokens"] = serde_json::json!(n);
     }
+    if let Some(schema) = response_schema {
+        body["response_format"] = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "extract_many",
+                "strict": true,
+                "schema": schema
+            }
+        });
+    }
+    body
+}
+
+fn chat_once(
+    server: &Server,
+    operation: Operation,
+    tenant: &str,
+    model: &str,
+    temperature: f64,
+    max_tokens: Option<u32>,
+    system: &str,
+    user: &str,
+    node: Option<String>,
+    response_schema: Option<&serde_json::Value>,
+) -> Result<(String, CallMeter), String> {
+    let cfg = &server.cfg;
+    let key = cfg.api_key.as_deref().unwrap_or("");
+    let url = format!(
+        "{}/chat/completions",
+        cfg.openai_base.trim_end_matches('/')
+    );
+    let body = chat_payload(model, temperature, max_tokens, system, user, response_schema);
     let payload = match serde_json::to_string(&body) {
         Ok(s) => s,
         Err(e) => return Err(redact(&e.to_string(), key)),
@@ -1971,6 +2049,18 @@ pub fn parse_bool(text: &str) -> Option<bool> {
     }
 }
 
+/// A bare array is the mock and any model that ignores the schema.
+/// Strict structured output is an object with `mentions`.
+fn many_mentions(value: &serde_json::Value) -> Result<&Vec<serde_json::Value>, String> {
+    if let Some(arr) = value.as_array() {
+        return Ok(arr);
+    }
+    if let Some(arr) = value.get("mentions").and_then(|v| v.as_array()) {
+        return Ok(arr);
+    }
+    Err("extract many expected a JSON array of strings, or an object with a mentions array".into())
+}
+
 fn parse_extract(text: &str, mode: Option<&str>) -> Result<serde_json::Value, String> {
     match mode.unwrap_or("json") {
         "json" => parse_json_value(text),
@@ -1985,9 +2075,7 @@ fn parse_extract(text: &str, mode: Option<&str>) -> Result<serde_json::Value, St
         }
         "many" => {
             let value = parse_json_value(text)?;
-            let Some(arr) = value.as_array() else {
-                return Err("extract many expected a JSON array".into());
-            };
+            let arr = many_mentions(&value)?;
             let mut out = Vec::with_capacity(arr.len());
             for item in arr {
                 match item {
@@ -2069,6 +2157,7 @@ fn extract_fanout(
                     &system,
                     &user,
                     item.node.clone(),
+                    item.response_schema.as_ref(),
                 )
                 .map_err(|message| item_err("provider", &message))?;
                 let _ = memo;
@@ -2599,6 +2688,39 @@ mod tests {
         assert!(parse_extract("[\"sasquatch\", 1]", Some("many")).is_err());
         assert!(parse_extract("{\"creature\":\"sasquatch\"}", Some("many")).is_err());
         assert!(parse_extract("a truck in the woods", Some("many")).is_err());
+        assert_eq!(
+            parse_extract("{\"mentions\":[\"Bigfoot\",\"gray\"]}", Some("many")).unwrap(),
+            serde_json::json!(["Bigfoot", "gray"])
+        );
+        assert_eq!(
+            parse_extract("{\"mentions\":[]}", Some("many")).unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn extract_many_chat_sends_temperature_zero_and_a_strict_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["mentions"],
+            "properties": { "mentions": { "type": "array", "items": { "type": "string" } } }
+        });
+        let body = chat_payload(
+            "openai/gpt-4o-mini",
+            0.0,
+            Some(256),
+            "extract",
+            "text",
+            Some(&schema),
+        );
+        assert_eq!(body["temperature"].as_f64(), Some(0.0));
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["name"], "extract_many");
+        assert_eq!(body["response_format"]["json_schema"]["schema"]["required"][0], "mentions");
+        let plain = chat_payload("openai/gpt-4o-mini", 0.0, None, "extract", "text", None);
+        assert!(plain.get("response_format").is_none());
     }
 
     #[test]
@@ -2658,6 +2780,7 @@ mod tests {
             label_descriptions: None,
             node: None,
             extract_mode: None,
+            response_schema: None,
         }
     }
 
