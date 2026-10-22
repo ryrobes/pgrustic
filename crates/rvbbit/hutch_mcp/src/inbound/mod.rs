@@ -3,6 +3,7 @@
 
 mod http;
 mod oauth;
+mod oidc;
 mod pg;
 mod tools;
 

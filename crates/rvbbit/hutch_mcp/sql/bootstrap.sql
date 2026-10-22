@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.oauth_code (
     redirect_uri text NOT NULL,
     code_challenge text NOT NULL,
     credential_version integer NOT NULL,
+    read_only boolean NOT NULL DEFAULT true,
     expires_at timestamptz NOT NULL
 );
 
@@ -38,6 +39,33 @@ CREATE TABLE IF NOT EXISTS rvbbit.oauth_refresh (
     role text NOT NULL,
     subject text NOT NULL,
     credential_version integer NOT NULL,
+    read_only boolean NOT NULL DEFAULT true,
+    expires_at timestamptz NOT NULL
+);
+
+-- email or hd claim -> Postgres role. Unmapped identities are denied.
+-- read_only defaults to true. A false row may run a read-write session.
+CREATE TABLE IF NOT EXISTS rvbbit.oidc_role (
+    claim text NOT NULL,
+    value text NOT NULL,
+    role text NOT NULL,
+    read_only boolean NOT NULL DEFAULT true,
+    PRIMARY KEY (claim, value),
+    CHECK (claim IN ('email', 'hd')),
+    CHECK (role ~ '^[A-Za-z_][A-Za-z0-9_]*$')
+);
+
+-- One-shot OIDC browser state. verifier is the upstream PKCE secret.
+-- Do not log this table.
+CREATE TABLE IF NOT EXISTS rvbbit.oidc_state (
+    state_hash text PRIMARY KEY,
+    nonce text NOT NULL,
+    verifier text NOT NULL,
+    client_id text NOT NULL,
+    redirect_uri text NOT NULL,
+    code_challenge text NOT NULL,
+    client_state text NOT NULL,
+    callback text NOT NULL,
     expires_at timestamptz NOT NULL
 );
 
@@ -107,6 +135,29 @@ BEGIN
     END IF;
 END
 $rvbbit_audit_cols$;
+
+DO $rvbbit_oauth_ro$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rvbbit' AND c.relname = 'oauth_code'
+          AND a.attname = 'read_only' AND NOT a.attisdropped
+    ) THEN
+        ALTER TABLE rvbbit.oauth_code ADD COLUMN read_only boolean NOT NULL DEFAULT true;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rvbbit' AND c.relname = 'oauth_refresh'
+          AND a.attname = 'read_only' AND NOT a.attisdropped
+    ) THEN
+        ALTER TABLE rvbbit.oauth_refresh ADD COLUMN read_only boolean NOT NULL DEFAULT true;
+    END IF;
+END
+$rvbbit_oauth_ro$;
 
 -- Future tables created by this role (rvbbit setup after this script)
 -- are granted too. ALL TABLES only covers relations that exist now.

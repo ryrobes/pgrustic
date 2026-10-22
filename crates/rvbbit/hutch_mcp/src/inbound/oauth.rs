@@ -6,6 +6,7 @@
 //! a bearer that never looks like a JWT; only its hash is stored.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_sha2::{PgSha256Ctx, PG_SHA256_DIGEST_LENGTH};
@@ -24,6 +25,9 @@ pub struct Identity {
     pub max_cost: Option<f64>,
     pub statement_timeout_ms: u64,
     pub credential_version: i32,
+    /// Password logins and API keys stay read-only. An OIDC mapping can
+    /// set this to false.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +41,22 @@ pub struct Oauth {
     pub pool: Pool,
     pub jwt_secret: Vec<u8>,
     pub password: PasswordTarget,
+    pub oidc: Option<super::oidc::OidcConfig>,
+    pub(crate) discovery: Mutex<Option<super::oidc::Discovery>>,
+    pub(crate) jwks: Mutex<Option<Vec<super::oidc::Jwk>>>,
+}
+
+impl Oauth {
+    pub fn new(pool: Pool, jwt_secret: Vec<u8>, password: PasswordTarget, oidc: Option<super::oidc::OidcConfig>) -> Self {
+        Self {
+            pool,
+            jwt_secret,
+            password,
+            oidc,
+            discovery: Mutex::new(None),
+            jwks: Mutex::new(None),
+        }
+    }
 }
 
 impl Oauth {
@@ -114,20 +134,42 @@ impl Oauth {
         if !self.password_matches(user, password)? {
             return Err("postgres rejected the password".into());
         }
+        self.issue_code(
+            client_id,
+            redirect_uri,
+            challenge,
+            user,
+            user,
+            user_row.credential_version,
+            true,
+        )
+    }
+
+    pub(crate) fn issue_code(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+        challenge: &str,
+        role: &str,
+        subject: &str,
+        version: i32,
+        read_only: bool,
+    ) -> Result<String, String> {
         let code = b64url(&random_bytes(32)?);
         let hash = sha256_hex(code.as_bytes());
         let exp = now_secs() + CODE_TTL_SECS;
+        let read_only_sql = if read_only { "true" } else { "false" };
         self.pool.with(|conn| {
             conn.exec(&format!(
-                "INSERT INTO rvbbit.oauth_code (code_hash, client_id, role, subject, redirect_uri, code_challenge, credential_version, expires_at) \
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, to_timestamp({exp}))",
+                "INSERT INTO rvbbit.oauth_code (code_hash, client_id, role, subject, redirect_uri, code_challenge, credential_version, read_only, expires_at) \
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {read_only_sql}, to_timestamp({exp}))",
                 quote_lit(&hash),
                 quote_lit(client_id),
-                quote_lit(user),
-                quote_lit(user),
+                quote_lit(role),
+                quote_lit(subject),
                 quote_lit(redirect_uri),
                 quote_lit(challenge),
-                user_row.credential_version,
+                version,
             ))
         })?;
         Ok(code)
@@ -145,7 +187,7 @@ impl Oauth {
         let rows = self.pool.with(|conn| {
             conn.query(&format!(
                 "DELETE FROM rvbbit.oauth_code WHERE code_hash = {} AND expires_at > now() \
-                 RETURNING client_id, role, subject, redirect_uri, code_challenge, credential_version::text",
+                 RETURNING client_id, role, subject, redirect_uri, code_challenge, credential_version::text, read_only::text",
                 quote_lit(&hash)
             ))
         })?;
@@ -159,13 +201,14 @@ impl Oauth {
         let stored_redirect = row.get(3).and_then(|c| c.clone()).unwrap_or_default();
         let challenge = row.get(4).and_then(|c| c.clone()).unwrap_or_default();
         let version: i32 = row.get(5).and_then(|c| c.as_deref()).unwrap_or("0").parse().unwrap_or(0);
+        let read_only = read_only_cell(row.get(6).and_then(|c| c.as_deref()));
         if stored_client != client_id || stored_redirect != redirect_uri {
             return Err("authorization code does not match this client".into());
         }
         if !constant_eq(challenge.as_bytes(), got.as_bytes()) {
             return Err("PKCE verification failed".into());
         }
-        self.tokens(&role, &subject, version, client_id)
+        self.tokens(&role, &subject, version, read_only, client_id)
     }
 
     pub fn exchange_refresh(&self, client_id: &str, refresh: &str) -> Result<Value, String> {
@@ -173,7 +216,7 @@ impl Oauth {
         let rows = self.pool.with(|conn| {
             conn.query(&format!(
                 "DELETE FROM rvbbit.oauth_refresh WHERE token_hash = {} AND expires_at > now() \
-                 RETURNING client_id, role, subject, credential_version::text",
+                 RETURNING client_id, role, subject, credential_version::text, read_only::text",
                 quote_lit(&hash)
             ))
         })?;
@@ -188,27 +231,29 @@ impl Oauth {
         let role = row.get(1).and_then(|c| c.clone()).unwrap_or_default();
         let subject = row.get(2).and_then(|c| c.clone()).unwrap_or_default();
         let version: i32 = row.get(3).and_then(|c| c.as_deref()).unwrap_or("0").parse().unwrap_or(0);
+        let read_only = read_only_cell(row.get(4).and_then(|c| c.as_deref()));
         let current = self.user_row(&role)?;
         if current.credential_version != version {
             return Err("credential version was revoked".into());
         }
-        self.tokens(&role, &subject, current.credential_version, client_id)
+        self.tokens(&role, &subject, current.credential_version, read_only, client_id)
     }
 
-    fn tokens(&self, role: &str, subject: &str, version: i32, client_id: &str) -> Result<Value, String> {
-        let access = sign_jwt(&self.jwt_secret, role, subject, version, now_secs() + ACCESS_TTL_SECS)?;
+    fn tokens(&self, role: &str, subject: &str, version: i32, read_only: bool, client_id: &str) -> Result<Value, String> {
+        let access = sign_jwt(&self.jwt_secret, role, subject, version, read_only, now_secs() + ACCESS_TTL_SECS)?;
         let refresh = b64url(&random_bytes(32)?);
         let hash = sha256_hex(refresh.as_bytes());
         let exp = now_secs() + REFRESH_TTL_SECS;
         self.pool.with(|conn| {
             conn.exec(&format!(
-                "INSERT INTO rvbbit.oauth_refresh (token_hash, client_id, role, subject, credential_version, expires_at) \
-                 VALUES ({}, {}, {}, {}, {}, to_timestamp({exp}))",
+                "INSERT INTO rvbbit.oauth_refresh (token_hash, client_id, role, subject, credential_version, read_only, expires_at) \
+                 VALUES ({}, {}, {}, {}, {}, {}, to_timestamp({exp}))",
                 quote_lit(&hash),
                 quote_lit(client_id),
                 quote_lit(role),
                 quote_lit(subject),
                 version,
+                if read_only { "true" } else { "false" },
             ))
         })?;
         Ok(json!({
@@ -263,6 +308,7 @@ impl Oauth {
             max_cost: user.max_cost,
             statement_timeout_ms: user.statement_timeout_ms,
             credential_version: user.credential_version,
+            read_only: claims.read_only,
         })
     }
 
@@ -298,10 +344,11 @@ impl Oauth {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(15_000),
             credential_version: user_ver,
+            read_only: true,
         })
     }
 
-    fn user_row(&self, role: &str) -> Result<Identity, String> {
+    pub(crate) fn user_row(&self, role: &str) -> Result<Identity, String> {
         let rows = self.pool.with(|conn| {
             conn.query(&format!(
                 "SELECT role, credential_version::text, max_cost::text, statement_timeout_ms::text \
@@ -323,6 +370,7 @@ impl Oauth {
                 .and_then(|c| c.as_deref())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(15_000),
+            read_only: true,
         })
     }
 
@@ -347,6 +395,14 @@ struct Claims {
     sub: String,
     role: String,
     ver: i32,
+    read_only: bool,
+}
+
+pub(crate) fn read_only_cell(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.unwrap_or("").trim().to_ascii_lowercase().as_str(),
+        "f" | "false" | "0" | "off"
+    )
 }
 
 static JTI_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -356,13 +412,14 @@ fn next_jti() -> String {
     format!("{}-{n}", now_secs())
 }
 
-pub fn sign_jwt(secret: &[u8], role: &str, subject: &str, ver: i32, exp: u64) -> Result<String, String> {
+pub fn sign_jwt(secret: &[u8], role: &str, subject: &str, ver: i32, read_only: bool, exp: u64) -> Result<String, String> {
     let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = b64url(
         json!({
             "sub": subject,
             "role": role,
             "ver": ver,
+            "ro": read_only,
             "iat": now_secs(),
             "jti": next_jti(),
             "exp": exp,
@@ -399,6 +456,7 @@ fn verify_jwt(secret: &[u8], token: &str) -> Result<Claims, String> {
         sub: value.get("sub").and_then(|v| v.as_str()).unwrap_or(&role).to_string(),
         role,
         ver: value.get("ver").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        read_only: value.get("ro").and_then(|v| v.as_bool()).unwrap_or(true),
     })
 }
 
@@ -417,11 +475,11 @@ pub fn ident_ok(name: &str) -> bool {
     }
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn sha256(data: &[u8]) -> [u8; PG_SHA256_DIGEST_LENGTH] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; PG_SHA256_DIGEST_LENGTH] {
     let mut ctx = PgSha256Ctx::init_sha256();
     ctx.update(data);
     ctx.final_sha256()
@@ -464,7 +522,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn b64url(data: &[u8]) -> String {
+pub(crate) fn b64url(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     let mut i = 0;
@@ -490,7 +548,7 @@ fn b64url(data: &[u8]) -> String {
     out
 }
 
-fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
     fn val(c: u8) -> Result<u8, String> {
         match c {
             b'A'..=b'Z' => Ok(c - b'A'),
@@ -530,14 +588,14 @@ fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
     let mut buf = vec![0u8; n];
     let mut file = std::fs::File::open("/dev/urandom").map_err(|e| e.to_string())?;
     std::io::Read::read_exact(&mut file, &mut buf).map_err(|e| e.to_string())?;
     Ok(buf)
 }
 
-fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -562,12 +620,15 @@ mod tests {
     #[test]
     fn jwt_round_trip_carries_role_and_version() {
         let secret = b"test-secret";
-        let token = sign_jwt(secret, "analyst", "analyst", 3, now_secs() + 60).unwrap();
-        let again = sign_jwt(secret, "analyst", "analyst", 3, now_secs() + 60).unwrap();
+        let token = sign_jwt(secret, "analyst", "analyst", 3, true, now_secs() + 60).unwrap();
+        let again = sign_jwt(secret, "analyst", "analyst", 3, true, now_secs() + 60).unwrap();
         assert_ne!(token, again, "iat and jti must make a refresh differ");
         let claims = verify_jwt(secret, &token).unwrap();
         assert_eq!(claims.role, "analyst");
         assert_eq!(claims.ver, 3);
+        assert!(claims.read_only);
+        let writer = sign_jwt(secret, "analyst", "ada@example.com", 3, false, now_secs() + 60).unwrap();
+        assert!(!verify_jwt(secret, &writer).unwrap().read_only);
         let payload = token.split('.').nth(1).unwrap();
         let body: Value = serde_json::from_slice(&b64url_decode(payload).unwrap()).unwrap();
         assert!(body.get("iat").and_then(|v| v.as_u64()).is_some(), "{body}");

@@ -8511,6 +8511,7 @@ dependencies = [
  "hutch_mock",
  "mcp_core",
  "pg_sha2",
+ "ring",
  "rmcp",
  "rvbbit_contract",
  "schemars",
