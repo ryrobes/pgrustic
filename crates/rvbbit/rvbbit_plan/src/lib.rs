@@ -66,7 +66,8 @@ pub fn lift_semantic_filters<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult
 }
 
 pub use estimate::{
-    apply_costs, begin_statement_cost, commit_statement_cost, node_estimate, remember_scan_rows,
+    apply_costs, begin_statement_cost, commit_statement_cost, in_nested_planner, node_estimate,
+    remember_scan_rows,
     tree_estimate, Shown,
 };
 pub use rvbbit_cost::{node_actual, query_actual};

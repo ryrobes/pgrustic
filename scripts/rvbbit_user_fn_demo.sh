@@ -174,17 +174,19 @@ STATS="$STATS" ROWS="$ROWS" FILTER_N="$FILTER_N" python3 - <<'PY'
 import json, os, sys
 stats = json.loads(os.environ["STATS"])
 rows = int(os.environ["ROWS"])
-calls = stats["calls"]
+calls = stats.get("calls", stats.get("requests", 0))
+stat_rows = stats.get("rows", 0)
+max_batch = stats.get("max_batch") or 0
 got = int(os.environ["FILTER_N"])
 expect = rows - rows // 5
 live = os.environ.get("RVBBIT_USER_FN_LIVE") == "1"
-print(f"filter calls={calls} rows={stats['rows']} max_batch={stats['max_batch']} matches={got}")
+print(f"filter calls={calls} rows={stat_rows} max_batch={max_batch} matches={got}")
 if not live and got != expect:
     sys.exit(f"expected {expect} biped rows, got {got}")
 if calls >= rows:
     sys.exit(f"filter was not batched: {calls} calls for {rows} rows")
-if stats["max_batch"] > 32:
-    sys.exit(f"batch larger than 32: {stats['max_batch']}")
+if max_batch > 32:
+    sys.exit(f"batch larger than 32: {max_batch}")
 print("filter batched")
 PY
 
@@ -203,11 +205,13 @@ STATS="$STATS" ROWS="$ROWS" PROJ_N="$PROJ_N" python3 - <<'PY'
 import json, os, sys
 stats = json.loads(os.environ["STATS"])
 rows = int(os.environ["ROWS"])
-calls = stats["calls"]
+calls = stats.get("calls", stats.get("requests", 0))
+stat_rows = stats.get("rows", 0)
+max_batch = stats.get("max_batch") or 0
 got = int(os.environ["PROJ_N"])
 expect = rows - rows // 5
 live = os.environ.get("RVBBIT_USER_FN_LIVE") == "1"
-print(f"project calls={calls} rows={stats['rows']} max_batch={stats['max_batch']} trues={got}")
+print(f"project calls={calls} rows={stat_rows} max_batch={max_batch} trues={got}")
 if not live and got != expect:
     sys.exit(f"expected {expect} true projections, got {got}")
 if calls >= rows:
@@ -230,7 +234,7 @@ stats = json.loads(os.environ["STATS"])
 rows = int(os.environ["ROWS"])
 got = int(os.environ["TREE_N"])
 expect = rows - rows // 5
-calls = stats["calls"]
+calls = stats.get("calls", stats.get("requests", 0))
 live = os.environ.get("RVBBIT_USER_FN_LIVE") == "1"
 print(f"tree calls={calls} cryptid={got}")
 if not live and got != expect:
@@ -252,8 +256,10 @@ STATS="$STATS" ROWS="$ROWS" python3 - <<'PY'
 import json, os, sys
 stats = json.loads(os.environ["STATS"])
 rows = int(os.environ["ROWS"])
-calls = stats["calls"]
-print(f"pipe calls={calls} rows={stats['rows']} max_batch={stats['max_batch']}")
+calls = stats.get("calls", stats.get("requests", 0))
+stat_rows = stats.get("rows", 0)
+max_batch = stats.get("max_batch") or 0
+print(f"pipe calls={calls} rows={stat_rows} max_batch={max_batch}")
 if calls >= rows:
     sys.exit(f"pipe was not batched: {calls} calls for {rows} rows")
 if calls < 1:

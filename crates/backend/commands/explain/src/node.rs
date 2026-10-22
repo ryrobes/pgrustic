@@ -125,6 +125,7 @@ fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
             let id = node.as_plan().map(|p| p.plan_node_id).unwrap_or(-1);
             let act = rvbbit_plan::node_actual(id).unwrap_or_default();
             ExplainPropertyInteger("Actual Semantic Calls", None, act.calls as i64, es);
+            ExplainPropertyInteger("Actual Choice Retakes", None, act.retakes as i64, es);
             ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
             ExplainPropertyInteger("Actual HTTP Batches", None, act.http_batches as i64, es);
             ExplainPropertyFloat("Actual Semantic USD", None, act.usd, 8, es);
@@ -155,6 +156,7 @@ fn show_semantic_totals(root: Node<'_>, es: &mut ExplainState<'_>) {
         if let Some(total) = &total {
             let act = rvbbit_plan::query_actual();
             ExplainPropertyInteger("Actual Total Calls", None, act.calls as i64, es);
+            ExplainPropertyInteger("Actual Total Choice Retakes", None, act.retakes as i64, es);
             ExplainPropertyInteger("Actual Total Cache Hits", None, act.cache_hits as i64, es);
             ExplainPropertyInteger("Actual Total HTTP Batches", None, act.http_batches as i64, es);
             ExplainPropertyFloat("Actual Total USD", None, act.usd, 8, es);

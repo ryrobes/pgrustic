@@ -293,6 +293,7 @@ mod tests {
             score: None,
             identical: None,
             payload: None,
+            retake: None,
         };
         let line = meter_log_line(&meter, "sk-secret");
         assert!(line.starts_with("hutch_call "));

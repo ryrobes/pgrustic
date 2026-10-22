@@ -484,6 +484,7 @@ pub fn init_all_with_transport(transport: Transport) {
     rvbbit_resolve::set_execute(rvbbit_catalog::execute);
     rvbbit_resolve::set_enum_labels(rvbbit_catalog::enum_labels);
     rvbbit_dispatch::define_gucs();
+    rvbbit_dispatch::set_nested_plan_probe(|| spi::debug_stack_depth() > 0);
     rvbbit_dispatch::start();
     nodeagg::set_summary_prefetcher(rvbbit_dispatch::prefetch_summaries);
 }

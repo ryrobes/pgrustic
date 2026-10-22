@@ -43,7 +43,8 @@ use cost::{
     summarize_produced, usage_from_body, ProviderUsage,
 };
 
-/// Latency samples kept per op and model. The call ledger uses
+/// Latency samples kept per op and model. The miss counter on
+/// `/stats` is not limited to this window. The call ledger uses
 /// [`rvbbit_contract::CALL_LOG_CAP`], which is much larger.
 const LATENCY_SAMPLE_CAP: usize = 1024;
 
@@ -284,12 +285,18 @@ struct Cache {
     provider_calls: u64,
     /// Operation POSTs, including ones served entirely from cache.
     requests: u64,
+    /// Items inside those POSTs. One row is one item.
+    rows: u64,
+    /// Largest item count in a single operation POST.
+    max_batch: u64,
     /// Recent provider calls and cache hits. `/reset` clears this.
     calls: VecDeque<CallMeter>,
     total_cost_usd: f64,
     cost_saved_usd: f64,
     /// Provider latency of misses, last [`LATENCY_SAMPLE_CAP`] per op+model.
     latency_samples: HashMap<(String, String), VecDeque<u64>>,
+    /// Misses per op+model. Not capped when the sample window is.
+    latency_misses: HashMap<(String, String), u64>,
     /// Decision-memo and contract-cache hits per op+model. Same reuse
     /// that `rvbbit.calls` records as `cache=hit`.
     latency_hits: HashMap<(String, String), u64>,
@@ -307,12 +314,24 @@ impl Cache {
             single_flight_waits: 0,
             provider_calls: 0,
             requests: 0,
+            rows: 0,
+            max_batch: 0,
             calls: VecDeque::new(),
             total_cost_usd: 0.0,
             cost_saved_usd: 0.0,
             latency_samples: HashMap::new(),
+            latency_misses: HashMap::new(),
             latency_hits: HashMap::new(),
         }
+    }
+}
+
+fn note_batch(cache: &mut Cache, items: usize) {
+    let n = items as u64;
+    cache.requests += 1;
+    cache.rows = cache.rows.saturating_add(n);
+    if n > cache.max_batch {
+        cache.max_batch = n;
     }
 }
 
@@ -493,7 +512,7 @@ fn route(
         }
         {
             let mut cache = lock(&server.cache);
-            cache.requests += 1;
+            note_batch(&mut cache, req.items.len());
         }
         let resp = run_batch(server, &tenant, op, mode, &req, audit);
         return (200, serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()));
@@ -1550,7 +1569,7 @@ fn choice_scored(
             let model = &plan.models[0];
             let mut asked = item.clone();
             asked.prompt = Some(CHOICE_RETRY_PROMPT.to_string());
-            let (text, meter) = decision_http(
+            let (text, mut meter) = decision_http(
                 server,
                 tenant,
                 operation,
@@ -1560,6 +1579,9 @@ fn choice_scored(
                 &asked,
                 memo,
             )?;
+            // EXPLAIN reads this response meter. The copy already logged
+            // inside `decision_http` stays unmarked.
+            meter.retake = Some(true);
             meters.push(meter);
             let hit = parse_choice(&text).map_err(map_decision_err)?;
             let mut fp = String::new();
@@ -2241,6 +2263,7 @@ fn miss_meter(
         score,
         identical: None,
         payload: audit_payload(),
+        retake: None,
     }
 }
 
@@ -2279,6 +2302,7 @@ fn saved_meter(
         score,
         identical: None,
         payload: audit_payload(),
+        retake: None,
     }
 }
 
@@ -2313,6 +2337,7 @@ fn meter_cached(
         score: stored.score,
         identical: stored.identical_takes,
         payload: audit_payload(),
+        retake: None,
     };
     record_call(server, &meter);
     let mut scored = stored.clone();
@@ -2331,6 +2356,10 @@ fn record_call(server: &Server, meter: &CallMeter) {
         cache.cost_saved_usd += saved;
     }
     if meter.cache == "miss" {
+        *cache
+            .latency_misses
+            .entry((meter.op.clone(), meter.model.clone()))
+            .or_default() += 1;
         if let Some(ms) = meter.provider_latency_ms {
             let samples = cache
                 .latency_samples
@@ -2863,6 +2892,7 @@ fn lookup_hit_meter(tenant: &str, stored: &Scored) -> CallMeter {
         score: stored.score,
         identical: stored.identical_takes,
         payload: audit_payload(),
+        retake: None,
     }
 }
 
@@ -2987,6 +3017,7 @@ fn stats_json(server: &Server, lite: bool) -> String {
         let mut keys = BTreeSet::new();
         keys.extend(cache.latency_samples.keys().cloned());
         keys.extend(cache.latency_hits.keys().cloned());
+        keys.extend(cache.latency_misses.keys().cloned());
         for (op, model) in keys {
             let values: Vec<u64> = cache
                 .latency_samples
@@ -2998,12 +3029,17 @@ fn stats_json(server: &Server, lite: bool) -> String {
                 .get(&(op.clone(), model.clone()))
                 .copied()
                 .unwrap_or(0);
+            let calls = cache
+                .latency_misses
+                .get(&(op.clone(), model.clone()))
+                .copied()
+                .unwrap_or(0);
             latency.push(serde_json::json!({
                 "op": op,
                 "model": model,
                 "p50_ms": percentile(&values, 0.50),
                 "p95_ms": percentile(&values, 0.95),
-                "calls": values.len(),
+                "calls": calls,
                 "hits": hits,
             }));
         }
@@ -3017,6 +3053,9 @@ fn stats_json(server: &Server, lite: bool) -> String {
             "single_flight_waits": cache.single_flight_waits,
             "provider_calls": cache.provider_calls,
             "requests": cache.requests,
+            "calls": cache.requests,
+            "rows": cache.rows,
+            "max_batch": cache.max_batch,
             "total_cost_usd": cache.total_cost_usd,
             "cost_saved_usd": cache.cost_saved_usd,
             "latency_by_op_model": latency,
@@ -3547,6 +3586,54 @@ mod tests {
             parse_json_value("{\"creature\":\"sasquatch\"}").unwrap()["creature"],
             "sasquatch"
         );
+    }
+
+    #[test]
+    fn stats_calls_follow_requests_and_misses_are_uncapped() {
+        let mut cache = Cache::new();
+        note_batch(&mut cache, 32);
+        note_batch(&mut cache, 8);
+        assert_eq!(cache.requests, 2);
+        assert_eq!(cache.rows, 40);
+        assert_eq!(cache.max_batch, 32);
+        let server = Server {
+            cfg: Config::from_env(),
+            agent: ureq::AgentBuilder::new().build(),
+            cache: Mutex::new(cache),
+        };
+        let n = LATENCY_SAMPLE_CAP + 100;
+        let usage = ProviderUsage {
+            model: Some("openai/gpt-4o-mini".into()),
+            ..ProviderUsage::default()
+        };
+        for _ in 0..n {
+            let meter = miss_meter(
+                Operation::Extract,
+                "local",
+                "openai/gpt-4o-mini",
+                &usage,
+                10,
+                11,
+                None,
+                None,
+            );
+            record_call(&server, &meter);
+        }
+        let stats: serde_json::Value = serde_json::from_str(&stats_json(&server, true)).unwrap();
+        assert_eq!(stats["calls"], 2);
+        assert_eq!(stats["requests"], 2);
+        assert_eq!(stats["rows"], 40);
+        assert_eq!(stats["max_batch"], 32);
+        let row = &stats["latency_by_op_model"][0];
+        assert_eq!(row["calls"], n);
+        assert_eq!(row["op"], "extract");
+        let samples = lock(&server.cache)
+            .latency_samples
+            .values()
+            .next()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        assert_eq!(samples, LATENCY_SAMPLE_CAP);
     }
 
     #[test]

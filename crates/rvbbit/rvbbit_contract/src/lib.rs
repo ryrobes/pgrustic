@@ -280,6 +280,10 @@ pub struct CallMeter {
     /// Postgres table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
+    /// This choice call is the second take for a score under 0.60.
+    /// Absent on the first take and on every other operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retake: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

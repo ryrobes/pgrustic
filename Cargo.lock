@@ -17160,6 +17160,7 @@ dependencies = [
 name = "rvbbit_cost"
 version = "0.0.0"
 dependencies = [
+ "rvbbit_contract",
  "serde_json",
 ]
 

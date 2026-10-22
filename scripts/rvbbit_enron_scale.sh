@@ -232,14 +232,14 @@ STEP_START=$(date +%s.%N)
 "${PSQL[@]}" -c "SELECT count(*) AS means_rows FROM enron WHERE body MEANS '${crit}'"
 rows_per_sec "MEANS" "$LOADED" "$STEP_START"
 report "after MEANS"
-MEANS_CALLS=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["calls"])')
+MEANS_CALLS=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s.get("provider_calls", s.get("calls", s.get("requests", 0))))')
 
 echo "=== MEANS again ==="
 STEP_START=$(date +%s.%N)
 "${PSQL[@]}" -c "SELECT count(*) AS means_rows FROM enron WHERE body MEANS '${crit}'"
 rows_per_sec "MEANS again" "$LOADED" "$STEP_START"
 report "after second MEANS"
-MEANS_CALLS_2=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["calls"])')
+MEANS_CALLS_2=$(curl -sf "http://127.0.0.1:$HUTCH_PORT/stats" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s.get("provider_calls", s.get("calls", s.get("requests", 0))))')
 echo "MEANS provider calls: ${MEANS_CALLS} then ${MEANS_CALLS_2}"
 
 echo "=== CLASSIFY ==="

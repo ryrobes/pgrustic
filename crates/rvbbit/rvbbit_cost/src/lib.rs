@@ -40,6 +40,10 @@ const VOYAGE_LATENCY_MS: f64 = 120.0;
 
 /// A configured `FALLBACK` is assumed to fire on a quarter of the rows.
 const FALLBACK_EXTRA: f64 = 0.25;
+/// Share of single-take CLASSIFY rows that take the second choice call
+/// when the winning probability is under 0.60. An Enron-scale run made
+/// 199 extra calls on 2000 rows.
+pub const CHOICE_RETAKE_FRACTION: f64 = 0.10;
 
 const HISTORY_CAP: usize = 256;
 
@@ -536,6 +540,15 @@ fn one_shot_rerank(op: Op, model: &str) -> bool {
     op == Op::Embed || (op == Op::Rerank && model != "jev")
 }
 
+/// The low-confidence second choice runs only for one model, one take,
+/// and no extra phrasing. Stacked takes already asked more than once.
+fn choice_may_retake(work: &Work) -> bool {
+    work.op == Op::Classify
+        && work.knobs.takes.max(1) == 1
+        && work.knobs.phrasings.max(1) == 1
+        && work.knobs.across.max(1) == 1
+}
+
 pub fn estimate(work: &Work) -> Estimate {
     let requested = work
         .knobs
@@ -572,7 +585,10 @@ pub fn estimate(work: &Work) -> Estimate {
     let fallback = if work.knobs.fallback { 1.0 + FALLBACK_EXTRA } else { 1.0 };
     let rows = work.rows.max(0.0);
     let per_row = if work.per_row > 0.0 { work.per_row } else { 1.0 };
-    let items = rows * per_row * takes * phrasings * across * fallback;
+    let mut items = rows * per_row * takes * phrasings * across * fallback;
+    if choice_may_retake(work) {
+        items *= 1.0 + CHOICE_RETAKE_FRACTION;
+    }
     let charged = items * (1.0 - hit_rate);
     let batch = work.batch_rows.max(1) as f64;
     let calls = match work.grouping {
@@ -592,11 +608,11 @@ pub fn estimate(work: &Work) -> Estimate {
     // on the batch.
     let wave_units = if one_shot_rerank(work.op, &model) { calls } else { charged };
     let waves = if wave_units <= 0.0 { 0.0 } else { (wave_units / conc).ceil() };
-    let sel = if work.filters {
-        selectivity(work.threshold.or(work.knobs.threshold))
-    } else {
-        1.0
-    };
+    let mut threshold = work.threshold.or(work.knobs.threshold);
+    if work.op == Op::Embed && threshold.is_none() {
+        threshold = Some(rvbbit_contract::ABOUT_THRESHOLD);
+    }
+    let sel = if work.filters { selectivity(threshold) } else { 1.0 };
     Estimate {
         calls,
         usd: charged * usd_per_item,
@@ -675,6 +691,8 @@ pub fn ingest_calls_json(text: &str) -> usize {
 pub struct Actual {
     /// Provider misses. A cache hit is not a call.
     pub calls: u64,
+    /// CLASSIFY choice calls taken because the first score was under 0.60.
+    pub retakes: u64,
     pub cache_hits: u64,
     /// HTTP attempts for this node. A fully local cache run is 0.
     pub http_batches: u64,
@@ -819,6 +837,18 @@ pub fn execution_in_progress() -> bool {
     EXEC_DEPTH.with(|d| d.get() > 0)
 }
 
+static NESTED_PLAN: Mutex<Option<fn() -> bool>> = Mutex::new(None);
+
+/// Installed at startup. True while a catalog SPI connection is planning,
+/// so that plan must not clear the user statement's scan-row counts.
+pub fn set_nested_plan_probe(probe: fn() -> bool) {
+    *lock(&NESTED_PLAN) = Some(probe);
+}
+
+pub fn in_nested_planner() -> bool {
+    lock(&NESTED_PLAN).is_some_and(|probe| probe())
+}
+
 /// New execution. Keeps the estimate armed at plan time. Nested SPI
 /// executions share this thread's depth so their plans cannot replace that
 /// estimate, and they do not wipe actuals the outer statement already recorded.
@@ -920,6 +950,7 @@ pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
                         items: call.get("items").and_then(|s| s.as_u64()).unwrap_or(1),
                     });
                 }
+                let retake = call.get("retake").and_then(|v| v.as_bool()).unwrap_or(false);
                 if let Some(id) = node {
                     let act = q.by_node.entry(id).or_default();
                     if hit {
@@ -927,6 +958,12 @@ pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
                     } else {
                         act.add_miss(usd, model);
                     }
+                    if retake {
+                        act.retakes += 1;
+                    }
+                }
+                if retake {
+                    q.total.retakes += 1;
                 }
             }
         } else if item.get("value").is_some_and(|v| !v.is_null())
@@ -1035,7 +1072,7 @@ mod tests {
             grouping: Grouping::Batched,
             batch_rows: 32,
             concurrency: 4,
-            threshold: Some(0.40),
+            threshold: None,
             filters: true,
         });
         let embed_per = EMBED_TOKENS_PER_TEXT * EMBED_USD_PER_MILLION / 1_000_000.0;
@@ -1043,6 +1080,9 @@ mod tests {
         assert_eq!(embedded.calls, 1.0);
         assert!((embedded.latency_ms - EMBED_LATENCY_MS).abs() < 1e-9);
         assert_eq!(embedded.model, "openai/text-embedding-3-small");
+        let about = selectivity(Some(rvbbit_contract::ABOUT_THRESHOLD));
+        assert!((embedded.selectivity - about).abs() < 1e-12, "{}", embedded.selectivity);
+        assert!((rvbbit_contract::ABOUT_THRESHOLD - 0.30).abs() < 1e-12);
 
         let mut knobs = Knobs::default();
         knobs.takes = 3;
@@ -1401,6 +1441,73 @@ mod tests {
         end_query();
         begin_query();
         assert_eq!(query_actual().calls, 0);
+        end_query();
+        reset_history();
+    }
+
+    #[test]
+    fn project_calls_count_rows_and_classify_includes_retakes() {
+        reset_history();
+        let project = estimate(&Work {
+            op: Op::Predict,
+            model: "jev".into(),
+            rows: 40.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        assert!((project.items - 40.0).abs() < 1e-9, "provider calls are per row");
+        assert_eq!(project.calls, 2.0, "HTTP batches stay packed");
+
+        let classify = estimate(&Work {
+            op: Op::Classify,
+            model: "jev".into(),
+            rows: 2000.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        let with_retake = 2000.0 * (1.0 + CHOICE_RETAKE_FRACTION);
+        assert!((classify.items - with_retake).abs() < 1e-6);
+
+        let mut knobs = Knobs::default();
+        knobs.takes = 2;
+        let stacked = estimate(&Work {
+            op: Op::Classify,
+            model: "jev".into(),
+            rows: 10.0,
+            per_row: 1.0,
+            knobs,
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        assert!((stacked.items - 20.0).abs() < 1e-9, "stacked takes do not add the retry");
+
+        begin_query();
+        let _scope = charge_scope(4);
+        observe_response(
+            r#"{"outputs":[{"key":"0","calls":[
+                {"op":"classify","model":"jev","cost_usd":0.01,"latency_ms":10,"cache":"miss","timestamp":"a"},
+                {"op":"classify","model":"jev","cost_usd":0.01,"latency_ms":12,"cache":"miss","timestamp":"b","retake":true}
+            ]}]}"#,
+            1,
+            4,
+        );
+        let node = node_actual(4).expect("classify node");
+        assert_eq!(node.calls, 2);
+        assert_eq!(node.retakes, 1);
+        assert_eq!(query_actual().retakes, 1);
         end_query();
         reset_history();
     }
