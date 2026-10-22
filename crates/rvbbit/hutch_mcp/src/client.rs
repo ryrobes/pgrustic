@@ -1,6 +1,7 @@
 //! Outbound MCP client. stdio spawns `command`. HTTP uses streamable HTTP.
-//! One connection serves a whole batch. stdio calls are serial. HTTP calls
-//! overlap up to the requested concurrency.
+//! One connection serves a whole batch. stdio and HTTP both overlap up to
+//! the requested concurrency: MCP allows concurrent JSON-RPC request ids
+//! on one session.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -50,7 +51,7 @@ pub fn call_many(
     let spec = spec.clone();
     block(async move {
         let client = connect(&spec).await?;
-        let conc = if spec.transport == "http" { concurrency.max(1) } else { 1 };
+        let conc = concurrency.max(1);
         let mut out = Vec::with_capacity(calls.len());
         for chunk in calls.chunks(conc) {
             if conc == 1 {

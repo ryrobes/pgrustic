@@ -23,6 +23,16 @@ pub struct Person {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BagBody {
+    pub k: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BagArgs {
+    pub bag: BagBody,
+}
+
 #[tool_router(server_handler)]
 impl DemoServer {
     #[tool(description = "Return the text argument")]
@@ -38,6 +48,18 @@ impl DemoServer {
     #[tool(description = "Fail on purpose")]
     fn fail(&self) -> Result<String, rmcp::ErrorData> {
         Err(rmcp::ErrorData::invalid_params("fail was called", None))
+    }
+
+    #[tool(description = "Echo one field of a JSON object")]
+    fn bag(&self, Parameters(BagArgs { bag }): Parameters<BagArgs>) -> String {
+        bag.k
+    }
+
+    /// The SQL name is longer than 63 bytes, so IMPORT records a warning
+    /// and keeps going.
+    #[tool(description = "Name does not fit in a Postgres identifier")]
+    fn this_tool_name_is_deliberately_longer_than_sixty_three_characters_xx(&self) -> String {
+        String::new()
     }
 
     #[tool(description = "Return two people")]
@@ -83,7 +105,9 @@ pub fn serve_http(addr: &str) -> Result<(), String> {
             config,
         );
         let router = axum::Router::new().nest_service("/mcp", service);
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| e.to_string())?;
+        let listener = crate::http::bind_listener(addr).map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
         eprintln!("hutch-mcp mock http on {addr}");
         axum::serve(listener, router).await.map_err(|e| e.to_string())?;
         Ok(())

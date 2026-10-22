@@ -143,6 +143,28 @@ fn gateway_caches_read_only_calls_and_logs_them() {
     assert!(blocked["error"].as_str().unwrap_or("").contains("max_cost"));
 }
 
+#[test]
+fn stdio_batch_runs_four_echoes_concurrently() {
+    let spec = stdio_spec();
+    let calls = (0..4)
+        .map(|i| ("echo".to_string(), json!({"text": format!("n{i}")})))
+        .collect();
+    let results = hutch_mcp::call_many(&spec, calls, Duration::from_secs(8), 4).expect("concurrent stdio batch");
+    assert_eq!(results.len(), 4);
+    for (i, result) in results.iter().enumerate() {
+        let value = result.as_ref().unwrap_or_else(|err| panic!("echo {i}: {err}"));
+        assert_eq!(value, &json!(format!("n{i}")));
+    }
+}
+
+#[test]
+fn gateway_rebinds_without_waiting_out_time_wait() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    drop(hutch_mcp::bind_listener(&addr).expect("first bind"));
+    drop(hutch_mcp::bind_listener(&addr).expect("second bind"));
+}
+
 fn post(addr: &str, path: &str, body: &Value) -> Value {
     let bytes = body.to_string();
     let mut stream = std::net::TcpStream::connect(addr).unwrap();

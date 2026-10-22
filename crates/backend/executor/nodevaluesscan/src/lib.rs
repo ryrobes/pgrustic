@@ -27,6 +27,7 @@ pub struct ValuesScanState<'mcx> {
     exprstatelists: PgVec<'mcx, Option<PgVec<'mcx, PgBox<'mcx, ExprState<'mcx>>>>>,
     curr_idx: i32,
     array_len: i32,
+    pub plan_node_id: i32,
 }
 
 impl<'mcx> ScanNode<'mcx> for ValuesScanState<'mcx> {
@@ -213,7 +214,15 @@ pub fn exec_init_values_scan<'mcx>(
         exprlists.push(row);
     }
 
-    Ok(ValuesScanState { ss, rowcontext, exprlists, exprstatelists, curr_idx: -1, array_len })
+    Ok(ValuesScanState {
+        ss,
+        rowcontext,
+        exprlists,
+        exprstatelists,
+        curr_idx: -1,
+        array_len,
+        plan_node_id: node.scan.plan.plan_node_id,
+    })
 }
 
 // ExecInitExprList over one VALUES row under the subplan compile env, the
@@ -284,5 +293,5 @@ pub fn exec_rescan_values_scan<'mcx>(
 }
 
 mcx::forget_safe_struct!(
-    ValuesScanState<'_> { ss, rowcontext, exprlists, curr_idx, array_len; exprstatelists },
+    ValuesScanState<'_> { ss, rowcontext, exprlists, curr_idx, array_len, plan_node_id; exprstatelists },
 );

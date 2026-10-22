@@ -115,12 +115,18 @@ pub fn exec_re_scan<'mcx>(
             crate::nodeprojectset::exec_re_scan_project_set_local(ps)?;
             exec_re_scan(&mut ps.outer, estate)
         }
-        PlanStateNode::SeqScan(ss) => ::nodeseqscan::exec_rescan_seq_scan(ss, estate),
+        PlanStateNode::SeqScan(ss) => {
+            crate::mcpbatch::rescan_scan(ss.plan_node_id());
+            ::nodeseqscan::exec_rescan_seq_scan(ss, estate)
+        }
         PlanStateNode::SampleScan(ss) => ::nodesamplescan::exec_rescan_sample_scan(ss, estate),
         PlanStateNode::FunctionScan(fs) => {
             ::nodefunctionscan::exec_rescan_function_scan(fs, estate)
         }
-        PlanStateNode::ValuesScan(vs) => ::nodevaluesscan::exec_rescan_values_scan(vs, estate),
+        PlanStateNode::ValuesScan(vs) => {
+            crate::mcpbatch::rescan_scan(vs.plan_node_id);
+            ::nodevaluesscan::exec_rescan_values_scan(vs, estate)
+        }
         PlanStateNode::ForeignScan(fs) => {
             let fs = &mut **fs;
             ::nodeforeignscan::exec_rescan_foreign_scan(
@@ -556,12 +562,18 @@ fn rescan_chg_forced_walk<'mcx>(
                 chg,
             )?;
         }
-        PlanStateNode::SeqScan(ss) => ::nodeseqscan::exec_rescan_seq_scan(ss, estate)?,
+        PlanStateNode::SeqScan(ss) => {
+            crate::mcpbatch::rescan_scan(ss.plan_node_id());
+            ::nodeseqscan::exec_rescan_seq_scan(ss, estate)?
+        }
         PlanStateNode::SampleScan(ss) => ::nodesamplescan::exec_rescan_sample_scan(ss, estate)?,
         PlanStateNode::FunctionScan(fs) => {
             ::nodefunctionscan::exec_rescan_function_scan_chg(fs, estate, chg)?
         }
-        PlanStateNode::ValuesScan(vs) => ::nodevaluesscan::exec_rescan_values_scan(vs, estate)?,
+        PlanStateNode::ValuesScan(vs) => {
+            crate::mcpbatch::rescan_scan(vs.plan_node_id);
+            ::nodevaluesscan::exec_rescan_values_scan(vs, estate)?
+        }
         PlanStateNode::ForeignScan(fs) => {
             let fs = &mut **fs;
             let mut outer = fs.outer.as_deref_mut().map(|o| crate::procnode::ForeignOuterChg {

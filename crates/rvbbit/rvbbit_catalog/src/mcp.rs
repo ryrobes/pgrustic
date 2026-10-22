@@ -41,12 +41,19 @@ const TOOL_DDL: &str = "CREATE TABLE IF NOT EXISTS mcp.tool (
     max_cost float8,
     read_only boolean NOT NULL DEFAULT false,
     procoid oid,
+    import_error text,
     PRIMARY KEY (nsp, name))";
 
 pub fn ensure() -> PgResult<()> {
-    exec("CREATE SCHEMA IF NOT EXISTS mcp")?;
-    exec(SERVER_DDL)?;
-    exec(TOOL_DDL)?;
+    ensure_schema("mcp")?;
+    if !relation_exists("mcp", "server")? {
+        exec(SERVER_DDL)?;
+    }
+    if !relation_exists("mcp", "tool")? {
+        exec(TOOL_DDL)?;
+    } else if !column_exists("mcp", "tool", "import_error")? {
+        exec("ALTER TABLE mcp.tool ADD COLUMN import_error text")?;
+    }
     if super::scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = 'rvbbit' AND p.proname = 'mcp_invoke_text' AND p.pronargs = 5",
@@ -176,7 +183,7 @@ fn import(server: &str, schema: &str, limit: Option<&[String]>, except: Option<&
     let spec = load_spec(server)?;
     let tools = rvbbit_dispatch::mcp_list(&spec).map_err(pg)?;
     let selected = select_tools(&tools, limit, except)?;
-    exec(&format!("CREATE SCHEMA IF NOT EXISTS {}", qident(schema)))?;
+    ensure_schema(schema)?;
     let mut used = sql_names(schema)?;
     let mut added = Vec::new();
     let mut changed = Vec::new();
@@ -192,18 +199,23 @@ fn import(server: &str, schema: &str, limit: Option<&[String]>, except: Option<&
         if let Some(row) = existing.into_iter().next() {
             let sql_name = cell(&row, 0);
             used.insert(sql_name.clone());
-            if cell(&row, 1) == tool.schema_hash {
+            let procoid: u32 = cell(&row, 3).parse().unwrap_or(0);
+            if cell(&row, 1) == tool.schema_hash && procoid != 0 {
                 unchanged.push(sql_name);
                 continue;
             }
             let old_hash = cell(&row, 1);
-            drop_fn(schema, &sql_name, &json_strings(&cell(&row, 2)))?;
-            create_fn(schema, &sql_name, server, tool, &spec)?;
-            changed.push(format!("{sql_name}: {old_hash} -> {} (recreated)", tool.schema_hash));
+            if procoid != 0 {
+                drop_fn(schema, &sql_name, &json_strings(&cell(&row, 2)))?;
+            }
+            if create_fn(schema, &sql_name, server, tool, &spec)? {
+                changed.push(format!("{sql_name}: {old_hash} -> {} (recreated)", tool.schema_hash));
+            }
         } else {
             let sql_name = unique_name(schema, &tool.name, &mut used)?;
-            create_fn(schema, &sql_name, server, tool, &spec)?;
-            added.push(sql_name);
+            if create_fn(schema, &sql_name, server, tool, &spec)? {
+                added.push(sql_name);
+            }
         }
     }
     if refresh {
@@ -237,7 +249,7 @@ fn refresh(server: &str) -> PgResult<()> {
         let schema = cell(row, 0);
         import(server, &schema, None, None, true)?;
         let have = query(&format!(
-            "SELECT name, tool, COALESCE(argtypes, '[]') FROM mcp.tool WHERE nsp = {} AND server = {}",
+            "SELECT name, tool, COALESCE(argtypes, '[]'), COALESCE(procoid::text, '0') FROM mcp.tool WHERE nsp = {} AND server = {}",
             qlit(&schema),
             qlit(server),
         ))?;
@@ -248,7 +260,9 @@ fn refresh(server: &str) -> PgResult<()> {
                 continue;
             }
             let sql_name = cell(&tool_row, 0);
-            drop_fn(&schema, &sql_name, &json_strings(&cell(&tool_row, 2)))?;
+            if cell(&tool_row, 3).parse::<u32>().unwrap_or(0) != 0 {
+                drop_fn(&schema, &sql_name, &json_strings(&cell(&tool_row, 2)))?;
+            }
             exec(&format!(
                 "DELETE FROM mcp.tool WHERE nsp = {} AND name = {}",
                 qlit(&schema),
@@ -365,7 +379,7 @@ pub fn mcp_try_drop(names: &[String], cascade: bool, missing_ok: bool) -> PgResu
 
 fn drop_server(name: &str, cascade: bool, missing_ok: bool) -> PgResult<()> {
     let rows = query(&format!(
-        "SELECT nsp, name, COALESCE(argtypes, '[]') FROM mcp.tool WHERE server = {}",
+        "SELECT nsp, name, COALESCE(argtypes, '[]'), COALESCE(procoid::text, '0') FROM mcp.tool WHERE server = {}",
         qlit(name)
     ))?;
     if rows.is_empty() && scalar(&format!("SELECT 1 FROM mcp.server WHERE name = {}", qlit(name)))?.is_none() {
@@ -375,13 +389,19 @@ fn drop_server(name: &str, cascade: bool, missing_ok: bool) -> PgResult<()> {
         return Err(pg(format!("MCP server \"{name}\" has tools; DROP SERVER ... CASCADE")));
     }
     for row in &rows {
+        if cell(row, 3).parse::<u32>().unwrap_or(0) == 0 {
+            continue;
+        }
         drop_fn(&cell(row, 0), &cell(row, 1), &json_strings(&cell(row, 2)))?;
     }
     exec(&format!("DELETE FROM mcp.server WHERE name = {}", qlit(name)))?;
     Ok(())
 }
 
-fn create_fn(schema: &str, sql_name: &str, server: &str, tool: &ListedTool, spec: &ServerSpec) -> PgResult<()> {
+/// True when the SQL function exists. A tool Postgres rejects (a name
+/// longer than 63 bytes, a required argument after a default) is recorded
+/// with a null `procoid` and does not abort the rest of the import.
+fn create_fn(schema: &str, sql_name: &str, server: &str, tool: &ListedTool, spec: &ServerSpec) -> PgResult<bool> {
     let shape = sql_args(&tool.input_schema, &tool.output_schema);
     let keys = json_names(&tool.input_schema);
     let body = tool_fn_body(schema, sql_name, &shape.args, shape.returns_table, &shape.columns);
@@ -392,26 +412,60 @@ fn create_fn(schema: &str, sql_name: &str, server: &str, tool: &ListedTool, spec
         .collect::<Vec<_>>()
         .join(", ");
     let vol = if tool.read_only_hint { "STABLE" } else { "VOLATILE" };
-    exec(&format!(
+    let create_sql = format!(
         "CREATE OR REPLACE FUNCTION {}.{}({args_sql}) RETURNS {} LANGUAGE sql {vol} PARALLEL UNSAFE COST 1000000 AS $mcp$\n{body}\n$mcp$",
         qident(schema),
         qident(sql_name),
         shape.return_sql,
-    ))?;
-    let oid = scalar(&format!(
-        "SELECT p.oid::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname = {} AND p.proname = {} ORDER BY p.oid DESC LIMIT 1",
-        qlit(schema),
-        qlit(sql_name),
-    ))?
-    .ok_or_else(|| pg(format!("MCP function {schema}.{sql_name} was not created")))?;
+    );
+    let name_lit = qlit(&tool.name);
+    // `name` truncates at 63 bytes and still creates the function, so a
+    // too-long tool would import under a different identifier. Refuse it
+    // before CREATE and keep the rest of the server.
+    let too_long = sql_name.len() > 63;
+    let preset_error = too_long.then(|| {
+        format!(
+            "SQL name \"{sql_name}\" is {} bytes; Postgres identifiers are at most 63 bytes",
+            sql_name.len()
+        )
+    });
+    if let Some(message) = &preset_error {
+        exec(&format!(
+            "DO $try$ BEGIN RAISE WARNING 'skipping MCP tool %: %', {name_lit}, {}; END $try$;",
+            qlit(message)
+        ))?;
+    } else {
+        exec("SELECT set_config('rvbbit.mcp_import_error', '', true)")?;
+        exec(&format!(
+            "DO $try$ BEGIN\n{create_sql};\nEXCEPTION WHEN OTHERS THEN\n\
+             PERFORM set_config('rvbbit.mcp_import_error', SQLERRM, true);\n\
+             RAISE WARNING 'skipping MCP tool %: %', {name_lit}, SQLERRM;\n\
+             END $try$;"
+        ))?;
+    }
+    let import_error = if let Some(message) = preset_error {
+        Some(message)
+    } else {
+        scalar("SELECT NULLIF(current_setting('rvbbit.mcp_import_error', true), '')")?
+    };
+    let oid = if import_error.is_some() {
+        None
+    } else {
+        Some(scalar(&format!(
+            "SELECT p.oid::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = {} AND p.proname = {} ORDER BY p.oid DESC LIMIT 1",
+            qlit(schema),
+            qlit(sql_name),
+        ))?
+        .ok_or_else(|| pg(format!("MCP function {schema}.{sql_name} was not created")))?)
+    };
     let argtypes = serde_json::to_string(&shape.args.iter().map(|a| a.sql_type.clone()).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
     let argkeys = serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into());
     let cols = serde_json::to_string(&shape.columns.iter().map(|c| format!("{} {}", c.name, c.sql_type)).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
     exec(&format!("DELETE FROM mcp.tool WHERE nsp = {} AND name = {}", qlit(schema), qlit(sql_name)))?;
     exec(&format!(
-        "INSERT INTO mcp.tool (nsp, name, server, tool, schema_hash, input_schema, output_schema, argkeys, argtypes, returns_table, return_cols, timeout_ms, cache_ttl_ms, max_cost, read_only, procoid) \
-         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, NULL, {}, {})",
+        "INSERT INTO mcp.tool (nsp, name, server, tool, schema_hash, input_schema, output_schema, argkeys, argtypes, returns_table, return_cols, timeout_ms, cache_ttl_ms, max_cost, read_only, procoid, import_error) \
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, NULL, {}, {}, {})",
         qlit(schema),
         qlit(sql_name),
         qlit(server),
@@ -425,9 +479,46 @@ fn create_fn(schema: &str, sql_name: &str, server: &str, tool: &ListedTool, spec
         qlit(&cols),
         spec.timeout_ms,
         if tool.read_only_hint { "true" } else { "false" },
-        qlit(&oid),
+        match &oid {
+            Some(value) => qlit(value),
+            None => "NULL".into(),
+        },
+        match &import_error {
+            Some(value) => qlit(value),
+            None => "NULL".into(),
+        },
     ))?;
+    Ok(oid.is_some())
+}
+
+fn ensure_schema(name: &str) -> PgResult<()> {
+    if scalar(&format!("SELECT 1 FROM pg_namespace WHERE nspname = {}", qlit(name)))?.is_none() {
+        exec(&format!("CREATE SCHEMA {}", qident(name)))?;
+    }
     Ok(())
+}
+
+fn relation_exists(nsp: &str, rel: &str) -> PgResult<bool> {
+    Ok(scalar(&format!(
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {} AND c.relname = {}",
+        qlit(nsp),
+        qlit(rel)
+    ))?
+    .is_some())
+}
+
+fn column_exists(nsp: &str, rel: &str, column: &str) -> PgResult<bool> {
+    Ok(scalar(&format!(
+        "SELECT 1 FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {} AND c.relname = {} AND a.attname = {} AND NOT a.attisdropped",
+        qlit(nsp),
+        qlit(rel),
+        qlit(column)
+    ))?
+    .is_some())
 }
 
 fn arg_sql(arg: &ArgSpec) -> String {

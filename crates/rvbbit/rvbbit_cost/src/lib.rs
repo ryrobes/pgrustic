@@ -848,10 +848,57 @@ pub fn disarm_query() {
 
 std::thread_local! {
     static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Plan node that owns an MCP tool in its target list. The tool's SQL
+    /// function is its own Result, and that inner `charge_scope` used to
+    /// steal the actuals from the scan or Result the user sees.
+    static MCP_NODE: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MCP_BATCHES: std::cell::RefCell<std::collections::HashMap<i32, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 pub fn execution_in_progress() -> bool {
     EXEC_DEPTH.with(|d| d.get() > 0)
+}
+
+pub fn exec_depth() -> u32 {
+    EXEC_DEPTH.with(|d| d.get())
+}
+
+pub struct McpNodeGuard {
+    armed: bool,
+}
+
+pub fn push_mcp_node(plan_node_id: i32) -> McpNodeGuard {
+    MCP_NODE.with(|stack| stack.borrow_mut().push(plan_node_id));
+    McpNodeGuard { armed: true }
+}
+
+impl Drop for McpNodeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            MCP_NODE.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+pub fn mcp_charge_node() -> Option<i32> {
+    MCP_NODE.with(|stack| stack.borrow().last().copied())
+}
+
+pub fn note_mcp_batch(plan_node_id: i32) {
+    MCP_BATCHES.with(|batches| {
+        *batches.borrow_mut().entry(plan_node_id).or_insert(0) += 1;
+    });
+}
+
+pub fn mcp_batches(plan_node_id: i32) -> Option<u64> {
+    MCP_BATCHES.with(|batches| batches.borrow().get(&plan_node_id).copied().filter(|n| *n > 0))
+}
+
+fn clear_mcp_batches() {
+    MCP_BATCHES.with(|batches| batches.borrow_mut().clear());
 }
 
 static NESTED_PLAN: Mutex<Option<fn() -> bool>> = Mutex::new(None);
@@ -878,6 +925,7 @@ pub fn begin_query() {
     if prev > 0 {
         return;
     }
+    clear_mcp_batches();
     let mut q = query();
     q.checked = false;
     q.node = None;
@@ -949,7 +997,7 @@ pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
                     note_observation(op, model, usd, latency, hit);
                 }
                 let mut q = query();
-                let node = q.node;
+                let node = mcp_charge_node().or(q.node);
                 if hit {
                     q.total.add_hit(model);
                 } else {
@@ -987,7 +1035,7 @@ pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
             && item.get("error").map(|e| e.is_null()).unwrap_or(true)
         {
             let mut q = query();
-            let node = q.node;
+            let node = mcp_charge_node().or(q.node);
             q.total.add_hit("");
             if let Some(id) = node {
                 q.by_node.entry(id).or_default().add_hit("");
@@ -996,7 +1044,7 @@ pub fn observe_response(body: &str, http_calls: u32, concurrency: u32) {
     }
     let wall = wall_ms(&misses, concurrency);
     let mut q = query();
-    let node = q.node;
+    let node = mcp_charge_node().or(q.node);
     q.total.latency_ms += wall;
     q.total.http_batches += u64::from(http_calls);
     if let Some(id) = node {

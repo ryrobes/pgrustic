@@ -36,10 +36,14 @@ static STATS: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, SemanticStats>>>
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 pub fn clear_stats() {
+    let outer = !rvbbit_cost::execution_in_progress();
     rvbbit_dispatch::begin_query();
     STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     crate::treebatch::clear_stats();
     crate::projbatch::clear_stats();
+    if outer {
+        crate::mcpbatch::clear_drives();
+    }
 }
 
 pub fn semantic_stats(plan_node_id: i32) -> Option<SemanticStats> {

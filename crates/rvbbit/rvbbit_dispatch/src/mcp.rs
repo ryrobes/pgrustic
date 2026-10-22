@@ -69,7 +69,7 @@ fn opts_from_tool(tool: &rvbbit_resolve::McpTool) -> McpCallOpts {
         cache_ttl_ms: tool.cache_ttl_ms,
         read_only: tool.read_only,
         max_cost: tool.max_cost,
-        concurrency: if tool.transport == "stdio" { 1 } else { 4 },
+        concurrency: 4,
     }
 }
 
@@ -155,6 +155,78 @@ fn call_body(spec: &ServerSpec, tool: &str, arguments: Value, opts: &McpCallOpts
         "read_only": opts.read_only,
         "max_cost": opts.max_cost,
     })
+}
+
+/// A memo the builtin kept from an earlier statement. The gateway never
+/// saw this call, so the row is recorded locally and the analyze counters
+/// still see a cache hit.
+pub fn note_mcp_memo_hit(server: &str, tool: &str, ok: bool) {
+    let status = if ok { "ok" } else { "error" };
+    let model = format!("mcp:{server}/{tool}");
+    crate::push_local_mcp_call(json!({
+        "op": "mcp",
+        "model": model,
+        "tokens_in": null,
+        "tokens_out": null,
+        "cost": 0.0,
+        "cost_saved": 0.0,
+        "latency_ms": 0,
+        "provider_latency_ms": null,
+        "cache": "hit",
+        "items": 1,
+        "tenant": "",
+        "generation_id": status,
+        "node": server,
+        "score": null,
+        "identical": null,
+        "ts": rfc3339_now(),
+        "server": server,
+        "tool": tool,
+        "status": status,
+    }));
+    let body = json!({
+        "outputs": [{
+            "value": if ok { json!("") } else { Value::Null },
+            "calls": [{
+                "op": "mcp",
+                "model": model,
+                "cache": "hit",
+                "cost_usd": 0.0,
+                "latency_ms": 0
+            }]
+        }]
+    });
+    rvbbit_cost::observe_response(&body.to_string(), 0, 1);
+}
+
+fn rfc3339_now() -> String {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (year, month, day) = civil_from_days((dur.as_secs() / 86_400) as i64);
+    let sod = dur.as_secs() % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60,
+        dur.subsec_millis()
+    )
+}
+
+/// Days since the Unix epoch to a civil date. Howard Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year as i32, month as u32, day as u32)
 }
 
 fn observe(rows: &[&Value], concurrency: usize) {

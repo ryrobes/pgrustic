@@ -85,6 +85,21 @@ fn re2_missing(reason: &str) {
     );
 }
 
+/// Undefined `absl` symbols in the static archive. `nm` missing is treated
+/// as "needs abseil": a silent `-lre2` link is how the undefined-symbol
+/// failure shipped before.
+fn archive_needs_absl(archive: &Path) -> bool {
+    let output = Command::new("nm").arg("-u").arg(archive).output();
+    let Ok(output) = output else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().any(|line| line.contains("absl"))
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_re2)");
     println!("cargo:rerun-if-changed=src/re2_shim.cc");
@@ -169,7 +184,9 @@ fn main() {
             // Newer re2 releases depend on abseil; the static archive does
             // not carry its deps, so emit pkg-config's static-view closure
             // after libre2.a (link order: dependents first). Older re2
-            // (no Requires:) makes this a no-op.
+            // (no Requires:) makes this a no-op. Without pkg-config, linking
+            // only -lre2 leaves undefined absl symbols.
+            let archive = d.join("libre2.a");
             if let Some(closure) = probe_pkgconfig(true) {
                 for p in &closure.link_paths {
                     println!("cargo:rustc-link-search=native={}", p.display());
@@ -179,6 +196,15 @@ fn main() {
                         println!("cargo:rustc-link-lib={l}");
                     }
                 }
+            } else if archive_needs_absl(&archive) {
+                panic!(
+                    "regexp_alt: {archive} references abseil (absl) but pkg-config \
+                     could not supply the static link line. Install pkg-config and \
+                     the re2 development files, then set PKG_CONFIG_PATH so \
+                     `pkg-config --static --libs re2` prints -lre2 and the absl \
+                     libraries. Linking -lre2 alone leaves those symbols undefined.",
+                    archive = archive.display()
+                );
             }
         }
         None => {

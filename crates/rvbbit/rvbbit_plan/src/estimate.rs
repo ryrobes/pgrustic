@@ -471,7 +471,10 @@ fn input_rows(node: Node<'_>) -> f64 {
         return plan.plan_rows;
     }
     let Some(child_node) = plan.lefttree else {
-        return plan.plan_rows;
+        // A seq scan or values scan has no child. Its own `plan_rows` is
+        // still the 10-page floor until ANALYZE. The planner stashes the
+        // counted tuple count on this node; use that when the qual is nil.
+        return priced_rows(plan.plan_rows, counted_scan_rows(node), plan.qual.is_nil());
     };
     let Some(child) = child_node.as_plan() else {
         return plan.plan_rows;
@@ -480,12 +483,19 @@ fn input_rows(node: Node<'_>) -> f64 {
     // EXPLAIN reuses id 1 for a small catalog table and used to replace
     // the user scan's count, so a 40-row project estimated a handful of
     // calls.
-    if child.qual.is_nil() {
-        if let Some(rows) = counted_scan_rows(child_node) {
+    priced_rows(child.plan_rows, counted_scan_rows(child_node), child.qual.is_nil())
+}
+
+/// Rows to price. A qual-free scan with a stashed live count uses that
+/// count. A scan that still has a qual keeps `plan_rows`. An absent count
+/// keeps `plan_rows` too (the 10-page floor).
+pub(crate) fn priced_rows(plan_rows: f64, counted: Option<f64>, qual_is_nil: bool) -> f64 {
+    if qual_is_nil {
+        if let Some(rows) = counted {
             return rows;
         }
     }
-    child.plan_rows
+    plan_rows
 }
 
 thread_local! {
@@ -612,6 +622,13 @@ mod tests {
         assert_eq!(counted_scan_key(8), None);
         clear_scan_rows();
         assert_eq!(counted_scan_key(7), None);
+    }
+
+    #[test]
+    fn priced_rows_uses_the_live_count_only_for_a_qual_free_scan() {
+        assert_eq!(priced_rows(1360.0, Some(10.0), true), 10.0);
+        assert_eq!(priced_rows(1360.0, None, true), 1360.0);
+        assert_eq!(priced_rows(4.0, Some(10.0), false), 4.0);
     }
 
     /// Two scans can both be `plan_node_id` 1 in successive plans. The
