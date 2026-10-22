@@ -310,9 +310,16 @@ pub fn serve(addr: &str, cfg: Config) -> std::io::Result<()> {
 }
 
 pub fn serve_listener(listener: TcpListener, cfg: Config) -> std::io::Result<()> {
+    // Idle-pool size is not an in-flight cap, but a pool of one makes
+    // a burst of summary chats open and discard sockets. Size it to
+    // the same concurrency the batch gate uses.
+    let pool = cfg.concurrency.max(8);
     let server = Arc::new(Server {
         cfg,
-        agent: ureq::AgentBuilder::new().build(),
+        agent: ureq::AgentBuilder::new()
+            .max_idle_connections(pool)
+            .max_idle_connections_per_host(pool)
+            .build(),
         cache: Mutex::new(Cache::new()),
     });
     for conn in listener.incoming() {
@@ -730,6 +737,9 @@ fn run_batch(
         };
         req.items.len()
     ]));
+    // One worker per item, capped by cfg.concurrency. scope joins them
+    // all, so a batch of summary chats overlaps instead of running one
+    // provider call after another.
     let slots = server.cfg.concurrency.max(1);
     let gate = Arc::new((Mutex::new(slots), Condvar::new()));
     thread::scope(|scope| {
@@ -923,7 +933,7 @@ fn provider_call(
         Operation::Extract => Some(256),
         _ => Some(32),
     });
-    let (text, meter) = chat(
+    let (text, mut meter) = chat(
         server,
         operation,
         tenant,
@@ -936,6 +946,11 @@ fn provider_call(
         item.response_schema.as_ref(),
     )
         .map_err(|message| item_err("provider", &message))?;
+    // SUMMARIZE shares the extract route. The call log has to say
+    // summarize so the planner can price it apart from EXTRACT MANY.
+    if item.extract_mode.as_deref() == Some("summary") {
+        meter.op = "summarize".into();
+    }
     let value = match operation {
         Operation::Extract => parse_extract(&text, item.extract_mode.as_deref())
             .map_err(|message| item_err("parse", &message))?,

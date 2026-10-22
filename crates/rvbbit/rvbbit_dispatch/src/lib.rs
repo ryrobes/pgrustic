@@ -217,8 +217,8 @@ pub fn define_gucs() {
 /// price from observed latency and USD. Later calls update the same table
 /// as their responses arrive. Missing hutch is ignored.
 fn pull_remote_history() {
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::Relaxed) {
+    static LOADED: AtomicBool = AtomicBool::new(false);
+    if LOADED.load(Ordering::Relaxed) {
         return;
     }
     let Ok(url) = std::env::var("RVBBIT_HUTCH_URL") else {
@@ -229,16 +229,20 @@ fn pull_remote_history() {
         return;
     }
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(250))
+        .timeout(Duration::from_millis(750))
         .build();
     let calls = match agent.get(&format!("{base}/v1/calls?limit=256")).call() {
         Ok(resp) => resp.into_string().map(|text| rvbbit_cost::ingest_calls_json(&text)).unwrap_or(0),
         Err(_) => 0,
     };
-    if calls == 0 {
-        if let Ok(resp) = agent.get(&format!("{base}/stats")).call() {
-            if let Ok(text) = resp.into_string() {
-                rvbbit_cost::ingest_stats_json(&text);
+    if calls > 0 {
+        LOADED.store(true, Ordering::Relaxed);
+        return;
+    }
+    if let Ok(resp) = agent.get(&format!("{base}/stats")).call() {
+        if let Ok(text) = resp.into_string() {
+            if rvbbit_cost::ingest_stats_json(&text) > 0 {
+                LOADED.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -247,7 +251,11 @@ fn pull_remote_history() {
 /// Clear the per-query memo. Executor start calls this.
 pub fn begin_query() {
     memo::begin_query();
+    let outer = !rvbbit_cost::execution_in_progress();
     rvbbit_cost::begin_query();
+    if outer {
+        clear_summary_cache();
+    }
 }
 
 pub struct Ticket {
@@ -776,11 +784,116 @@ pub fn push_agg(state: &str, value: &str, extra: &str, clauses: &str) -> String 
 }
 
 pub fn summarize_state(state: &str) -> PgResult<Option<String>> {
+    if let Some(hit) = cached_summary(state) {
+        return Ok(Some(hit));
+    }
     let (clauses, _extra, parts) = read_agg(state);
     if parts.is_empty() {
         return Ok(None);
     }
     Ok(Some(summarize_text(&parts.join("\n\n"), &clauses)?))
+}
+
+/// Hash aggregation calls this once per filled batch, before any final
+/// function runs. Groups with no clause tail share one extract body, and
+/// hutch runs those chat calls under its concurrency cap. The finals then
+/// read the cache instead of posting one group at a time.
+pub fn prefetch_summaries(states: &[String]) {
+    let _ = prefetch_summaries_inner(states);
+}
+
+fn prefetch_summaries_inner(states: &[String]) -> Result<(), String> {
+    let mut simple_state = Vec::new();
+    let mut simple_input = Vec::new();
+    let mut complex: Vec<(String, String, String)> = Vec::new();
+    for state in states {
+        let (clauses, _extra, parts) = read_agg(state);
+        if parts.is_empty() {
+            continue;
+        }
+        let input = parts.join("\n\n");
+        if clauses.trim().is_empty() {
+            simple_state.push(state.to_string());
+            simple_input.push(input);
+        } else {
+            complex.push((state.to_string(), input, clauses));
+        }
+    }
+    if !simple_input.is_empty() {
+        let reply = summarize_many(&simple_input).map_err(|e| e.to_string())?;
+        if reply.values.len() == simple_state.len() {
+            let mut cache = summary_cache();
+            for (state, value) in simple_state.into_iter().zip(reply.values) {
+                if let Ok(text) = value {
+                    cache.insert(state, text);
+                }
+            }
+        }
+    }
+    for (state, input, clauses) in complex {
+        if let Ok(text) = summarize_text(&input, &clauses) {
+            summary_cache().insert(state, text);
+        }
+    }
+    Ok(())
+}
+
+fn summarize_many(inputs: &[String]) -> PgResult<ManyReply> {
+    if inputs.is_empty() {
+        return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
+    }
+    let ep = summary_endpoint();
+    let width = rvbbit_resolve::batch_rows().max(1);
+    let mut tickets = Vec::new();
+    for chunk in inputs.chunks(width) {
+        let payload: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|input| serde_json::json!({ "input": input }))
+            .collect();
+        let body = encode_items(&ep, Operation::Extract, &payload).map_err(pg)?;
+        tickets.push(post_ticket(&ep, "extract", body)?);
+    }
+    let mut values = Vec::with_capacity(inputs.len());
+    let mut http_calls = 0u32;
+    for ticket in tickets {
+        let raw = wait_raw(ticket)?;
+        http_calls = http_calls.saturating_add(raw.http_calls);
+        values.extend(decode_text_items(&raw.body).map_err(pg)?);
+    }
+    if values.len() != inputs.len() {
+        return Err(pg(format!(
+            "hutch summarize returned {} items for {} groups",
+            values.len(),
+            inputs.len()
+        )));
+    }
+    Ok(ManyReply { values, http_calls })
+}
+
+fn post_ticket(ep: &Endpoint, op: &str, body: String) -> PgResult<Ticket> {
+    let auth = bearer(ep).map_err(pg)?;
+    send(
+        format!("{}/v1/{op}", ep.base_url.trim_end_matches('/')),
+        auth,
+        ep,
+        body,
+        cache_header(cache_mode_of(ep), None, None),
+    )
+}
+
+static SUMMARY_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn summary_cache() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+    SUMMARY_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cached_summary(state: &str) -> Option<String> {
+    summary_cache().get(state).cloned()
+}
+
+fn clear_summary_cache() {
+    summary_cache().clear();
 }
 
 pub fn summarize_text(input: &str, clauses: &str) -> PgResult<String> {

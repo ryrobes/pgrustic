@@ -44,6 +44,18 @@ use ::types_tuple::TupleDescData;
 
 pub fn init_seams() {}
 
+/// Hash aggregation calls this with every group's transition text before
+/// the first final function. SUMMARIZE uses it to post the groups together.
+static SUMMARY_PREFETCH: std::sync::Mutex<Option<fn(&[String])>> = std::sync::Mutex::new(None);
+
+pub fn set_summary_prefetcher(prefetch: fn(&[String])) {
+    *SUMMARY_PREFETCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(prefetch);
+}
+
+fn summary_prefetcher() -> Option<fn(&[String])> {
+    *SUMMARY_PREFETCH.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -630,6 +642,53 @@ struct PerSortData<'mcx> {
     // None when numCols == 0 (all keys constant): no boundary, one group.
     eq: Option<PgBox<'mcx, ExprState<'mcx>>>,
     have_pending: bool,
+    // Pure SUMMARIZE groups are read to the end before the first final
+    // waits, then replayed from this buffer. One pull at a time would post
+    // one chat per group.
+    capture_summaries: bool,
+    summary_replay: Option<SummaryReplay>,
+}
+
+// One sorted group's representative tuple and SUMMARIZE transition text,
+// copied out before the agg context reset drops the live datums.
+struct SavedSummaryGroup {
+    image: Vec<u8>,
+    states: Vec<(u32, String)>,
+}
+
+struct SummaryReplay {
+    groups: Vec<SavedSummaryGroup>,
+    index: usize,
+    // The row just returned still points into this image.
+    live: Option<AlignedImage>,
+}
+
+struct AlignedImage {
+    ptr: NonNull<u8>,
+    layout: core::alloc::Layout,
+}
+
+impl AlignedImage {
+    fn copy_of(bytes: &[u8]) -> Self {
+        let layout = core::alloc::Layout::from_size_align(bytes.len().max(1), 8).expect("summary tuple align");
+        // SAFETY: layout size is non-zero.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        let ptr = NonNull::new(ptr).expect("summary tuple alloc");
+        // SAFETY: fresh allocation of at least bytes.len() bytes.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len()) };
+        AlignedImage { ptr, layout }
+    }
+
+    fn as_mintuple(&self) -> NonNull<::types_tuple::MinimalTupleData> {
+        self.ptr.cast()
+    }
+}
+
+impl Drop for AlignedImage {
+    fn drop(&mut self) {
+        // SAFETY: allocated by copy_of with this layout.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
 }
 
 // C AggStatePerHashData, single grouping set (find_hash_columns order:
@@ -1727,7 +1786,15 @@ fn init_persort<'mcx>(
     let pending_slot =
         exectuples::make_tuple_table_slot(mcx, TupleSlotKind::MinimalTuple, Some(outer_desc));
     let slot_mcx = make_owned_context(mcx, mcx.context().new_child("Agg Sorted Group Slots"))?;
-    Ok(PerSortData { first_slot, pending_slot, slot_mcx, eq, have_pending: false })
+    Ok(PerSortData {
+        first_slot,
+        pending_slot,
+        slot_mcx,
+        eq,
+        have_pending: false,
+        capture_summaries: false,
+        summary_replay: None,
+    })
 }
 
 // find_cols (nodeAgg.c): outer columns referenced outside aggregate args.
@@ -5229,6 +5296,12 @@ where
     F: FnMut(&mut EStateData<'mcx>) -> PgResult<Option<ExecSlotId>>,
 {
     let mcx = estate.es_query_cxt;
+    if node.persort.as_ref().is_some_and(|ps| ps.summary_replay.is_some()) {
+        return emit_buffered_summary(node, estate);
+    }
+    if sorted_summary_should_capture(node) {
+        node.persort.as_mut().expect("sorted Agg has persort").capture_summaries = true;
+    }
     while !node.agg_done {
         estate.reset_expr_context(node.ps_ExprContext);
         // SAFETY: sole access path to the node during the reset (the frames'
@@ -5316,52 +5389,213 @@ where
             estate.reset_expr_context(node.tmpcontext);
         }
         process_ordered_aggregates(node, estate)?;
+        // Sorted agg would finalize (and wait) one group per pull. Read
+        // every SUMMARIZE group first, post the chats together, then
+        // replay the finals from the cache.
+        if node.persort.as_ref().is_some_and(|ps| ps.capture_summaries) {
+            capture_sorted_group(node)?;
+            if node.agg_done {
+                node.persort.as_mut().expect("sorted Agg has persort").capture_summaries = false;
+                prefetch_captured_summaries(node);
+                node.agg_done = false;
+                return emit_buffered_summary(node, estate);
+            }
+            continue;
+        }
         finalize_aggregates(node, estate, node.pergroup_base)?;
-
-        if node.proj.has_subplan()
-            || !node.proj.param_exec_deps().is_empty()
-            || node.qual.as_deref().is_some_and(|q| q.has_subplan() || !q.param_exec_deps().is_empty())
-        {
-            let ecxt = node.ps_ExprContext;
-            let result = node.ps_ResultTupleSlot;
-            let instr_idx = node.instr_idx;
-            let AggStateData { persort, qual, proj, .. } = node;
-            let ps = persort.as_mut().expect("sorted Agg has persort");
-            if !::executils::exec_qual_with_subplans_outer(
-                qual.as_deref_mut(),
-                &mut ps.first_slot,
-                estate,
-                ecxt,
-            )? {
-                estate.instr_count_filtered1(instr_idx);
-                continue;
-            }
-            ::executils::exec_project_with_subplans_outer(
-                proj,
-                &mut ps.first_slot,
-                estate,
-                ecxt,
-                result,
-            )?;
-            return Ok(Some(result));
+        if let Some(slot) = project_sorted_group(node, estate, mcx)? {
+            return Ok(Some(slot));
         }
-        {
-            let AggStateData { persort, qual, .. } = node;
-            let ps = persort.as_mut().expect("sorted Agg has persort");
-            let mut slots =
-                EvalSlots { scan: None, inner: None, outer: Some(&mut ps.first_slot) };
-            if !exec_qual(qual.as_deref_mut(), &mut slots)? {
-                estate.instr_count_filtered1(node.instr_idx);
-                continue;
-            }
-        }
-        let result_slot = estate.slot_mut(node.ps_ResultTupleSlot);
-        let ps = node.persort.as_mut().unwrap();
-        let mut slots = EvalSlots { scan: None, inner: None, outer: Some(&mut ps.first_slot) };
-        exec_project(&mut node.proj, &mut slots, result_slot, mcx)?;
-        return Ok(Some(node.ps_ResultTupleSlot));
     }
     Ok(None)
+}
+
+fn project_sorted_group<'mcx>(
+    node: &mut AggStateData<'mcx>,
+    estate: &mut EStateData<'mcx>,
+    mcx: ::mcx::Mcx<'mcx>,
+) -> PgResult<Option<ExecSlotId>> {
+    if node.proj.has_subplan()
+        || !node.proj.param_exec_deps().is_empty()
+        || node.qual.as_deref().is_some_and(|q| q.has_subplan() || !q.param_exec_deps().is_empty())
+    {
+        let ecxt = node.ps_ExprContext;
+        let result = node.ps_ResultTupleSlot;
+        let instr_idx = node.instr_idx;
+        let AggStateData { persort, qual, proj, .. } = node;
+        let ps = persort.as_mut().expect("sorted Agg has persort");
+        if !::executils::exec_qual_with_subplans_outer(
+            qual.as_deref_mut(),
+            &mut ps.first_slot,
+            estate,
+            ecxt,
+        )? {
+            estate.instr_count_filtered1(instr_idx);
+            return Ok(None);
+        }
+        ::executils::exec_project_with_subplans_outer(
+            proj,
+            &mut ps.first_slot,
+            estate,
+            ecxt,
+            result,
+        )?;
+        return Ok(Some(result));
+    }
+    {
+        let AggStateData { persort, qual, .. } = node;
+        let ps = persort.as_mut().expect("sorted Agg has persort");
+        let mut slots = EvalSlots { scan: None, inner: None, outer: Some(&mut ps.first_slot) };
+        if !exec_qual(qual.as_deref_mut(), &mut slots)? {
+            estate.instr_count_filtered1(node.instr_idx);
+            return Ok(None);
+        }
+    }
+    let result_slot = estate.slot_mut(node.ps_ResultTupleSlot);
+    let ps = node.persort.as_mut().unwrap();
+    let mut slots = EvalSlots { scan: None, inner: None, outer: Some(&mut ps.first_slot) };
+    exec_project(&mut node.proj, &mut slots, result_slot, mcx)?;
+    Ok(Some(node.ps_ResultTupleSlot))
+}
+
+/// Every transition is a SUMMARIZE final, with no ordered-aggregate sort.
+/// Mixed aggregates stay on the one-group finalize path.
+fn sorted_summary_should_capture(node: &AggStateData<'_>) -> bool {
+    if !node.pertrans_sort.is_empty() {
+        return false;
+    }
+    let transnos = summarize_transnos(node);
+    !transnos.is_empty() && transnos.len() == node.trans_typ.len()
+}
+
+fn capture_sorted_group<'mcx>(node: &mut AggStateData<'mcx>) -> PgResult<()> {
+    let image = {
+        let ps = node.persort.as_mut().expect("sorted Agg has persort");
+        let mt = exectuples::exec_copy_slot_minimal_tuple(&mut ps.first_slot, ps.slot_mcx, ps.slot_mcx, 0)?;
+        let len = mt.t_len() as usize;
+        // SAFETY: as_ptr is a live minimal-tuple image of t_len bytes.
+        unsafe { core::slice::from_raw_parts(mt.as_ptr(), len) }.to_vec()
+    };
+    let mut states = Vec::new();
+    for transno in summarize_transnos(node) {
+        // SAFETY: transno came from peragg and is inside the pergroup array.
+        let pg = unsafe { &*node.pergroup_base.as_ptr().add(transno as usize) };
+        if pg.trans_value_is_null || pg.no_trans_value {
+            continue;
+        }
+        if let Some(text) = datum_text(pg.trans_value) {
+            states.push((transno, text));
+        }
+    }
+    let ps = node.persort.as_mut().expect("sorted Agg has persort");
+    let replay = ps.summary_replay.get_or_insert_with(|| SummaryReplay {
+        groups: Vec::new(),
+        index: 0,
+        live: None,
+    });
+    replay.groups.push(SavedSummaryGroup { image, states });
+    Ok(())
+}
+
+fn prefetch_captured_summaries(node: &AggStateData<'_>) {
+    let Some(prefetch) = summary_prefetcher() else {
+        return;
+    };
+    let Some(replay) = node.persort.as_ref().and_then(|ps| ps.summary_replay.as_ref()) else {
+        return;
+    };
+    let mut states = Vec::new();
+    for group in &replay.groups {
+        for (_, text) in &group.states {
+            if !text.is_empty() {
+                states.push(text.clone());
+            }
+        }
+    }
+    if !states.is_empty() {
+        prefetch(&states);
+    }
+}
+
+fn emit_buffered_summary<'mcx>(
+    node: &mut AggStateData<'mcx>,
+    estate: &mut EStateData<'mcx>,
+) -> PgResult<Option<ExecSlotId>> {
+    let mcx = estate.es_query_cxt;
+    loop {
+        let (image, states, done) = {
+            let replay = node
+                .persort
+                .as_ref()
+                .and_then(|ps| ps.summary_replay.as_ref())
+                .expect("buffered summary replay");
+            if replay.index >= replay.groups.len() {
+                (Vec::new(), Vec::new(), true)
+            } else {
+                let group = &replay.groups[replay.index];
+                (group.image.clone(), group.states.clone(), false)
+            }
+        };
+        if done {
+            node.agg_done = true;
+            return Ok(None);
+        }
+        node.persort.as_mut().unwrap().summary_replay.as_mut().unwrap().index += 1;
+        estate.reset_expr_context(node.ps_ExprContext);
+        // SAFETY: sole access path during the per-group reset.
+        unsafe { node.agg_node.as_mut() }.reset();
+        initialize_aggregates(node, estate)?;
+        install_summary_states(node, &states)?;
+        let aligned = AlignedImage::copy_of(&image);
+        let ptr = aligned.as_mintuple();
+        node.persort.as_mut().unwrap().summary_replay.as_mut().unwrap().live = Some(aligned);
+        {
+            let ps = node.persort.as_mut().expect("sorted Agg has persort");
+            // SAFETY: live holds the image until the next group replaces it.
+            unsafe { exectuples::exec_store_minimal_tuple_ptr(&mut ps.first_slot, mcx, ptr) };
+            exectuples::slot_getallattrs(&mut ps.first_slot);
+        }
+        finalize_aggregates(node, estate, node.pergroup_base)?;
+        if let Some(slot) = project_sorted_group(node, estate, mcx)? {
+            return Ok(Some(slot));
+        }
+    }
+}
+
+fn install_summary_states<'mcx>(
+    node: &mut AggStateData<'mcx>,
+    states: &[(u32, String)],
+) -> PgResult<()> {
+    // SAFETY: agg_node is the query-lifetime cell.
+    let agg_mcx = unsafe { node.agg_node.as_ref() }.aggcontext();
+    for (transno, text) in states {
+        let datum = agg_text_datum(agg_mcx, text)?;
+        // SAFETY: transno is inside the pergroup array.
+        unsafe {
+            node.pergroup_base.as_ptr().add(*transno as usize).write(AggPerGroup {
+                trans_value: datum,
+                trans_value_is_null: false,
+                no_trans_value: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn agg_text_datum<'mcx>(mcx: ::mcx::Mcx<'mcx>, text: &str) -> PgResult<Datum> {
+    let payload = text.as_bytes();
+    let len = datum::varlena::VARHDRSZ + payload.len();
+    let mut buf = vec_with_capacity_in(mcx, len)?;
+    // SAFETY: the reserve covers the 4-byte header plus the payload.
+    unsafe {
+        let hdr = datum::varlena::set_varsize_4b(len);
+        core::ptr::copy_nonoverlapping(hdr.as_ptr(), buf.as_mut_ptr(), hdr.len());
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), buf.as_mut_ptr().add(hdr.len()), payload.len());
+        buf.set_len(len);
+    }
+    let datum = Datum::from_usize(buf.as_ptr() as usize);
+    core::mem::forget(buf);
+    Ok(datum)
 }
 
 // agg_fill_hash_table (nodeAgg.c): drain the child through the hash lookup +
@@ -5514,6 +5748,11 @@ fn agg_retrieve_hash_table<'mcx>(
 ) -> PgResult<Option<ExecSlotId>> {
     let mcx = estate.es_query_cxt;
     loop {
+        // A filled or refilled batch starts at cursor 0. Post every SUMMARIZE
+        // group before any final function waits on its own HTTP call.
+        if node.perhash.as_ref().is_some_and(|ph| ph.hashiter == 0) {
+            prefetch_hash_summaries(node)?;
+        }
         // agg_retrieve_hash_table_in_memory (nodeAgg.c:2895): per entry.
         check_for_interrupts()?;
         estate.reset_expr_context(node.ps_ExprContext);
@@ -5604,6 +5843,109 @@ fn agg_retrieve_hash_table<'mcx>(
     }
 }
 
+fn prefetch_hash_summaries<'mcx>(node: &AggStateData<'mcx>) -> PgResult<()> {
+    let Some(prefetch) = summary_prefetcher() else {
+        return Ok(());
+    };
+    let transnos = summarize_transnos(node);
+    if transnos.is_empty() {
+        return Ok(());
+    }
+    let Some(ph) = node.perhash.as_ref() else {
+        return Ok(());
+    };
+    let ntrans = node.trans_typ.len();
+    if ntrans == 0 {
+        return Ok(());
+    }
+    let mut states = Vec::new();
+    let mut cursor = 0u64;
+    while let Some(ix) = ph.hashtable.iterate(&mut cursor) {
+        let Some(extra) = ph.hashtable.entry_additional(ix) else {
+            continue;
+        };
+        let base = extra.cast::<AggPerGroup>();
+        for &transno in &transnos {
+            let transno = transno as usize;
+            if transno >= ntrans {
+                continue;
+            }
+            // SAFETY: the entry's additional block holds ntrans AggPerGroup
+            // slots, and transno is inside that count. The text datum stays
+            // live in the agg context for the table's lifetime.
+            let pg = unsafe { &*base.as_ptr().add(transno) };
+            if pg.trans_value_is_null || pg.no_trans_value {
+                continue;
+            }
+            if let Some(text) = datum_text(pg.trans_value) {
+                states.push(text);
+            }
+        }
+    }
+    if !states.is_empty() {
+        prefetch(&states);
+    }
+    Ok(())
+}
+
+fn summarize_transnos(node: &AggStateData<'_>) -> Vec<u32> {
+    let mut out = Vec::new();
+    for pa in &node.peragg {
+        let Some(flinfo) = pa.finalfn.as_ref() else {
+            continue;
+        };
+        if !is_summarize_final(flinfo.fn_oid) {
+            continue;
+        }
+        if !out.contains(&pa.transno) {
+            out.push(pa.transno);
+        }
+    }
+    out
+}
+
+fn is_summarize_final(oid: Oid) -> bool {
+    match syscache_seams::pg_proc_proname::call(oid) {
+        Ok(Some(name)) => {
+            let n = core::str::from_utf8(name.name_str()).unwrap_or("");
+            n == "summarize_final" || n == "rvbbit_summarize_final"
+        }
+        _ => false,
+    }
+}
+
+/// 1-byte and uncompressed 4-byte text. Toasted values are left for the
+/// final function, which already knows how to read its argument.
+fn datum_text(d: Datum) -> Option<String> {
+    let ptr = d.as_usize() as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: a by-ref transvalue is a live varlena in the agg context.
+    // A header that is neither 1B nor 4B-U is skipped.
+    unsafe {
+        let b0 = *ptr;
+        let (data, len) = if b0 & 0x01 == 0x01 {
+            let varsize = (b0 >> 1) as usize;
+            if varsize < 1 {
+                return None;
+            }
+            (ptr.add(1), varsize - 1)
+        } else if b0 & 0x03 == 0 {
+            let word = ptr.cast::<u32>().read_unaligned();
+            let varsize = (word >> 2) as usize;
+            if varsize < 4 || varsize > 16 * 1024 * 1024 {
+                return None;
+            }
+            (ptr.add(4), varsize - 4)
+        } else {
+            return None;
+        };
+        let bytes = core::slice::from_raw_parts(data, len);
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 /// `ExecEndAgg` node-local half; the caller ends the outer child (contexts
 /// are freed with the EState).
 pub fn exec_end_agg(node: &mut AggStateData<'_>) {
@@ -5611,6 +5953,10 @@ pub fn exec_end_agg(node: &mut AggStateData<'_>) {
     node.merge = None;
     if let Some(ph) = node.perhash.as_mut() {
         hashagg_reset_spill_state(ph, node.plan.numGroups as f64);
+    }
+    if let Some(ps) = node.persort.as_mut() {
+        ps.capture_summaries = false;
+        ps.summary_replay.take();
     }
     if let Some(gs) = node.gsets.as_mut() {
         gsets::end_grouping_sets(gs);
@@ -5673,6 +6019,8 @@ pub fn exec_rescan_agg_chg<'mcx>(node: &mut AggStateData<'mcx>, _estate: &mut ES
     }
     if let Some(ps) = node.persort.as_mut() {
         ps.have_pending = false;
+        ps.capture_summaries = false;
+        ps.summary_replay.take();
     }
     // SAFETY: sole access path to the node during the reset; frees hashed
     // byref transvalues too (they live in aggcontext).
@@ -5729,6 +6077,8 @@ pub fn exec_rescan_agg<'mcx>(node: &mut AggStateData<'mcx>, _estate: &mut EState
     }
     if let Some(ps) = node.persort.as_mut() {
         ps.have_pending = false;
+        ps.capture_summaries = false;
+        ps.summary_replay.take();
     }
     // SAFETY: sole access path to the node during the reset.
     unsafe { node.agg_node.as_mut() }.reset();
@@ -5794,7 +6144,7 @@ mcx::forget_safe_struct!(
     PerAggData<'_> { transno, aggref, trans_shared, num_final_args,
         agg_collation, resulttype_len, wide_fcinfo;
         finalfn, serialfn, direct_args },
-    PerSortData<'_> { have_pending, slot_mcx; first_slot, pending_slot, eq },
+    PerSortData<'_> { have_pending, slot_mcx, capture_summaries; first_slot, pending_slot, eq, summary_replay },
     HashSpillState<'_> { mode, ever_spilled, batches, all_cols_needed,
         max_colno_needed, colnos_needed, read_buf, input_card, used_bits,
         hashentrysize;
