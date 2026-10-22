@@ -729,7 +729,7 @@ fn rerank_summary_and_extract_many() {
         summed.outputs[0].value,
         Some(serde_json::json!("a short summary of the notes"))
     );
-    assert_eq!(summed.outputs[0].calls.as_ref().unwrap()[0].op, "extract");
+    assert_eq!(summed.outputs[0].calls.as_ref().unwrap()[0].op, "summarize");
 
     let mut many = summary.clone();
     many.items[0].extract_mode = Some("many".into());

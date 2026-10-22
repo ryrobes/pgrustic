@@ -923,7 +923,7 @@ fn provider_call(
         Operation::Extract => Some(256),
         _ => Some(32),
     });
-    let (text, meter) = chat(
+    let (text, mut meter) = chat(
         server,
         operation,
         tenant,
@@ -936,6 +936,11 @@ fn provider_call(
         item.response_schema.as_ref(),
     )
         .map_err(|message| item_err("provider", &message))?;
+    // SUMMARIZE shares the extract route. The call log has to say
+    // summarize so the planner can price it apart from EXTRACT MANY.
+    if item.extract_mode.as_deref() == Some("summary") {
+        meter.op = "summarize".into();
+    }
     let value = match operation {
         Operation::Extract => parse_extract(&text, item.extract_mode.as_deref())
             .map_err(|message| item_err("parse", &message))?,
@@ -2085,7 +2090,15 @@ fn parse_extract(text: &str, mode: Option<&str>) -> Result<serde_json::Value, St
                             out.push(serde_json::Value::String(s.to_string()));
                         }
                     }
-                    _ => return Err("extract many items must be strings".into()),
+                    serde_json::Value::Object(map) => {
+                        let text = map.get("text").and_then(|t| t.as_str()).unwrap_or("").trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let proper = map.get("proper").and_then(|p| p.as_bool()).unwrap_or(false);
+                        out.push(serde_json::json!({ "text": text, "proper": proper }));
+                    }
+                    _ => return Err("extract many items must be strings or {text, proper} objects".into()),
                 }
             }
             Ok(serde_json::Value::Array(out))
@@ -2695,6 +2708,14 @@ mod tests {
         assert_eq!(
             parse_extract("{\"mentions\":[]}", Some("many")).unwrap(),
             serde_json::json!([])
+        );
+        assert_eq!(
+            parse_extract(
+                "{\"mentions\":[{\"text\":\"Bigfoot\",\"proper\":true},{\"text\":\"animal\",\"proper\":false}]}",
+                Some("many")
+            )
+            .unwrap(),
+            serde_json::json!([{"text":"Bigfoot","proper":true},{"text":"animal","proper":false}])
         );
     }
 

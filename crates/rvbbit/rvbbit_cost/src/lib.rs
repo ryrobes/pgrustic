@@ -19,11 +19,16 @@ const MINI_TOKENS_IN: f64 = 300.0;
 const MINI_TOKENS_OUT: f64 = 50.0;
 
 /// Voyage rerank is priced per token, like the rerank-2 list rate.
+/// Live `/rerank` rows billed about half of a 200-token document.
 const VOYAGE_USD_PER_MILLION: f64 = 0.05;
-const VOYAGE_TOKENS_PER_DOC: f64 = 200.0;
+const VOYAGE_TOKENS_PER_DOC: f64 = 100.0;
 
 const JEV_LATENCY_MS: f64 = 350.0;
 const MINI_LATENCY_MS: f64 = 280.0;
+/// Observed gpt-4o-mini SUMMARIZE p50, until `rvbbit.calls` replaces it.
+const SUMMARIZE_LATENCY_MS: f64 = 1000.0;
+/// Live SUMMARIZE USD ran at 5/8 of the shared mini seed (1.6x high).
+const SUMMARIZE_USD_FACTOR: f64 = 5.0 / 8.0;
 const VOYAGE_LATENCY_MS: f64 = 120.0;
 
 /// A configured `FALLBACK` is assumed to fire on a quarter of the rows.
@@ -332,12 +337,16 @@ struct Seed {
 fn seed_for(model: &str, op: Op) -> Seed {
     let m = model.trim().to_ascii_lowercase();
     if m.contains("gpt-4o-mini") || m.contains("4o-mini") {
-        return Seed {
-            usd_per_item: (MINI_TOKENS_IN * MINI_USD_PER_MILLION_IN
-                + MINI_TOKENS_OUT * MINI_USD_PER_MILLION_OUT)
-                / 1_000_000.0,
-            latency_ms: MINI_LATENCY_MS,
-        };
+        let usd = (MINI_TOKENS_IN * MINI_USD_PER_MILLION_IN
+            + MINI_TOKENS_OUT * MINI_USD_PER_MILLION_OUT)
+            / 1_000_000.0;
+        if op == Op::Summarize {
+            return Seed {
+                usd_per_item: usd * SUMMARIZE_USD_FACTOR,
+                latency_ms: SUMMARIZE_LATENCY_MS,
+            };
+        }
+        return Seed { usd_per_item: usd, latency_ms: MINI_LATENCY_MS };
     }
     if op == Op::Rerank && (m.contains("voyage") || m.contains("rerank-3")) {
         return Seed {
@@ -406,6 +415,40 @@ struct Learned {
     usd_per_item: Option<f64>,
     latency_ms: Option<f64>,
     hit_rate: Option<f64>,
+}
+
+fn same_model(sample: &str, want: &str) -> bool {
+    let a = sample.trim().to_ascii_lowercase();
+    let b = want.trim().to_ascii_lowercase();
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+fn history_samples(op: Op, model: &str) -> Vec<Sample> {
+    let history = lock(&HISTORY);
+    history
+        .samples
+        .iter()
+        .filter(|s| s.op.eq_ignore_ascii_case(op.as_str()) && same_model(&s.model, model))
+        .cloned()
+        .collect()
+}
+
+fn mean_priced(samples: &[Sample]) -> Option<f64> {
+    let priced: Vec<&Sample> = samples.iter().filter(|s| !s.hit && s.usd > 0.0).collect();
+    if priced.is_empty() {
+        return None;
+    }
+    Some(priced.iter().map(|s| s.usd).sum::<f64>() / priced.len() as f64)
+}
+
+fn p50_miss(samples: &[Sample]) -> Option<f64> {
+    let mut values: Vec<f64> = samples.iter().filter(|s| !s.hit).map(|s| s.latency_ms).collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((values.len() - 1) as f64 * 0.50).round() as usize;
+    Some(values[idx.min(values.len() - 1)])
 }
 
 fn learned(op: Op, model: &str) -> Learned {
@@ -479,8 +522,21 @@ pub fn estimate(work: &Work) -> Estimate {
     let model = priced_model(work.op, &requested);
     let seed = seed_for(&model, work.op);
     let learned = learned(work.op, &model);
-    let usd_per_item = learned.usd_per_item.unwrap_or(seed.usd_per_item);
-    let latency_per = learned.latency_ms.unwrap_or(seed.latency_ms);
+    let mut usd_per_item = learned.usd_per_item.unwrap_or(seed.usd_per_item);
+    let mut latency_per = learned.latency_ms.unwrap_or(seed.latency_ms);
+    if work.op == Op::Summarize {
+        let own = history_samples(Op::Summarize, &model);
+        if let Some(usd) = mean_priced(&own) {
+            usd_per_item = usd;
+        }
+        // Prefer this op's own p50. Otherwise the gpt-4o-mini chat p50,
+        // which is what SUMMARIZE actually spends (logged as extract until
+        // the meter was tagged).
+        if let Some(ms) = p50_miss(&own).or_else(|| p50_miss(&history_samples(Op::Extract, &model)))
+        {
+            latency_per = ms;
+        }
+    }
     let hit_rate = if work.knobs.cache_off {
         0.0
     } else {
@@ -580,7 +636,12 @@ pub fn ingest_calls_json(text: &str) -> usize {
             .unwrap_or(0.0);
         let latency = row.get("latency_ms").and_then(|s| s.as_f64()).unwrap_or(0.0);
         let cache = row.get("cache").and_then(|s| s.as_str()).unwrap_or("miss");
-        note_observation(op, model, usd, latency, cache == "hit");
+        // A voyage rerank meter is one request cloned across `items`
+        // documents. The planner multiplies per document, so the sample
+        // has to be per document too.
+        let items = row.get("items").and_then(|n| n.as_u64()).unwrap_or(1).max(1);
+        let per_item = if items > 1 { usd / items as f64 } else { usd };
+        note_observation(op, model, per_item, latency, cache == "hit");
         n += 1;
     }
     n
@@ -1054,7 +1115,9 @@ mod tests {
             filters: false,
         });
         assert_eq!(summary.model, "openai/gpt-4o-mini");
-        assert!((summary.usd - 3.0 * mini).abs() < 1e-12);
+        assert!((summary.usd - 3.0 * mini * SUMMARIZE_USD_FACTOR).abs() < 1e-12);
+        // Three groups at concurrency 4 are one wave of the mini p50.
+        assert!((summary.latency_ms - SUMMARIZE_LATENCY_MS).abs() < 1e-9);
 
         let means = estimate(&Work {
             op: Op::Predict,
@@ -1109,6 +1172,69 @@ mod tests {
             filters: false,
         });
         assert_eq!(nemotron.model, "nvidia/nemotron-3.5-rerank-8b:free");
+        reset_history();
+    }
+
+    #[test]
+    fn calls_history_calibrates_voyage_per_doc_and_summarize_p50() {
+        reset_history();
+        let n = ingest_calls_json(
+            r#"{"calls":[
+                {"op":"rerank","model":"voyageai/rerank-3","cost_usd":0.00012,"latency_ms":90,"cache":"miss","items":12},
+                {"op":"extract","model":"gpt-4o-mini","cost_usd":0.0002,"latency_ms":800,"cache":"miss","items":1},
+                {"op":"extract","model":"openai/gpt-4o-mini","cost_usd":0.0002,"latency_ms":1200,"cache":"miss","items":1}
+            ]}"#,
+        );
+        assert_eq!(n, 3);
+        let voyage = estimate(&Work {
+            op: Op::Rerank,
+            model: "voyageai/rerank-3".into(),
+            rows: 12.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::Batched,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        // The meter was the whole request. Per document is 0.00012 / 12.
+        assert!((voyage.usd - 0.00012).abs() < 1e-12, "{}", voyage.usd);
+
+        let summary = estimate(&Work {
+            op: Op::Summarize,
+            model: "mock".into(),
+            rows: 3.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::PerGroup,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        // p50 of 800 and 1200, same index rule as hutch percentile: the higher one.
+        // Extract USD must not replace the summarize seed.
+        let mini = (MINI_TOKENS_IN * MINI_USD_PER_MILLION_IN + MINI_TOKENS_OUT * MINI_USD_PER_MILLION_OUT)
+            / 1_000_000.0;
+        assert!((summary.latency_ms - 1200.0).abs() < 1e-9, "{}", summary.latency_ms);
+        assert!((summary.usd - 3.0 * mini * SUMMARIZE_USD_FACTOR).abs() < 1e-12, "{}", summary.usd);
+
+        note_observation("summarize", "openai/gpt-4o-mini", 0.00004, 900.0, false);
+        let priced = estimate(&Work {
+            op: Op::Summarize,
+            model: "openai/gpt-4o-mini".into(),
+            rows: 1.0,
+            per_row: 1.0,
+            knobs: Knobs::default(),
+            grouping: Grouping::PerGroup,
+            batch_rows: 32,
+            concurrency: 4,
+            threshold: None,
+            filters: false,
+        });
+        assert!((priced.usd - 0.00004).abs() < 1e-12, "{}", priced.usd);
+        assert!((priced.latency_ms - 900.0).abs() < 1e-9, "{}", priced.latency_ms);
         reset_history();
     }
 

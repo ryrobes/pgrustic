@@ -44,6 +44,18 @@ use ::types_tuple::TupleDescData;
 
 pub fn init_seams() {}
 
+/// Hash aggregation calls this with every group's transition text before
+/// the first final function. SUMMARIZE uses it to post the groups together.
+static SUMMARY_PREFETCH: std::sync::Mutex<Option<fn(&[String])>> = std::sync::Mutex::new(None);
+
+pub fn set_summary_prefetcher(prefetch: fn(&[String])) {
+    *SUMMARY_PREFETCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(prefetch);
+}
+
+fn summary_prefetcher() -> Option<fn(&[String])> {
+    *SUMMARY_PREFETCH.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -5514,6 +5526,11 @@ fn agg_retrieve_hash_table<'mcx>(
 ) -> PgResult<Option<ExecSlotId>> {
     let mcx = estate.es_query_cxt;
     loop {
+        // A filled or refilled batch starts at cursor 0. Post every SUMMARIZE
+        // group before any final function waits on its own HTTP call.
+        if node.perhash.as_ref().is_some_and(|ph| ph.hashiter == 0) {
+            prefetch_hash_summaries(node)?;
+        }
         // agg_retrieve_hash_table_in_memory (nodeAgg.c:2895): per entry.
         check_for_interrupts()?;
         estate.reset_expr_context(node.ps_ExprContext);
@@ -5601,6 +5618,109 @@ fn agg_retrieve_hash_table<'mcx>(
         let mut slots = EvalSlots { scan: None, inner: None, outer: Some(&mut ph.first_slot) };
         exec_project(&mut node.proj, &mut slots, result_slot, mcx)?;
         return Ok(Some(node.ps_ResultTupleSlot));
+    }
+}
+
+fn prefetch_hash_summaries<'mcx>(node: &AggStateData<'mcx>) -> PgResult<()> {
+    let Some(prefetch) = summary_prefetcher() else {
+        return Ok(());
+    };
+    let transnos = summarize_transnos(node);
+    if transnos.is_empty() {
+        return Ok(());
+    }
+    let Some(ph) = node.perhash.as_ref() else {
+        return Ok(());
+    };
+    let ntrans = node.trans_typ.len();
+    if ntrans == 0 {
+        return Ok(());
+    }
+    let mut states = Vec::new();
+    let mut cursor = 0u64;
+    while let Some(ix) = ph.hashtable.iterate(&mut cursor) {
+        let Some(extra) = ph.hashtable.entry_additional(ix) else {
+            continue;
+        };
+        let base = extra.cast::<AggPerGroup>();
+        for &transno in &transnos {
+            let transno = transno as usize;
+            if transno >= ntrans {
+                continue;
+            }
+            // SAFETY: the entry's additional block holds ntrans AggPerGroup
+            // slots, and transno is inside that count. The text datum stays
+            // live in the agg context for the table's lifetime.
+            let pg = unsafe { &*base.as_ptr().add(transno) };
+            if pg.trans_value_is_null || pg.no_trans_value {
+                continue;
+            }
+            if let Some(text) = datum_text(pg.trans_value) {
+                states.push(text);
+            }
+        }
+    }
+    if !states.is_empty() {
+        prefetch(&states);
+    }
+    Ok(())
+}
+
+fn summarize_transnos(node: &AggStateData<'_>) -> Vec<u32> {
+    let mut out = Vec::new();
+    for pa in &node.peragg {
+        let Some(flinfo) = pa.finalfn.as_ref() else {
+            continue;
+        };
+        if !is_summarize_final(flinfo.fn_oid) {
+            continue;
+        }
+        if !out.contains(&pa.transno) {
+            out.push(pa.transno);
+        }
+    }
+    out
+}
+
+fn is_summarize_final(oid: Oid) -> bool {
+    match syscache_seams::pg_proc_proname::call(oid) {
+        Ok(Some(name)) => {
+            let n = core::str::from_utf8(name.name_str()).unwrap_or("");
+            n == "summarize_final" || n == "rvbbit_summarize_final"
+        }
+        _ => false,
+    }
+}
+
+/// 1-byte and uncompressed 4-byte text. Toasted values are left for the
+/// final function, which already knows how to read its argument.
+fn datum_text(d: Datum) -> Option<String> {
+    let ptr = d.as_usize() as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: a by-ref transvalue is a live varlena in the agg context.
+    // A header that is neither 1B nor 4B-U is skipped.
+    unsafe {
+        let b0 = *ptr;
+        let (data, len) = if b0 & 0x01 == 0x01 {
+            let varsize = (b0 >> 1) as usize;
+            if varsize < 1 {
+                return None;
+            }
+            (ptr.add(1), varsize - 1)
+        } else if b0 & 0x03 == 0 {
+            let word = ptr.cast::<u32>().read_unaligned();
+            let varsize = (word >> 2) as usize;
+            if varsize < 4 || varsize > 16 * 1024 * 1024 {
+                return None;
+            }
+            (ptr.add(4), varsize - 4)
+        } else {
+            return None;
+        };
+        let bytes = core::slice::from_raw_parts(data, len);
+        Some(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 

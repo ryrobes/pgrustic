@@ -217,8 +217,8 @@ pub fn define_gucs() {
 /// price from observed latency and USD. Later calls update the same table
 /// as their responses arrive. Missing hutch is ignored.
 fn pull_remote_history() {
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::Relaxed) {
+    static LOADED: AtomicBool = AtomicBool::new(false);
+    if LOADED.load(Ordering::Relaxed) {
         return;
     }
     let Ok(url) = std::env::var("RVBBIT_HUTCH_URL") else {
@@ -229,16 +229,20 @@ fn pull_remote_history() {
         return;
     }
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(250))
+        .timeout(Duration::from_millis(750))
         .build();
     let calls = match agent.get(&format!("{base}/v1/calls?limit=256")).call() {
         Ok(resp) => resp.into_string().map(|text| rvbbit_cost::ingest_calls_json(&text)).unwrap_or(0),
         Err(_) => 0,
     };
-    if calls == 0 {
-        if let Ok(resp) = agent.get(&format!("{base}/stats")).call() {
-            if let Ok(text) = resp.into_string() {
-                rvbbit_cost::ingest_stats_json(&text);
+    if calls > 0 {
+        LOADED.store(true, Ordering::Relaxed);
+        return;
+    }
+    if let Ok(resp) = agent.get(&format!("{base}/stats")).call() {
+        if let Ok(text) = resp.into_string() {
+            if rvbbit_cost::ingest_stats_json(&text) > 0 {
+                LOADED.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -247,7 +251,11 @@ fn pull_remote_history() {
 /// Clear the per-query memo. Executor start calls this.
 pub fn begin_query() {
     memo::begin_query();
+    let outer = !rvbbit_cost::execution_in_progress();
     rvbbit_cost::begin_query();
+    if outer {
+        clear_summary_cache();
+    }
 }
 
 pub struct Ticket {
@@ -605,7 +613,18 @@ fn many_schema(kind: &str) -> serde_json::Value {
             "mentions": {
                 "type": "array",
                 "description": format!("One {kind} copied from the text, or empty."),
-                "items": { "type": "string" }
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["text", "proper"],
+                    "properties": {
+                        "text": { "type": "string" },
+                        "proper": {
+                            "type": "boolean",
+                            "description": "True when text is a proper noun or a named entity."
+                        }
+                    }
+                }
             }
         }
     })
@@ -633,12 +652,14 @@ fn many_endpoint(kind: &str) -> Endpoint {
     ep.system_prompt = format!(
         "Extract every {kind}. JSON only, no markdown, schema {schema_text}. \
          {} \
+         proper is true for a proper noun or a named entity, including a cryptid name. \
          Copy only words from the user text. Leave out anything that is not a {kind}. \
          If there are none, mentions is [].",
         many_examples()
     );
     ep.user_prompt = format!(
         "List every {kind}. Proper nouns, descriptive phrases, and synonyms count. \
+         Set proper true for a proper noun or named entity. \
          Leave out anything that is not a {kind}. If there are none, mentions is [].\n{{{{input}}}}"
     );
     ep.max_tokens = Some(256);
@@ -654,11 +675,88 @@ fn many_examples() -> String {
         .to_string()
 }
 
-/// One batched jev question per candidate: `is {candidate} a {kind}?`.
-/// The input is the source text. A false answer drops that candidate.
-/// A transport error, or a reply that does not line up, keeps the chat
-/// list. Jev is much cheaper than the extract call, and an outage must
-/// not wipe recall. Empty lists skip the check.
+/// One mention from the chat list. `proper` is set when the extractor
+/// marked a proper noun or named entity, or the copied text has a capital.
+#[derive(Clone, Debug)]
+struct Mention {
+    text: String,
+    proper: bool,
+}
+
+/// Keep, drop, or ask jev. A marked proper noun is never dropped. A
+/// generic word for the kind (`animal`, `man`, `sea life`) is never kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MentionFate {
+    Keep,
+    Drop,
+    Ask,
+}
+
+fn mention_fate(kind: &str, text: &str, proper: bool) -> MentionFate {
+    if proper {
+        return MentionFate::Keep;
+    }
+    if generic_kind_word(kind, text) {
+        return MentionFate::Drop;
+    }
+    MentionFate::Ask
+}
+
+fn generic_kind_word(kind: &str, text: &str) -> bool {
+    let folded = fold_words(text);
+    if folded.is_empty() {
+        return true;
+    }
+    if folded == fold_words(kind) {
+        return true;
+    }
+    const GENERIC: &[&str] = &[
+        "animal",
+        "animals",
+        "man",
+        "men",
+        "person",
+        "people",
+        "human",
+        "humans",
+        "creature",
+        "creatures",
+        "thing",
+        "being",
+        "entity",
+        "shellfish",
+        "sea life",
+        "human like figure",
+        "humanlike figure",
+        "life form",
+        "critter",
+    ];
+    GENERIC.contains(&folded.as_str())
+}
+
+fn fold_words(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
+fn looks_proper(text: &str) -> bool {
+    text.chars().any(|c| c.is_uppercase())
+}
+
+/// The question names the source text. A context-free `is X a creature?`
+/// told jev that Bigfoot is a cryptid, not a creature, and let `animal` through.
+fn specific_question(kind: &str, cand: &str, input: &str) -> String {
+    let cand = cand.replace('"', "'");
+    let excerpt: String = input.chars().take(400).collect();
+    format!(
+        "Text: {excerpt}. In this text, does \"{cand}\" name a specific {kind}, rather than a generic word for the kind itself?"
+    )
+}
+
+/// One batched jev question per candidate that is not already decided.
+/// The input and the question both carry the source text. A false answer
+/// drops that candidate. A transport error, or a reply that does not line
+/// up, keeps the undecided candidates. Proper nouns stay either way.
+/// Values are deduped case-insensitively.
 fn confirm_mentions(
     kind: &str,
     inputs: &[String],
@@ -666,44 +764,49 @@ fn confirm_mentions(
 ) -> Vec<Result<String, String>> {
     let mut jobs: Vec<(String, String)> = Vec::new();
     let mut where_job: Vec<(usize, usize)> = Vec::new();
-    let mut parsed: Vec<Option<Vec<String>>> = Vec::with_capacity(values.len());
+    let mut parsed: Vec<Option<Vec<Mention>>> = Vec::with_capacity(values.len());
+    let mut dropped: Vec<Vec<bool>> = Vec::with_capacity(values.len());
     for (row, value) in values.iter().enumerate() {
         let Some(text) = value.as_ref().ok() else {
             parsed.push(None);
+            dropped.push(Vec::new());
             continue;
         };
-        let Some(mentions) = parse_mention_list(text) else {
+        let Some(mentions) = parse_mentions(text) else {
             parsed.push(None);
+            dropped.push(Vec::new());
             continue;
         };
         let input = inputs.get(row).map(|s| s.as_str()).unwrap_or("");
-        for (index, cand) in mentions.iter().enumerate() {
-            let trimmed = cand.trim();
+        let mut row_drop = vec![false; mentions.len()];
+        for (index, mention) in mentions.iter().enumerate() {
+            let trimmed = mention.text.trim();
             if trimmed.is_empty() {
+                row_drop[index] = true;
                 continue;
             }
-            jobs.push((input.to_string(), format!("is {trimmed} a {kind}?")));
-            where_job.push((row, index));
+            match mention_fate(kind, trimmed, mention.proper) {
+                MentionFate::Keep => {}
+                MentionFate::Drop => row_drop[index] = true,
+                MentionFate::Ask => {
+                    jobs.push((input.to_string(), specific_question(kind, trimmed, input)));
+                    where_job.push((row, index));
+                }
+            }
         }
         parsed.push(Some(mentions));
+        dropped.push(row_drop);
     }
-    if jobs.is_empty() {
-        return values;
-    }
-    let oid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
-    let Ok(reply) = submit(oid, &jobs).and_then(wait) else {
-        return values;
-    };
-    if reply.matched.len() != where_job.len() {
-        return values;
-    }
-    let mut dropped: Vec<Vec<bool>> = parsed
-        .iter()
-        .map(|mentions| mentions.as_ref().map(|m| vec![false; m.len()]).unwrap_or_default())
-        .collect();
-    for (flag, (row, index)) in reply.matched.iter().zip(where_job) {
-        if !flag {
-            dropped[row][index] = true;
+    if !jobs.is_empty() {
+        let oid = rvbbit_resolve::func_oid("means").unwrap_or(rvbbit_oids::MEANS_OID);
+        if let Ok(reply) = submit(oid, &jobs).and_then(wait) {
+            if reply.matched.len() == where_job.len() {
+                for (flag, (row, index)) in reply.matched.iter().zip(where_job) {
+                    if !flag {
+                        dropped[row][index] = true;
+                    }
+                }
+            }
         }
     }
     for (row, mentions) in parsed.into_iter().enumerate() {
@@ -715,22 +818,48 @@ fn confirm_mentions(
     values
 }
 
-fn retain_mentions(mentions: &[String], rejected: &[bool]) -> String {
-    let kept: Vec<&str> = mentions
-        .iter()
-        .enumerate()
-        .filter(|(index, cand)| !cand.trim().is_empty() && !rejected.get(*index).copied().unwrap_or(false))
-        .map(|(_, cand)| cand.as_str())
-        .collect();
+fn retain_mentions(mentions: &[Mention], rejected: &[bool]) -> String {
+    let mut seen = Vec::new();
+    let mut kept = Vec::new();
+    for (index, mention) in mentions.iter().enumerate() {
+        let text = mention.text.trim();
+        if text.is_empty() || rejected.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let key = text.to_ascii_lowercase();
+        if seen.iter().any(|s: &String| s == &key) {
+            continue;
+        }
+        seen.push(key);
+        kept.push(text);
+    }
     serde_json::to_string(&kept).unwrap_or_else(|_| "[]".into())
 }
 
-fn parse_mention_list(text: &str) -> Option<Vec<String>> {
+fn parse_mentions(text: &str) -> Option<Vec<Mention>> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let arr = value.as_array()?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        out.push(item.as_str()?.to_string());
+        if let Some(s) = item.as_str() {
+            let s = s.trim();
+            if s.is_empty() {
+                continue;
+            }
+            let proper = looks_proper(s);
+            out.push(Mention { text: s.to_string(), proper });
+            continue;
+        }
+        let obj = item.as_object()?;
+        let text = obj.get("text").and_then(|t| t.as_str()).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        let flagged = obj.get("proper").and_then(|p| p.as_bool()).unwrap_or(false);
+        out.push(Mention {
+            text: text.to_string(),
+            proper: flagged || looks_proper(text),
+        });
     }
     Some(out)
 }
@@ -776,11 +905,116 @@ pub fn push_agg(state: &str, value: &str, extra: &str, clauses: &str) -> String 
 }
 
 pub fn summarize_state(state: &str) -> PgResult<Option<String>> {
+    if let Some(hit) = cached_summary(state) {
+        return Ok(Some(hit));
+    }
     let (clauses, _extra, parts) = read_agg(state);
     if parts.is_empty() {
         return Ok(None);
     }
     Ok(Some(summarize_text(&parts.join("\n\n"), &clauses)?))
+}
+
+/// Hash aggregation calls this once per filled batch, before any final
+/// function runs. Groups with no clause tail share one extract body, and
+/// hutch runs those chat calls under its concurrency cap. The finals then
+/// read the cache instead of posting one group at a time.
+pub fn prefetch_summaries(states: &[String]) {
+    let _ = prefetch_summaries_inner(states);
+}
+
+fn prefetch_summaries_inner(states: &[String]) -> Result<(), String> {
+    let mut simple_state = Vec::new();
+    let mut simple_input = Vec::new();
+    let mut complex: Vec<(String, String, String)> = Vec::new();
+    for state in states {
+        let (clauses, _extra, parts) = read_agg(state);
+        if parts.is_empty() {
+            continue;
+        }
+        let input = parts.join("\n\n");
+        if clauses.trim().is_empty() {
+            simple_state.push(state.to_string());
+            simple_input.push(input);
+        } else {
+            complex.push((state.to_string(), input, clauses));
+        }
+    }
+    if !simple_input.is_empty() {
+        let reply = summarize_many(&simple_input).map_err(|e| e.to_string())?;
+        if reply.values.len() == simple_state.len() {
+            let mut cache = summary_cache();
+            for (state, value) in simple_state.into_iter().zip(reply.values) {
+                if let Ok(text) = value {
+                    cache.insert(state, text);
+                }
+            }
+        }
+    }
+    for (state, input, clauses) in complex {
+        if let Ok(text) = summarize_text(&input, &clauses) {
+            summary_cache().insert(state, text);
+        }
+    }
+    Ok(())
+}
+
+fn summarize_many(inputs: &[String]) -> PgResult<ManyReply> {
+    if inputs.is_empty() {
+        return Ok(ManyReply { values: Vec::new(), http_calls: 0 });
+    }
+    let ep = summary_endpoint();
+    let width = rvbbit_resolve::batch_rows().max(1);
+    let mut tickets = Vec::new();
+    for chunk in inputs.chunks(width) {
+        let payload: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|input| serde_json::json!({ "input": input }))
+            .collect();
+        let body = encode_items(&ep, Operation::Extract, &payload).map_err(pg)?;
+        tickets.push(post_ticket(&ep, "extract", body)?);
+    }
+    let mut values = Vec::with_capacity(inputs.len());
+    let mut http_calls = 0u32;
+    for ticket in tickets {
+        let raw = wait_raw(ticket)?;
+        http_calls = http_calls.saturating_add(raw.http_calls);
+        values.extend(decode_text_items(&raw.body).map_err(pg)?);
+    }
+    if values.len() != inputs.len() {
+        return Err(pg(format!(
+            "hutch summarize returned {} items for {} groups",
+            values.len(),
+            inputs.len()
+        )));
+    }
+    Ok(ManyReply { values, http_calls })
+}
+
+fn post_ticket(ep: &Endpoint, op: &str, body: String) -> PgResult<Ticket> {
+    let auth = bearer(ep).map_err(pg)?;
+    send(
+        format!("{}/v1/{op}", ep.base_url.trim_end_matches('/')),
+        auth,
+        ep,
+        body,
+        cache_header(cache_mode_of(ep), None, None),
+    )
+}
+
+static SUMMARY_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn summary_cache() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+    SUMMARY_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cached_summary(state: &str) -> Option<String> {
+    summary_cache().get(state).cloned()
+}
+
+fn clear_summary_cache() {
+    summary_cache().clear();
 }
 
 pub fn summarize_text(input: &str, clauses: &str) -> PgResult<String> {
@@ -2083,21 +2317,27 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["mentions"]["type"], "array");
-        assert_eq!(schema["properties"]["mentions"]["items"]["type"], "string");
+        assert_eq!(schema["properties"]["mentions"]["items"]["type"], "object");
+        assert_eq!(schema["properties"]["mentions"]["items"]["properties"]["proper"]["type"], "boolean");
         assert!(schema["properties"]["mentions"]["description"]
             .as_str()
             .unwrap()
             .contains("creature"));
+        assert!(ep.system_prompt.contains("proper is true"));
+        assert!(ep.user_prompt.contains("Set proper true"));
         let color = super::many_endpoint("color");
         assert!(color.system_prompt.contains("Large gray triangular aircraft"));
         assert!(color.system_prompt.contains("not a color"));
-        let mentions = super::parse_mention_list("[\"gray\",\"night\",\"bright\"]").unwrap();
+        let mentions = super::parse_mentions("[\"gray\",\"night\",\"bright\"]").unwrap();
         assert_eq!(
             super::retain_mentions(&mentions, &[false, true, true]),
             "[\"gray\"]"
         );
-        assert_eq!(format!("is {} a color?", mentions[1].trim()), "is night a color?");
-        assert!(super::parse_mention_list("not json").is_none());
+        let question = super::specific_question("color", "night", "Large gray triangular aircraft");
+        assert!(question.contains("Large gray triangular aircraft"), "{question}");
+        assert!(question.contains("does \"night\" name a specific color"), "{question}");
+        assert!(question.contains("generic word"), "{question}");
+        assert!(super::parse_mentions("not json").is_none());
         assert!(!color.system_prompt.contains("or adjectives"));
         let body = encode_items(
             &ep,
@@ -2115,7 +2355,7 @@ mod tests {
         assert_eq!(parsed["items"][0]["response_schema"]["type"], "object");
         assert_eq!(
             parsed["items"][0]["response_schema"]["properties"]["mentions"]["items"]["type"],
-            "string"
+            "object"
         );
         let system = parsed["items"][0]["system"].as_str().unwrap();
         assert!(system.contains("Bigfoot"));
@@ -2143,6 +2383,54 @@ mod tests {
         assert!(body.contains("\"extract_mode\":\"scalar\""));
         assert!(body.contains("What creature does this text name?"));
         assert!(!body.contains("large, black-brown"));
+    }
+
+    #[test]
+    fn extract_many_keeps_proper_nouns_drops_generics_and_dedupes() {
+        let bare = super::parse_mentions("[\"Bigfoot\",\"black dog\"]").unwrap();
+        assert!(bare[0].proper, "a capital letter is a proper noun");
+        assert!(!bare[1].proper);
+        assert_eq!(
+            super::mention_fate("creature", &bare[0].text, bare[0].proper),
+            super::MentionFate::Keep
+        );
+        assert_eq!(super::mention_fate("creature", "bigfoot", true), super::MentionFate::Keep);
+        assert_eq!(super::mention_fate("creature", "animal", false), super::MentionFate::Drop);
+        assert_eq!(super::mention_fate("creature", "man", false), super::MentionFate::Drop);
+        assert_eq!(super::mention_fate("creature", "shellfish", false), super::MentionFate::Drop);
+        assert_eq!(super::mention_fate("creature", "sea life", false), super::MentionFate::Drop);
+        assert_eq!(
+            super::mention_fate("creature", "human like figure", false),
+            super::MentionFate::Drop
+        );
+        assert_eq!(super::mention_fate("creature", "black dog", false), super::MentionFate::Ask);
+        assert_eq!(super::mention_fate("creature", "sasquatch", false), super::MentionFate::Ask);
+        assert_eq!(super::mention_fate("creature", "deer", false), super::MentionFate::Ask);
+        assert_eq!(super::mention_fate("color", "gray", false), super::MentionFate::Ask);
+        let marked = super::parse_mentions(
+            r#"[{"text":"Bigfoot","proper":true},{"text":"animal","proper":false},{"text":"Deer","proper":false},{"text":"deer","proper":false}]"#,
+        )
+        .unwrap();
+        assert!(marked[0].proper);
+        assert!(!marked[1].proper);
+        assert_eq!(
+            super::retain_mentions(&marked, &[false, true, false, false]),
+            "[\"Bigfoot\",\"Deer\"]"
+        );
+        let body = encode_items(
+            &super::summary_endpoint(),
+            Operation::Extract,
+            &[
+                serde_json::json!({ "input": "one" }),
+                serde_json::json!({ "input": "two" }),
+                serde_json::json!({ "input": "three" }),
+            ],
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["items"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["items"][0]["extract_mode"], "summary");
+        assert_eq!(parsed["items"][2]["inputs"]["input"], "three");
     }
 }
 
