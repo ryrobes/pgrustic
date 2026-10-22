@@ -214,6 +214,10 @@ pub fn define_gucs() {
             "semantic.capture_actual",
             "When on, the executor snapshots provider calls and USD for rvbbit.last_actual(). The inbound audit sets this for the user statement only.",
         ),
+        (
+            "semantic.mcp_require_price",
+            "When on, an MCP tool with no tool or server cost_usd errors before the call. Empty or off leaves unpriced tools at 0 USD.",
+        ),
         ("semantic.retry", "Default RETRY count."),
         ("semantic.threshold", "Default noul cutoff."),
         (

@@ -705,6 +705,15 @@ mod tests {
         assert_eq!(read_only_sql("EXPLAIN DROP TABLE notes").unwrap_err(), READ_ONLY_SQL);
         assert_eq!(read_only_sql("EXPLAIN ANALYZE DELETE FROM notes").unwrap_err(), READ_ONLY_SQL);
     }
+
+    #[test]
+    fn total_usd_includes_an_mcp_only_plan() {
+        let plan = "Aggregate\n  MCP USD: 0.00800000\nMCP Total USD: 0.00800000\n";
+        assert!((total_usd(plan) - 0.008).abs() < 1e-9, "{}", total_usd(plan));
+        let mixed = "Semantic Total USD: 0.00001260\nMCP Total USD: 0.00800000\n";
+        assert!((total_usd(mixed) - 0.008).abs() < 1e-9);
+        assert!((total_usd("Seq Scan") - 0.0).abs() < 1e-12);
+    }
 }
 
 // ServerHandler is emitted by tool_router. This keeps the trait in scope for readers.

@@ -44,6 +44,8 @@ struct Site<'mcx> {
     arg_types: Vec<String>,
     arg_keys: Vec<String>,
     args: Vec<PgBox<'mcx, ExprState<'mcx>>>,
+    price: Option<f64>,
+    model: String,
 }
 
 struct Pending {
@@ -167,6 +169,7 @@ fn sites_from<'mcx>(
             tool.max_cost.unwrap_or(-1.0),
             tool.retries
         );
+        let model = format!("mcp:{}/{}", tool.server, tool.tool);
         sites.push(Site {
             nsp: tool.nsp,
             name: tool.name,
@@ -175,12 +178,32 @@ fn sites_from<'mcx>(
             arg_types: tool.arg_types,
             arg_keys: tool.arg_keys,
             args,
+            price: tool.cost_usd,
+            model,
         });
     }
     if sites.is_empty() {
         return Ok(None);
     }
     Ok(Some(sites))
+}
+
+fn priced_calls(
+    sites: &[Site<'_>],
+    server_key: &str,
+    calls: &[(String, serde_json::Value)],
+) -> PgResult<Vec<(String, serde_json::Value, f64)>> {
+    let mut out = Vec::with_capacity(calls.len());
+    for (tool, args) in calls {
+        let site = sites.iter().find(|site| site.server_key == server_key && site.tool == *tool);
+        if let Some(site) = site {
+            rvbbit_cost::reject_unpriced_mcp(&site.model, site.price.is_some()).map_err(err)?;
+            out.push((tool.clone(), args.clone(), site.price.unwrap_or(0.0)));
+        } else {
+            out.push((tool.clone(), args.clone(), 0.0));
+        }
+    }
+    Ok(out)
 }
 
 fn bare_named<'mcx>(node: Node<'mcx>) -> Node<'mcx> {
@@ -342,8 +365,10 @@ impl<'mcx> McpState<'mcx> {
                 read_only: spec_tool.read_only,
                 max_cost: spec_tool.max_cost,
                 concurrency: fanout(),
+                cost_usd: spec_tool.cost_usd.unwrap_or(0.0),
             };
-            let reply = rvbbit_dispatch::mcp_batch_for_tool(&spec_tool, calls.clone(), &opts).map_err(err)?;
+            let priced = priced_calls(&self.sites, server_key, calls)?;
+            let reply = rvbbit_dispatch::mcp_batch_for_tool(&spec_tool, priced, &opts).map_err(err)?;
             let mut cursor = 0usize;
             for (key_server, key, input) in &index {
                 if key_server != server_key {
@@ -768,8 +793,10 @@ fn launch_calls<'mcx>(
             read_only: spec_tool.read_only,
             max_cost: spec_tool.max_cost,
             concurrency: fanout(),
+            cost_usd: spec_tool.cost_usd.unwrap_or(0.0),
         };
-        let reply = rvbbit_dispatch::mcp_batch_for_tool(&spec_tool, calls.clone(), &opts).map_err(err)?;
+        let priced = priced_calls(sites, server_key, calls)?;
+        let reply = rvbbit_dispatch::mcp_batch_for_tool(&spec_tool, priced, &opts).map_err(err)?;
         let mut cursor = 0usize;
         for (key_server, key, input) in &index {
             if key_server != server_key {

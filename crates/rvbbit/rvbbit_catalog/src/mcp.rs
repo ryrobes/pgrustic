@@ -22,7 +22,8 @@ const SERVER_DDL: &str = "CREATE TABLE IF NOT EXISTS mcp.server (
     headers text,
     env text,
     timeout_ms int,
-    retries int)";
+    retries int,
+    cost_usd float8)";
 
 const TOOL_DDL: &str = "CREATE TABLE IF NOT EXISTS mcp.tool (
     nsp text NOT NULL,
@@ -40,6 +41,7 @@ const TOOL_DDL: &str = "CREATE TABLE IF NOT EXISTS mcp.tool (
     cache_ttl_ms int,
     max_cost float8,
     read_only boolean NOT NULL DEFAULT false,
+    cost_usd float8,
     procoid oid,
     import_error text,
     PRIMARY KEY (nsp, name))";
@@ -56,6 +58,12 @@ pub fn ensure() -> PgResult<()> {
         exec(TOOL_DDL)?;
     } else if !column_exists("mcp", "tool", "import_error")? {
         exec("ALTER TABLE mcp.tool ADD COLUMN import_error text")?;
+    }
+    if relation_exists("mcp", "server")? && !column_exists("mcp", "server", "cost_usd")? {
+        exec("ALTER TABLE mcp.server ADD COLUMN cost_usd float8")?;
+    }
+    if relation_exists("mcp", "tool")? && !column_exists("mcp", "tool", "cost_usd")? {
+        exec("ALTER TABLE mcp.tool ADD COLUMN cost_usd float8")?;
     }
     if super::scalar(
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
@@ -115,7 +123,8 @@ fn load_rows() -> PgResult<()> {
                 t.max_cost::text, \
                 s.transport, s.url, s.command, COALESCE(s.args, '[]'), \
                 COALESCE(s.headers, '{}'), COALESCE(s.env, '{}'), \
-                COALESCE(s.retries, 2)::text, COALESCE(s.timeout_ms, 30000)::text \
+                COALESCE(s.retries, 2)::text, COALESCE(s.timeout_ms, 30000)::text, \
+                t.cost_usd::text, s.cost_usd::text \
          FROM mcp.tool t JOIN mcp.server s ON s.name = t.server",
     )?;
     let mut tools = Vec::with_capacity(rows.len());
@@ -140,6 +149,9 @@ fn load_rows() -> PgResult<()> {
             timeout_ms,
             cache_ttl_ms: cell(&row, 10).parse().unwrap_or(0),
             max_cost: cell_opt(&row, 11).and_then(|s| s.parse().ok()),
+            cost_usd: cell_opt(&row, 20)
+                .and_then(|s| s.parse().ok())
+                .or_else(|| cell_opt(&row, 21).and_then(|s| s.parse().ok())),
             transport: cell(&row, 12),
             url: cell_opt(&row, 13),
             command: cell_opt(&row, 14),
@@ -169,6 +181,11 @@ pub fn apply(cmd: Command) -> PgResult<()> {
 
 fn create_server(or_replace: bool, if_not_exists: bool, name: &str, options: &BTreeMap<String, String>) -> PgResult<()> {
     let spec = server_from_options(name, options).map_err(pg)?;
+    let cost_usd = match options.get("cost_usd") {
+        Some(raw) => parse_cost_usd(raw)?,
+        None => None,
+    };
+    let cost_sql = sql_f64(cost_usd);
     let exists = scalar(&format!("SELECT 1 FROM mcp.server WHERE name = {}", qlit(name)))?.is_some();
     if exists && if_not_exists {
         return Ok(());
@@ -181,7 +198,7 @@ fn create_server(or_replace: bool, if_not_exists: bool, name: &str, options: &BT
     let env = serde_json::to_string(&spec.env).unwrap_or_else(|_| "{}".into());
     if exists {
         exec(&format!(
-            "UPDATE mcp.server SET transport = {}, url = {}, command = {}, args = {}, headers = {}, env = {}, timeout_ms = {}, retries = {} WHERE name = {}",
+            "UPDATE mcp.server SET transport = {}, url = {}, command = {}, args = {}, headers = {}, env = {}, timeout_ms = {}, retries = {}, cost_usd = {cost_sql} WHERE name = {}",
             qlit(&spec.transport),
             opt_lit(spec.url.as_deref()),
             opt_lit(spec.command.as_deref()),
@@ -194,7 +211,7 @@ fn create_server(or_replace: bool, if_not_exists: bool, name: &str, options: &BT
         ))?;
     } else {
         exec(&format!(
-            "INSERT INTO mcp.server (name, transport, url, command, args, headers, env, timeout_ms, retries) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO mcp.server (name, transport, url, command, args, headers, env, timeout_ms, retries, cost_usd) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {cost_sql})",
             qlit(name),
             qlit(&spec.transport),
             opt_lit(spec.url.as_deref()),
@@ -309,7 +326,7 @@ fn refresh(server: &str) -> PgResult<()> {
 
 fn alter(schema: &str, name: &str, options: &BTreeMap<String, String>) -> PgResult<()> {
     let (schema, name) = resolve_qual(schema, name)?;
-    let known = ["timeout", "cache_ttl", "max_cost", "read_only", "side_effects"];
+    let known = ["timeout", "cache_ttl", "max_cost", "read_only", "side_effects", "cost_usd"];
     for key in options.keys() {
         if !known.contains(&key.as_str()) {
             return Err(pg(format!("unknown MCP tool option {key}")));
@@ -320,7 +337,7 @@ fn alter(schema: &str, name: &str, options: &BTreeMap<String, String>) -> PgResu
     }
     let rows = query(&format!(
         "SELECT COALESCE(timeout_ms::text, ''), COALESCE(cache_ttl_ms::text, '0'), max_cost::text, \
-                read_only::text, COALESCE(argtypes, '[]') \
+                read_only::text, COALESCE(argtypes, '[]'), cost_usd::text \
          FROM mcp.tool WHERE nsp = {} AND name = {}",
         qlit(&schema),
         qlit(&name),
@@ -333,6 +350,7 @@ fn alter(schema: &str, name: &str, options: &BTreeMap<String, String>) -> PgResu
     let mut max_cost: Option<f64> = cell_opt(&row, 2).and_then(|s| s.parse().ok());
     let mut read_only = is_true(&cell(&row, 3));
     let argtypes = json_strings(&cell(&row, 4));
+    let mut cost_usd: Option<f64> = cell_opt(&row, 5).and_then(|s| s.parse().ok());
     if let Some(raw) = options.get("timeout") {
         timeout = Some(mcp_core::parse_timeout_ms(raw).map_err(pg)? as i64);
     }
@@ -348,6 +366,9 @@ fn alter(schema: &str, name: &str, options: &BTreeMap<String, String>) -> PgResu
     if let Some(raw) = options.get("side_effects") {
         read_only = !parse_bool(raw)?;
     }
+    if let Some(raw) = options.get("cost_usd") {
+        cost_usd = parse_cost_usd(raw)?;
+    }
     let vol = if read_only { "STABLE" } else { "VOLATILE" };
     exec(&format!(
         "ALTER FUNCTION {}.{}({}) {vol}",
@@ -356,7 +377,7 @@ fn alter(schema: &str, name: &str, options: &BTreeMap<String, String>) -> PgResu
         argtypes.join(", "),
     ))?;
     exec(&format!(
-        "UPDATE mcp.tool SET timeout_ms = {}, cache_ttl_ms = {}, max_cost = {}, read_only = {} WHERE nsp = {} AND name = {}",
+        "UPDATE mcp.tool SET timeout_ms = {}, cache_ttl_ms = {}, max_cost = {}, read_only = {}, cost_usd = {} WHERE nsp = {} AND name = {}",
         match timeout {
             Some(v) => v.to_string(),
             None => "NULL".into(),
@@ -367,6 +388,7 @@ fn alter(schema: &str, name: &str, options: &BTreeMap<String, String>) -> PgResu
             None => "NULL".into(),
         },
         if read_only { "true" } else { "false" },
+        sql_f64(cost_usd),
         qlit(&schema),
         qlit(&name),
     ))?;
@@ -492,10 +514,17 @@ fn create_fn(schema: &str, sql_name: &str, server: &str, tool: &ListedTool, spec
     let argtypes = serde_json::to_string(&shape.args.iter().map(|a| a.sql_type.clone()).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
     let argkeys = serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into());
     let cols = serde_json::to_string(&shape.columns.iter().map(|c| format!("{} {}", c.name, c.sql_type)).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
+    let kept_cost = scalar(&format!(
+        "SELECT cost_usd::text FROM mcp.tool WHERE nsp = {} AND name = {}",
+        qlit(schema),
+        qlit(sql_name),
+    ))?
+    .and_then(|s| s.parse().ok());
     exec(&format!("DELETE FROM mcp.tool WHERE nsp = {} AND name = {}", qlit(schema), qlit(sql_name)))?;
+    let kept_cost_sql = sql_f64(kept_cost);
     exec(&format!(
-        "INSERT INTO mcp.tool (nsp, name, server, tool, schema_hash, input_schema, output_schema, argkeys, argtypes, returns_table, return_cols, timeout_ms, cache_ttl_ms, max_cost, read_only, procoid, import_error) \
-         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, NULL, {}, {}, {})",
+        "INSERT INTO mcp.tool (nsp, name, server, tool, schema_hash, input_schema, output_schema, argkeys, argtypes, returns_table, return_cols, timeout_ms, cache_ttl_ms, max_cost, read_only, cost_usd, procoid, import_error) \
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, NULL, {}, {kept_cost_sql}, {}, {})",
         qlit(schema),
         qlit(sql_name),
         qlit(server),
@@ -668,6 +697,27 @@ fn json_strings(raw: &str) -> Vec<String> {
 
 fn is_true(raw: &str) -> bool {
     matches!(raw.trim().to_ascii_lowercase().as_str(), "t" | "true" | "1" | "on")
+}
+
+fn parse_cost_usd(raw: &str) -> PgResult<Option<f64>> {
+    let text = raw.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("default") || text.eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
+    let n: f64 = text
+        .parse()
+        .map_err(|_| pg(format!("cost_usd {raw} is not a number")))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err(pg(format!("cost_usd {raw} must be a finite number >= 0")));
+    }
+    Ok(Some(n))
+}
+
+fn sql_f64(value: Option<f64>) -> String {
+    match value {
+        Some(n) => format!("{n:.10}"),
+        None => "NULL".into(),
+    }
 }
 
 fn parse_bool(raw: &str) -> PgResult<bool> {
