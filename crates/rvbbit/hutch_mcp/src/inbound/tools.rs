@@ -178,7 +178,7 @@ impl Warehouse {
         self.explain_tool(&ctx, "explain", &args.sql, false).await
     }
 
-    #[tool(description = "Run one read-only statement. Row cap, timeout, and semantic.max_cost come from the token")]
+    #[tool(description = "Run one statement. Read-only sessions allow SELECT/WITH/VALUES/EXPLAIN. A write session may run other statements except SET ROLE. Row cap, timeout, and semantic.max_cost come from the token")]
     async fn run_sql(
         &self,
         ctx: rmcp::service::RequestContext<RoleServer>,
@@ -191,7 +191,11 @@ impl Warehouse {
                 return Err("semantic estimate exceeds budget 0".into());
             }
             one_statement(&sql)?;
-            read_only_sql(&sql)?;
+            if id.read_only {
+                read_only_sql(&sql)?;
+            } else {
+                reject_session_auth(&sql)?;
+            }
             if is_explain(&sql) {
                 let _ = conn.exec("SET LOCAL semantic.capture_actual = 'on'");
                 let rows = conn.query(sql.trim().trim_end_matches(';').trim())?;
@@ -200,19 +204,23 @@ impl Warehouse {
                 let (calls, usd) = executed_actuals(conn, &plan);
                 return Ok((plan, rows.rows.len() as i64, usd, calls));
             }
-            let statement = capped(&sql, limit);
-            let plan = explain_text(conn, &statement)?;
-            let estimate = total_usd(&plan);
-            if let Some(cap) = id.max_cost {
-                if estimate > cap + 1e-12 {
-                    return Err(format!("semantic estimate {estimate:.8} USD exceeds budget {cap:.8}"));
+            if read_only_sql(&sql).is_ok() {
+                let statement = capped(&sql, limit);
+                let plan = explain_text(conn, &statement)?;
+                let estimate = total_usd(&plan);
+                if let Some(cap) = id.max_cost {
+                    if estimate > cap + 1e-12 {
+                        return Err(format!("semantic estimate {estimate:.8} USD exceeds budget {cap:.8}"));
+                    }
                 }
+                let _ = conn.exec("SET LOCAL semantic.capture_actual = 'on'");
+                let rows = conn.query(&statement)?;
+                let _ = conn.exec("SET LOCAL semantic.capture_actual = 'off'");
+                let (calls, usd) = executed_actuals(conn, "");
+                return Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, usd, calls));
             }
-            let _ = conn.exec("SET LOCAL semantic.capture_actual = 'on'");
-            let rows = conn.query(&statement)?;
-            let _ = conn.exec("SET LOCAL semantic.capture_actual = 'off'");
-            let (calls, usd) = executed_actuals(conn, "");
-            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, usd, calls))
+            let rows = conn.query(sql.trim().trim_end_matches(';').trim())?;
+            Ok((json_rows(&rows).to_string(), rows.rows.len() as i64, 0.0, 0.0))
         })
         .await
     }
@@ -301,7 +309,14 @@ impl Warehouse {
     ) -> ToolOut {
         let sql = sql.to_string();
         self.finish(ctx, tool, Some(sql.clone()), move |id, conn| {
-            match one_statement(&sql).and_then(|_| read_only_sql(&sql)).and_then(|_| explain_text(conn, &sql)) {
+            let allowed = one_statement(&sql).and_then(|_| {
+                if id.read_only {
+                    read_only_sql(&sql)
+                } else {
+                    reject_session_auth(&sql)
+                }
+            });
+            match allowed.and_then(|_| explain_text(conn, &sql)) {
                 Ok(plan) => {
                     let usd = total_usd(&plan);
                     let over_budget = id.max_cost.is_some_and(|cap| usd > cap + 1e-12);
@@ -379,7 +394,7 @@ fn in_role<T>(
 ) -> Result<T, String> {
     let role = PgRole {
         role: id.role.clone(),
-        read_only: true,
+        read_only: id.read_only,
         max_cost: id.max_cost.filter(|n| *n > 0.0),
         statement_timeout_ms: id.statement_timeout_ms,
     };
@@ -584,6 +599,25 @@ fn command_after_explain(rest: &str) -> String {
     }
 }
 
+fn reject_session_auth(sql: &str) -> Result<(), String> {
+    let (head, rest) = statement_head(sql);
+    if head == "reset" && rest.trim_start().to_ascii_lowercase().starts_with("role") {
+        return Err("SET ROLE is not allowed".into());
+    }
+    if head == "set" {
+        let next = rest
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || c == '=')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if next == "role" || next == "session" {
+            return Err("SET ROLE is not allowed".into());
+        }
+    }
+    Ok(())
+}
+
 fn read_only_sql(sql: &str) -> Result<(), String> {
     let (head, rest) = statement_head(sql);
     let command = if head == "explain" { command_after_explain(&rest) } else { head };
@@ -704,6 +738,18 @@ mod tests {
         assert_eq!(read_only_sql("/* hide */ INSERT INTO notes VALUES (1)").unwrap_err(), READ_ONLY_SQL);
         assert_eq!(read_only_sql("EXPLAIN DROP TABLE notes").unwrap_err(), READ_ONLY_SQL);
         assert_eq!(read_only_sql("EXPLAIN ANALYZE DELETE FROM notes").unwrap_err(), READ_ONLY_SQL);
+    }
+
+    #[test]
+    fn write_session_blocks_set_role_and_allows_insert() {
+        assert!(reject_session_auth("INSERT INTO notes (owner, body) VALUES ('w', 'x')").is_ok());
+        assert!(reject_session_auth("SET statement_timeout = '1s'").is_ok());
+        assert_eq!(reject_session_auth("SET ROLE postgres").unwrap_err(), "SET ROLE is not allowed");
+        assert_eq!(
+            reject_session_auth("SET SESSION AUTHORIZATION postgres").unwrap_err(),
+            "SET ROLE is not allowed"
+        );
+        assert_eq!(reject_session_auth("RESET ROLE").unwrap_err(), "SET ROLE is not allowed");
     }
 
     #[test]

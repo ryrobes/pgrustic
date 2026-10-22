@@ -1,8 +1,8 @@
 //! Streamable HTTP at `/mcp`, plus the OAuth 2.1 endpoints.
 //!
 //! Login is a Postgres password check for a role listed in `rvbbit.users`.
-//! The browser form is only that check. OIDC can replace it later without
-//! moving the token tables.
+//! When OIDC is configured, the same page also starts that provider.
+//! The password form stays.
 
 use std::sync::Arc;
 
@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::oauth::{Oauth, PasswordTarget};
+use super::oidc;
 use super::pg::Pool;
 use super::tools::Warehouse;
 
@@ -67,11 +68,12 @@ impl InboundConfig {
 }
 
 pub fn app_from(cfg: &InboundConfig) -> App {
-    let oauth = Arc::new(Oauth {
-        pool: Pool::new(cfg.conninfo.clone(), 4),
-        jwt_secret: cfg.jwt_secret.as_bytes().to_vec(),
-        password: cfg.password.clone(),
-    });
+    let oauth = Arc::new(Oauth::new(
+        Pool::new(cfg.conninfo.clone(), 4),
+        cfg.jwt_secret.as_bytes().to_vec(),
+        cfg.password.clone(),
+        oidc::config_from_env(),
+    ));
     App {
         oauth,
         public_url: cfg.public_url.clone(),
@@ -128,6 +130,8 @@ fn router(app: App, stdio_bearer: Option<String>) -> Router {
         .route("/register", post(register))
         .route("/authorize", get(authorize))
         .route("/login", post(login))
+        .route("/oidc/start", get(oidc_start))
+        .route("/oidc/callback", get(oidc_callback))
         .route("/token", post(token))
         .nest_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(app.clone(), gate))
@@ -215,13 +219,25 @@ async fn authorize(State(app): State<App>, Query(q): Query<AuthorizeQuery>) -> R
         Ok(false) => return (StatusCode::BAD_REQUEST, "client or redirect_uri is not registered").into_response(),
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     }
-    Html(login_page(&q)).into_response()
+    Html(login_page(&q, app.oauth.oidc.as_ref().map(|cfg| cfg.label.as_str()))).into_response()
 }
 
-fn login_page(q: &AuthorizeQuery) -> String {
+fn login_page(q: &AuthorizeQuery, oidc_label: Option<&str>) -> String {
+    let oidc = match oidc_label {
+        Some(label) => format!(
+            "<p><a href=\"/oidc/start?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method={}&state={}\">Sign in with {}</a></p>",
+            urlencoding_escape(&q.client_id),
+            urlencoding_escape(&q.redirect_uri),
+            urlencoding_escape(&q.code_challenge),
+            urlencoding_escape(&q.code_challenge_method),
+            urlencoding_escape(&q.state),
+            html_escape(label),
+        ),
+        None => String::new(),
+    };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>rvbbit</title></head>\
-<body><h1>rvbbit</h1><p>Postgres role in rvbbit.users.</p>\
+<body><h1>rvbbit</h1>{oidc}<p>Postgres role in rvbbit.users.</p>\
 <form method=\"post\" action=\"/login\">\
 <input type=\"hidden\" name=\"client_id\" value=\"{}\">\
 <input type=\"hidden\" name=\"redirect_uri\" value=\"{}\">\
@@ -237,6 +253,54 @@ fn login_page(q: &AuthorizeQuery) -> String {
         html_escape(&q.code_challenge_method),
         html_escape(&q.state),
     )
+}
+
+async fn oidc_start(State(app): State<App>, Query(q): Query<AuthorizeQuery>) -> Response {
+    if q.response_type != "code" {
+        return (StatusCode::BAD_REQUEST, "response_type=code is required").into_response();
+    }
+    let callback = format!("{}/oidc/callback", app.public_url);
+    match app.oauth.begin_oidc(
+        &q.client_id,
+        &q.redirect_uri,
+        &q.code_challenge,
+        &q.code_challenge_method,
+        &q.state,
+        &callback,
+    ) {
+        Ok(url) => redirect_to(&url),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
+async fn oidc_callback(State(app): State<App>, Query(q): Query<OidcCallback>) -> Response {
+    match app.oauth.finish_oidc(&q.code, &q.state) {
+        Ok(done) => {
+            let mut url = format!("{}?code={}", done.redirect_uri, urlencoding_escape(&done.code));
+            if !done.client_state.is_empty() {
+                url.push_str("&state=");
+                url.push_str(&urlencoding_escape(&done.client_state));
+            }
+            redirect_to(&url)
+        }
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcCallback {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    state: String,
+}
+
+fn redirect_to(url: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, url)
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "redirect").into_response())
 }
 
 #[derive(Debug, Deserialize)]
