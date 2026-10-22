@@ -1489,6 +1489,34 @@ fn inherited_custom_definitions_survive_child_registry_rebuild() {
     .unwrap();
 }
 
+// seams_init defines custom variables before InitializeGUCOptions builds the
+// store. The definition still has to be captured, and the same thread's
+// later initialize_guc_options has to create the real variable.
+#[test]
+fn custom_definition_recorded_before_the_store_exists() {
+    setup();
+    std::thread::spawn(|| {
+        let err = DefineCustomStringVariable(
+            "semearly.max_cost",
+            Some("cap"),
+            None,
+            Some(""),
+            PGC_USERSET,
+            0,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("GUC store is not initialized"));
+        assert!(custom_string_definitions().iter().any(|d| d.name == "semearly.max_cost"));
+        MarkGUCPrefixReserved("semearly");
+        initialize_guc_options().unwrap();
+        assert_eq!(show("semearly.max_cost"), Some(String::new()));
+        assert_eq!(set_session("semearly.max_cost", Some("0.01")).unwrap(), 1);
+        assert_eq!(show("semearly.max_cost"), Some("0.01".to_string()));
+    })
+    .join()
+    .unwrap();
+}
+
 // guc.c: GUC_PENDING_RESTART set in the postmaster is inherited by every
 // later fork, so a fresh session reports pg_settings.pending_restart = true
 // for a PGC_POSTMASTER variable ALTER SYSTEM changed since boot.

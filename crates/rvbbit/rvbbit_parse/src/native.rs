@@ -260,8 +260,44 @@ fn rewrite_means(sql: &str, means_end: usize, out: &mut String) -> Option<usize>
     let left = pop_simple_expr(out)?;
     let right = sql[right_at..right_end].trim();
     let call = typed_clause("means", &format!("({left})"), &format!("({right})"), &tail);
-    out.push_str(&alias_op(sql, tail_end, &call, "means"));
+    // A SELECT-list tail is a column and needs an alias. A WHERE / HAVING
+    // / ON predicate cannot take one.
+    let rendered = if predicate_context(sql, means_end) {
+        call
+    } else {
+        alias_op(sql, tail_end, &call, "means")
+    };
+    out.push_str(&rendered);
     Some(tail_end)
+}
+
+fn last_kw_pos(sql: &str, at: usize, word: &str) -> Option<usize> {
+    let head = sql[..at].to_ascii_lowercase();
+    let b = head.as_bytes();
+    let w = word.as_bytes();
+    let mut from = 0usize;
+    let mut found = None;
+    while let Some(pos) = head[from..].find(word) {
+        let i = from + pos;
+        let before_ok = i == 0 || !is_ident_cont(b[i - 1]);
+        let after = i + w.len();
+        let after_ok = after >= b.len() || !is_ident_cont(b[after]);
+        if before_ok && after_ok {
+            found = Some(i);
+        }
+        from = i + word.len();
+    }
+    found
+}
+
+fn predicate_context(sql: &str, at: usize) -> bool {
+    let pred = ["where", "having", "on"]
+        .into_iter()
+        .filter_map(|word| last_kw_pos(sql, at, word))
+        .max()
+        .unwrap_or(0);
+    let select_at = last_kw_pos(sql, at, "select").unwrap_or(0);
+    pred > select_at
 }
 
 fn rewrite_named_call(kind: &str, body: &str, clauses: &str) -> Option<String> {
@@ -541,6 +577,7 @@ fn clause_tail(sql: &str, at: usize) -> Option<(usize, String)> {
     let starts = [
         "using model",
         "with takes",
+        "with budget",
         "with temperature",
         "with phrasings",
         "with max",
@@ -1666,6 +1703,20 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn means_budget_in_where_has_no_alias() {
+        let sql = "SELECT count(*) FROM notes WHERE body MEANS 'alpha' WITH BUDGET 0.0000001";
+        let out = rewrite_native_semantic(sql).unwrap();
+        assert!(
+            out.contains(
+                "rvbbit.clause_bool('means', (body), ('alpha'), 'WITH BUDGET 0.0000001')"
+            ),
+            "{out}"
+        );
+        assert!(!out.to_ascii_lowercase().contains("as means"), "{out}");
+        assert!(out.contains("WHERE"), "{out}");
     }
 
     #[test]

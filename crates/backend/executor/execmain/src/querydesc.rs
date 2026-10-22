@@ -318,6 +318,10 @@ pub(crate) fn create_query_desc_seam(
 // C frees an aborted QueryDesc with the portal context, ExecutorEnd never
 // runs, and snapshot registrations are released by the resource owner.
 pub(crate) fn release_query_desc_seam(h: QueryDescHandle) {
+    // Abort frees the QueryDesc without ExecutorEnd. Drop the execution
+    // depth here so the next statement on this backend still sees a fresh
+    // pre-flight arm and fresh EXPLAIN ANALYZE actuals.
+    rvbbit_cost::end_query();
     drop(remove(h));
 }
 

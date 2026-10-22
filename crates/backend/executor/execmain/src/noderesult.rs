@@ -147,30 +147,85 @@ pub fn exec_result<'mcx>(
         return Ok(None);
     }
 
-    estate.reset_expr_context(ecxt);
+    // Ordinary Result nodes have no filter. Keep that body straight so the
+    // childless hot path stays the same shape as lane_result_childless_next.
+    if node.ps.qual.is_none() {
+        estate.reset_expr_context(ecxt);
 
-    if node.rs_done {
-        return Ok(None);
-    }
-
-    if let Some(outer) = node.outer.as_deref_mut() {
-        if !node.outer_chg.is_empty() {
-            let chg = core::mem::replace(
-                &mut node.outer_chg,
-                ::types_nodes::bitmapset::Bitmapset::empty(),
-            );
-            let outer_plan = node.ps.plan.lefttree.expect("Result outer plan");
-            crate::execami::exec_re_scan_with_chg(outer, outer_plan, estate, &chg)?;
-        }
-        let Some(outer_slot) = exec_proc_node(outer, estate)? else {
+        if node.rs_done {
             return Ok(None);
-        };
-        estate.ecxt_mut(ecxt).ecxt_outertuple = Some(outer_slot);
-    } else {
-        node.rs_done = true;
+        }
+
+        if let Some(outer) = node.outer.as_deref_mut() {
+            if !node.outer_chg.is_empty() {
+                let chg = core::mem::replace(
+                    &mut node.outer_chg,
+                    ::types_nodes::bitmapset::Bitmapset::empty(),
+                );
+                let outer_plan = node.ps.plan.lefttree.expect("Result outer plan");
+                crate::execami::exec_re_scan_with_chg(outer, outer_plan, estate, &chg)?;
+            }
+            let Some(outer_slot) = exec_proc_node(outer, estate)? else {
+                return Ok(None);
+            };
+            estate.ecxt_mut(ecxt).ecxt_outertuple = Some(outer_slot);
+        } else {
+            node.rs_done = true;
+        }
+
+        return Ok(Some(lane_result_project(&mut node.ps, estate)?));
     }
 
-    Ok(Some(lane_result_project(&mut node.ps, estate)?))
+    // A lifted semantic qual the batcher does not own (a clause tail such
+    // as BUDGET) still has to run, or every child row would pass.
+    loop {
+        estate.reset_expr_context(ecxt);
+
+        if node.rs_done {
+            return Ok(None);
+        }
+
+        if let Some(outer) = node.outer.as_deref_mut() {
+            if !node.outer_chg.is_empty() {
+                let chg = core::mem::replace(
+                    &mut node.outer_chg,
+                    ::types_nodes::bitmapset::Bitmapset::empty(),
+                );
+                let outer_plan = node.ps.plan.lefttree.expect("Result outer plan");
+                crate::execami::exec_re_scan_with_chg(outer, outer_plan, estate, &chg)?;
+            }
+            let Some(outer_slot) = exec_proc_node(outer, estate)? else {
+                return Ok(None);
+            };
+            estate.ecxt_mut(ecxt).ecxt_outertuple = Some(outer_slot);
+        } else {
+            node.rs_done = true;
+        }
+
+        if !result_qual_passes(node, estate, ecxt)? {
+            if node.rs_done {
+                return Ok(None);
+            }
+            continue;
+        }
+
+        return Ok(Some(lane_result_project(&mut node.ps, estate)?));
+    }
+}
+
+fn result_qual_passes<'mcx>(
+    node: &mut ResultState<'mcx>,
+    estate: &mut EStateData<'mcx>,
+    ecxt: executils::EcxtId,
+) -> PgResult<bool> {
+    let Some(qual) = node.ps.qual.as_deref_mut() else {
+        return Ok(true);
+    };
+    if qual.has_subplan() || !qual.param_exec_deps().is_empty() {
+        ::executils::exec_qual_with_subplans(Some(qual), estate, ecxt)
+    } else {
+        with_eval_slots(estate, ecxt, None, |slots, _, _| exec_qual(Some(qual), slots))
+    }
 }
 
 // ===========================================================================

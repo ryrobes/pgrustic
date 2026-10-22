@@ -99,6 +99,30 @@ order, and fall back to the builtin.
 `Semantic Project`, and prints `Batch Size`. Under `ANALYZE` it prints
 batches, HTTP calls, memo hits, and rows in/out.
 
+Each semantic node also carries a provider estimate. The seed is jev at
+$0.042 per million input tokens and about 300 billed tokens a call,
+gpt-4o-mini at its list rates, and voyage rerank at $0.05 per million
+tokens. A response `calls` array, `rvbbit.calls`, or hutch `/stats`
+replaces that seed for the same operation and model. `TAKES`,
+`PHRASINGS`, `ACROSS`, and `FALLBACK` multiply the items. A cache hit
+rate, including `CACHE off`, reduces the charged items, and batching
+turns them into `ceil(items / batch)` calls. A filter's selectivity is
+0.5, or `1 - THRESHOLD` clamped to 0.05..0.95.
+
+`EXPLAIN` prints `Semantic Calls`, `Semantic USD`, `Semantic Latency`,
+and `Semantic Model` on the node and `Semantic Total` for the statement.
+`EXPLAIN (COSTS OFF)` leaves those lines out. `EXPLAIN ANALYZE` adds
+`Actual Semantic Calls`, `Actual Cache Hits`, `Actual Semantic USD`,
+`Actual Semantic Latency`, and `Actual Semantic Model`, plus the same
+totals. Cheap predicates stay on the scan. A semantic filter moves
+above an inner join when the join emits fewer rows than its input, and
+a project or decision tree moves above `LIMIT` so the limit runs first.
+
+`BUDGET` on the clause, `semantic.max_cost`, and `semantic.budget` are
+pre-flight caps. If the estimate is above the tightest one, the
+statement errors before any provider call. `SET semantic.cost_check =
+off` skips that check.
+
 The row-at-a-time builtin runs when:
 
 - a MEANS qual or a top-level `rvbbit.decide` already owns the Result, so a

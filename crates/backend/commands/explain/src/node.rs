@@ -87,6 +87,7 @@ pub fn ExplainPrintPlan<'mcx>(
         }
     }
     ExplainNode(root, None, None, None, es)?;
+    show_semantic_totals(root, es);
     ExplainPrintSettings(es)?;
     if es.verbose
         && unsafe { pstmt.queryId.get() } != 0
@@ -95,6 +96,58 @@ pub fn ExplainPrintPlan<'mcx>(
         ExplainPropertyInteger("Query Identifier", None, unsafe { pstmt.queryId.get() }, es);
     }
     Ok(())
+}
+
+fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
+    if es.costs {
+        if let Some(est) = rvbbit_plan::node_estimate(node) {
+            ExplainPropertyFloat("Semantic Calls", None, est.calls, 2, es);
+            ExplainPropertyFloat("Semantic USD", None, est.usd, 8, es);
+            ExplainPropertyFloat("Semantic Latency", Some("ms"), est.latency_ms, 1, es);
+            if !est.model.is_empty() {
+                ExplainPropertyText("Semantic Model", &est.model, es);
+            }
+            if est.filters {
+                ExplainPropertyFloat("Semantic Selectivity", None, est.selectivity, 2, es);
+            }
+        }
+    }
+    if es.analyze {
+        let id = node.as_plan().map(|p| p.plan_node_id).unwrap_or(-1);
+        if let Some(act) = rvbbit_plan::node_actual(id) {
+            if act.calls > 0 {
+                ExplainPropertyInteger("Actual Semantic Calls", None, act.calls as i64, es);
+                ExplainPropertyInteger("Actual Cache Hits", None, act.cache_hits as i64, es);
+                ExplainPropertyFloat("Actual Semantic USD", None, act.usd, 8, es);
+                ExplainPropertyFloat("Actual Semantic Latency", Some("ms"), act.latency_ms, 1, es);
+                if !act.model.is_empty() {
+                    ExplainPropertyText("Actual Semantic Model", &act.model, es);
+                }
+            }
+        }
+    }
+}
+
+fn show_semantic_totals(root: Node<'_>, es: &mut ExplainState<'_>) {
+    if es.costs {
+        if let Some(total) = rvbbit_plan::tree_estimate(root) {
+            ExplainPropertyFloat("Semantic Total Calls", None, total.calls, 2, es);
+            ExplainPropertyFloat("Semantic Total USD", None, total.usd, 8, es);
+            ExplainPropertyFloat("Semantic Total Latency", Some("ms"), total.latency_ms, 1, es);
+        }
+    }
+    if es.analyze {
+        let act = rvbbit_plan::query_actual();
+        if act.calls > 0 {
+            ExplainPropertyInteger("Actual Total Calls", None, act.calls as i64, es);
+            ExplainPropertyInteger("Actual Total Cache Hits", None, act.cache_hits as i64, es);
+            ExplainPropertyFloat("Actual Total USD", None, act.usd, 8, es);
+            ExplainPropertyFloat("Actual Total Latency", Some("ms"), act.latency_ms, 1, es);
+            if !act.model.is_empty() {
+                ExplainPropertyText("Actual Total Model", &act.model, es);
+            }
+        }
+    }
 }
 
 // explain.c ExplainPrintSettings.
@@ -1413,6 +1466,7 @@ pub fn ExplainNode<'mcx>(
             } else if project.present {
                 ExplainPropertyText("Project", "per-row", es);
             }
+            show_semantic_cost(node, es);
         }
         NodeTag::T_Sort => {
             show_sort_keys(node, ancestors, es)?;
@@ -1442,6 +1496,7 @@ pub fn ExplainNode<'mcx>(
             if !plan.qual.is_nil() {
                 show_instrumentation_count("Rows Removed by Filter", 1, &instrument, es);
             }
+            show_semantic_cost(node, es);
         }
         NodeTag::T_Group => {
             show_group_keys(node, ancestors, es)?;

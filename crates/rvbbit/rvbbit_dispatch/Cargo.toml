@@ -13,6 +13,7 @@ init_small = { path = "../../backend/utils/init/init_small" }
 types_guc = { path = "../../_support/types/types_guc" }
 postgres_seams = { path = "../../backend/tcop/postgres_seams" }
 rvbbit_contract = { path = "../rvbbit_contract" }
+rvbbit_cost = { path = "../rvbbit_cost" }
 rvbbit_oids = { path = "../rvbbit_oids" }
 rvbbit_resolve = { path = "../rvbbit_resolve" }
 rvbbit_tree = { path = "../rvbbit_tree" }

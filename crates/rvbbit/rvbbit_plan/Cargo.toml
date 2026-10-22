@@ -9,7 +9,10 @@ path = "src/lib.rs"
 
 [dependencies]
 mcx = { path = "../../_support/mcx" }
+rvbbit_cost = { path = "../rvbbit_cost" }
+rvbbit_oids = { path = "../rvbbit_oids" }
 rvbbit_resolve = { path = "../rvbbit_resolve" }
+types_tuple = { path = "../../_support/types/types_tuple" }
 syscache_seams = { path = "../../backend/utils/cache/syscache_seams" }
 types_core = { path = "../../_support/types/types_core" }
 types_error = { path = "../../_support/types/types_error" }

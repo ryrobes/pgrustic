@@ -20,8 +20,8 @@ use std::thread;
 use std::time::Duration;
 
 use rvbbit_contract::{
-    BatchRequest, BatchResponse, CacheLookupRequest, CacheLookupResponse, ItemError, ItemResponse,
-    Operation, CONTRACT_VERSION,
+    BatchRequest, BatchResponse, CacheLookupRequest, CacheLookupResponse, CallMeter, ItemError,
+    ItemResponse, Operation, CONTRACT_VERSION,
 };
 
 #[derive(Clone, Debug)]
@@ -270,7 +270,7 @@ fn route(
                     value: Some(value),
                     score,
                     scores: None,
-                    calls: None,
+                    calls: Some(vec![mock_meter(op)]),
                     error: None,
                     identical_takes: None,
                 }
@@ -287,6 +287,38 @@ fn route(
         );
     }
     (404, String::new(), "{\"error\":\"not found\"}".to_string())
+}
+
+/// One miss at the jev seed price so EXPLAIN ANALYZE can show USD.
+/// 300 billed tokens at $0.042 per million.
+fn mock_meter(op: Operation) -> CallMeter {
+    let name = match op {
+        Operation::Predict => "predict",
+        Operation::Classify => "classify",
+        Operation::Extract => "extract",
+        Operation::Embed => "embed",
+        Operation::Rerank => "rerank",
+        Operation::Decide => "decide",
+    };
+    CallMeter {
+        op: name.into(),
+        model: "jev".into(),
+        tokens_in: Some(300),
+        tokens_out: None,
+        cost_usd: Some(300.0 * 0.042 / 1_000_000.0),
+        cost_saved_usd: None,
+        provider_latency_ms: Some(1),
+        latency_ms: 1,
+        cache: "miss".into(),
+        items: 1,
+        tenant: "mock".into(),
+        timestamp: "1970-01-01T00:00:00.000Z".into(),
+        generation_id: None,
+        identical: None,
+        node: None,
+        score: None,
+        payload: None,
+    }
 }
 
 fn operation_of(path: &str) -> Option<Operation> {

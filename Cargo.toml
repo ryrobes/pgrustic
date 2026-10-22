@@ -893,6 +893,7 @@ members = [
     "crates/bin/fuzzgen",
     "crates/rvbbit/rvbbit_oids",
     "crates/rvbbit/rvbbit_plan",
+    "crates/rvbbit/rvbbit_cost",
     "crates/rvbbit/rvbbit_dispatch",
     "crates/rvbbit/rvbbit_builtins",
     "crates/rvbbit/rvbbit_contract",

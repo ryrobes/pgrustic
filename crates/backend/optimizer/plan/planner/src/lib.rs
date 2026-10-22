@@ -440,8 +440,21 @@ pub fn standard_planner<'mcx>(
 
     debug_assert!(run.glob.finalrtable.is_nil());
     // Lift MEANS quals onto a batch Result before setrefs retargets Vars.
+    // Cost is accumulated across the main plan and the subplans, then armed
+    // once so a pre-flight budget check sees the whole statement.
+    rvbbit_plan::begin_statement_cost();
+    struct ArmSemanticCost;
+    impl Drop for ArmSemanticCost {
+        fn drop(&mut self) {
+            rvbbit_plan::commit_statement_cost();
+        }
+    }
+    let _arm_semantic_cost = ArmSemanticCost;
     let top_plan = rvbbit_plan::lift_semantic_filters(mcx, top_plan)?;
     let top_plan = set_plan_references(&mut run, top_plan)?;
+    // Cost after setrefs. Clause tails are Const text only once the
+    // plan is in final form, and the pre-flight arm reads that text.
+    rvbbit_plan::apply_costs(top_plan);
     // ... and the subplans, each under its own root (C's forboth over
     // glob->subplans/glob->subroots, planner.c:561-567). A cell NULLed by an
     // earlier level's set_plan_references (an unchosen AlternativeSubPlan
@@ -460,7 +473,11 @@ pub fn standard_planner<'mcx>(
             let fixed = crate::setrefs::set_plan_references_opt(&mut run, subplan);
             core::mem::swap(&mut run.subroots[i].root, &mut run.root);
             run.processed_tlist = top_tlist;
-            run.glob.subplans.as_mut_slice()[i] = fixed?;
+            let fixed = fixed?;
+            if let Some(plan) = fixed {
+                rvbbit_plan::apply_costs(plan);
+            }
+            run.glob.subplans.as_mut_slice()[i] = fixed;
         }
     }
 

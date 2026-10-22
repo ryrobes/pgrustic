@@ -2078,6 +2078,7 @@ pub(crate) fn fused_arm_set_for_tests(env_suffix: &str, on: bool) {
 
 #[inline(never)]
 fn result_arm<'mcx>(rs: &mut ResultState<'mcx>, estate: &mut EStateData<'mcx>) -> ProcResult {
+    let _charge = rvbbit_cost::charge_scope(rs.ps.plan.plan_node_id);
     exec_result(rs, estate)
 }
 
@@ -2183,6 +2184,7 @@ fn agg_arm<'mcx>(
     aps: &mut PgBox<'mcx, AggPlanState<'mcx>>,
     estate: &mut EStateData<'mcx>,
 ) -> ProcResult {
+    let _charge = rvbbit_cost::charge_scope(aps.agg.plan.plan.plan_node_id);
     let aps = &mut **aps;
     let AggPlanState { agg, outer, .. } = aps;
     match outer {

@@ -9,6 +9,9 @@
 //! scan output. Nested calls and a mix with MEANS or a decision tree stay
 //! on the row-at-a-time builtin.
 
+mod estimate;
+mod place;
+
 use mcx::Mcx;
 use types_error::PgResult;
 use types_nodes::list::NodeList;
@@ -24,7 +27,9 @@ pub fn expr_contains_means(node: Node<'_>) -> bool {
     match node.node_tag() {
         NodeTag::T_FuncExpr => {
             let f = node.as_func_expr().expect("FuncExpr");
-            rvbbit_resolve::is_semantic_func(f.funcid) || f.args.iter().any(expr_contains_means)
+            rvbbit_resolve::is_semantic_func(f.funcid)
+                || func_is_clause_bool(f.funcid)
+                || f.args.iter().any(expr_contains_means)
         }
         NodeTag::T_BoolExpr => node
             .as_bool_expr()
@@ -46,16 +51,26 @@ pub fn expr_contains_means(node: Node<'_>) -> bool {
 
 /// Walk `plan` and wrap any base scan whose qual contains MEANS.
 pub fn lift_semantic_filters<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Node<'mcx>> {
+    let plan = lift_tree(mcx, plan)?;
+    place::place(mcx, plan)
+}
+
+pub use estimate::{
+    apply_costs, begin_statement_cost, commit_statement_cost, node_estimate, tree_estimate, Shown,
+};
+pub use rvbbit_cost::{node_actual, query_actual};
+
+fn lift_tree<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<Node<'mcx>> {
     if plan.as_plan().is_none() {
         return Ok(plan);
     }
     if let Some(left) = plan.as_plan().and_then(|p| p.lefttree) {
-        let new_left = lift_semantic_filters(mcx, left)?;
+        let new_left = lift_tree(mcx, left)?;
         // SAFETY: the plan tree was just built and is exclusively owned.
         unsafe { plan.with_plan_mut(|p| p.lefttree = Some(new_left)) }.expect("plan node");
     }
     if let Some(right) = plan.as_plan().and_then(|p| p.righttree) {
-        let new_right = lift_semantic_filters(mcx, right)?;
+        let new_right = lift_tree(mcx, right)?;
         unsafe { plan.with_plan_mut(|p| p.righttree = Some(new_right)) }.expect("plan node");
     }
     lift_list_field(mcx, plan)?;
@@ -94,13 +109,46 @@ fn is_base_scan(plan: Node<'_>) -> bool {
     )
 }
 
+pub(crate) fn lift_list_children<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<()> {
+    // Placement runs after the lift, so list children are already lifted.
+    // Re-walk them so a project under a Limit inside an Append still moves.
+    match plan.node_tag() {
+        NodeTag::T_Append => {
+            let children: Vec<Node<'mcx>> = plan.as_append().expect("Append").appendplans.iter().collect();
+            let mut placed = NodeList::nil();
+            for child in children {
+                placed.lappend(mcx, place::place(mcx, child)?)?;
+            }
+            unsafe { plan.with_mut::<Append, _>(|a| a.appendplans = placed) }.expect("Append");
+        }
+        NodeTag::T_MergeAppend => {
+            let children: Vec<Node<'mcx>> =
+                plan.as_merge_append().expect("MergeAppend").mergeplans.iter().collect();
+            let mut placed = NodeList::nil();
+            for child in children {
+                placed.lappend(mcx, place::place(mcx, child)?)?;
+            }
+            unsafe { plan.with_mut::<MergeAppend, _>(|a| a.mergeplans = placed) }.expect("MergeAppend");
+        }
+        NodeTag::T_SubqueryScan => {
+            if let Some(sub) = plan.as_subquery_scan().expect("SubqueryScan").subplan {
+                let new_sub = place::place(mcx, sub)?;
+                unsafe { plan.with_mut::<SubqueryScan, _>(|s| s.subplan = Some(new_sub)) }
+                    .expect("SubqueryScan");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn lift_list_field<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<()> {
     match plan.node_tag() {
         NodeTag::T_Append => {
             let children: Vec<Node<'mcx>> = plan.as_append().expect("Append").appendplans.iter().collect();
             let mut lifted = NodeList::nil();
             for child in children {
-                lifted.lappend(mcx, lift_semantic_filters(mcx, child)?)?;
+                lifted.lappend(mcx, lift_tree(mcx, child)?)?;
             }
             unsafe { plan.with_mut::<Append, _>(|a| a.appendplans = lifted) }.expect("Append");
         }
@@ -109,13 +157,13 @@ fn lift_list_field<'mcx>(mcx: Mcx<'mcx>, plan: Node<'mcx>) -> PgResult<()> {
                 plan.as_merge_append().expect("MergeAppend").mergeplans.iter().collect();
             let mut lifted = NodeList::nil();
             for child in children {
-                lifted.lappend(mcx, lift_semantic_filters(mcx, child)?)?;
+                lifted.lappend(mcx, lift_tree(mcx, child)?)?;
             }
             unsafe { plan.with_mut::<MergeAppend, _>(|a| a.mergeplans = lifted) }.expect("MergeAppend");
         }
         NodeTag::T_SubqueryScan => {
             if let Some(sub) = plan.as_subquery_scan().expect("SubqueryScan").subplan {
-                let new_sub = lift_semantic_filters(mcx, sub)?;
+                let new_sub = lift_tree(mcx, sub)?;
                 unsafe { plan.with_mut::<SubqueryScan, _>(|s| s.subplan = Some(new_sub)) }
                     .expect("SubqueryScan");
             }
@@ -175,7 +223,7 @@ fn wrap_scan<'mcx>(mcx: Mcx<'mcx>, scan: Node<'mcx>) -> PgResult<Node<'mcx>> {
     Ok(result.seal())
 }
 
-fn add_junk_inputs<'mcx>(
+pub(crate) fn add_junk_inputs<'mcx>(
     mcx: Mcx<'mcx>,
     semantic: &NodeList<'mcx>,
     tlist: &mut NodeList<'mcx>,
@@ -233,6 +281,33 @@ fn add_junk_inputs<'mcx>(
 /// `pg_proc` name lookup. The decide oid is not a fixed builtin number, and
 /// a fresh backend has not loaded the rvbbit cache yet. Missing seams (planner
 /// unit tests) count as "not decide" so ordinary plans are unchanged.
+/// `rvbbit.clause_bool` is the WHERE form of `MEANS ... WITH BUDGET`.
+/// It is not a catalog MEANS operator, so the oid cache does not know it.
+fn func_is_clause_bool(funcid: types_core::Oid) -> bool {
+    if funcid == rvbbit_oids::CLAUSE_BOOL_OID {
+        return true;
+    }
+    if !syscache_seams::pg_proc_proname::is_installed()
+        || !syscache_seams::lookup_pg_proc_shape::is_installed()
+        || !syscache_seams::pg_namespace_nspname::is_installed()
+    {
+        return false;
+    }
+    let Ok(Some(name)) = syscache_seams::pg_proc_proname::call(funcid) else {
+        return false;
+    };
+    if name.name_str() != b"clause_bool" {
+        return false;
+    }
+    let Ok(Some(shape)) = syscache_seams::lookup_pg_proc_shape::call(funcid) else {
+        return false;
+    };
+    let Ok(Some(ns)) = syscache_seams::pg_namespace_nspname::call(shape.pronamespace) else {
+        return false;
+    };
+    ns.name_str() == b"rvbbit"
+}
+
 fn func_is_decide(funcid: types_core::Oid) -> bool {
     if rvbbit_resolve::is_decide_func(funcid) {
         return true;
@@ -283,7 +358,7 @@ fn expr_contains_decide(node: Node<'_>) -> bool {
     }
 }
 
-fn tlist_contains_decide(tlist: &NodeList<'_>) -> bool {
+pub(crate) fn tlist_contains_decide(tlist: &NodeList<'_>) -> bool {
     tlist.iter().any(|tle| {
         tle.as_target_entry()
             .is_some_and(|te| expr_contains_decide(te.expr))
@@ -401,7 +476,7 @@ fn expr_contains_project(node: Node<'_>) -> bool {
     }
 }
 
-fn tlist_contains_project(tlist: &NodeList<'_>) -> bool {
+pub(crate) fn tlist_contains_project(tlist: &NodeList<'_>) -> bool {
     tlist.iter().any(|tle| {
         tle.as_target_entry()
             .is_some_and(|te| expr_contains_project(te.expr))

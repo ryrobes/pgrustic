@@ -339,6 +339,7 @@ pub(crate) fn executor_rearm_seam(
     // tap_executor_start would silently undercount reused executions of a
     // parked prepared statement unless the tap fires here too.
     if reused {
+        rvbbit_cost::begin_query();
         tap_executor_start::call_if(|f| f(h));
     }
     Ok(reused)
@@ -369,6 +370,7 @@ pub(crate) fn executor_finish_and_park_seam(h: QueryDescHandle) -> PgResult<bool
             standard_executor_end(qd)?;
             return Ok(false);
         }
+        rvbbit_cost::end_query();
         // CreateQueryDesc registered this snapshot; the parked QueryDesc
         // skips FreeQueryDesc, so release it here (rearm re-registers).
         snapmgr::UnregisterSnapshot(qd.snapshot.take().as_ref());
@@ -1754,6 +1756,7 @@ fn exec_postprocess_plan(estate: &mut EStateData<'_>) -> PgResult<()> {
 // cost the per-query seam its base inlining (select1 attribution, +42/q).
 #[inline]
 pub fn standard_executor_end(qd: &mut QueryDescData) -> PgResult<()> {
+    rvbbit_cost::end_query();
     // execMain.c:487-489.
     if let Some(exec) = qd.exec.as_mut() {
         exec.with_mut(|data| {

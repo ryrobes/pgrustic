@@ -15,6 +15,7 @@
 //! In-flight HTTP is not aborted; the wait returns at the next 20ms poll.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -183,6 +184,10 @@ pub fn define_gucs() {
         ("semantic.pick", "Default reducer: vote, mean score, consensus, judge, or first valid."),
         ("semantic.timeout", "Default clause timeout, in seconds."),
         ("semantic.budget", "Session USD cap. A wave that would pass it aborts."),
+        (
+            "semantic.max_cost",
+            "Pre-flight USD cap. An estimate above this errors before any provider call. Empty disables the cap.",
+        ),
         ("semantic.retry", "Default RETRY count."),
         ("semantic.threshold", "Default noul cutoff."),
         (
@@ -192,15 +197,57 @@ pub fn define_gucs() {
     ] {
         let _ = guc::DefineCustomStringVariable(name, Some(desc), None, Some(""), PGC_USERSET, 0);
     }
+    let _ = guc::DefineCustomStringVariable(
+        "semantic.cost_check",
+        Some("When off, skip the pre-flight semantic budget check."),
+        None,
+        Some("on"),
+        PGC_USERSET,
+        0,
+    );
     guc::MarkGUCPrefixReserved("semantic");
     let read = |name: &str| guc::GetConfigOption(name, true, false).ok().flatten();
     memo::set_guc_reader(read);
     clauses::set_guc_reader(read);
+    rvbbit_cost::set_guc_reader(read);
+    rvbbit_cost::set_history_refresher(pull_remote_history);
+}
+
+/// One short read of hutch `/stats` and `/v1/calls` so the next plan can
+/// price from observed latency and USD. Later calls update the same table
+/// as their responses arrive. Missing hutch is ignored.
+fn pull_remote_history() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(url) = std::env::var("RVBBIT_HUTCH_URL") else {
+        return;
+    };
+    let base = url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return;
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(250))
+        .build();
+    let calls = match agent.get(&format!("{base}/v1/calls?limit=256")).call() {
+        Ok(resp) => resp.into_string().map(|text| rvbbit_cost::ingest_calls_json(&text)).unwrap_or(0),
+        Err(_) => 0,
+    };
+    if calls == 0 {
+        if let Ok(resp) = agent.get(&format!("{base}/stats")).call() {
+            if let Ok(text) = resp.into_string() {
+                rvbbit_cost::ingest_stats_json(&text);
+            }
+        }
+    }
 }
 
 /// Clear the per-query memo. Executor start calls this.
 pub fn begin_query() {
     memo::begin_query();
+    rvbbit_cost::begin_query();
 }
 
 pub struct Ticket {
@@ -830,6 +877,9 @@ fn send(
     body: String,
     cache_header: String,
 ) -> PgResult<Ticket> {
+    if let Err(message) = rvbbit_cost::preflight() {
+        return Err(pg(message));
+    }
     let prepared = prepare_batch(ep, &url, &body, &cache_header)?;
     match prepared {
         Prepared::Local(body) => {
@@ -977,6 +1027,7 @@ fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
         }
     };
     if order.is_empty() {
+        rvbbit_cost::observe_response(&raw.body);
         return Ok(raw);
     }
     let mut parsed: BatchResponse = serde_json::from_str(&raw.body).map_err(|e| pg(e.to_string()))?;
@@ -997,6 +1048,7 @@ fn wait_raw(ticket: Ticket) -> PgResult<RawReply> {
     }
     parsed.outputs = merged;
     let body = serde_json::to_string(&parsed).map_err(|e| pg(e.to_string()))?;
+    rvbbit_cost::observe_response(&body);
     Ok(RawReply {
         body,
         http_calls: raw.http_calls,

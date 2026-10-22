@@ -458,18 +458,24 @@ pub fn DefineCustomStringVariable(
     context: GucContext,
     flags: i32,
 ) -> PgResult<()> {
-    define_custom_string_variable(name, short_desc, long_desc, boot_val, context, flags)?;
+    // Record before the store write. seams_init defines these while the
+    // store is still down; the postmaster captures this list and every
+    // child replays it once its own store exists. A later successful
+    // define of the same name must not push a second copy.
     RESERVED_CLASS_PREFIX.with(|s| {
-        s.borrow_mut().definitions.push(CustomStringDefinition {
-            name,
-            short_desc,
-            long_desc,
-            boot_val: boot_val.map(str::to_owned),
-            context,
-            flags,
-        })
+        let defs = &mut s.borrow_mut().definitions;
+        if !defs.iter().any(|d| d.name == name) {
+            defs.push(CustomStringDefinition {
+                name,
+                short_desc,
+                long_desc,
+                boot_val: boot_val.map(str::to_owned),
+                context,
+                flags,
+            });
+        }
     });
-    Ok(())
+    define_custom_string_variable(name, short_desc, long_desc, boot_val, context, flags)
 }
 
 fn define_custom_string_variable(

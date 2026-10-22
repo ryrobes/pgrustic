@@ -165,7 +165,11 @@ pub(crate) fn build_variable(setting: GucSetting) -> Option<GucVariable> {
 
 // InitializeGUCOptions (guc.c:1530).
 pub fn initialize_guc_options() -> PgResult<()> {
-    initialize_guc_options_impl(|_| true)
+    initialize_guc_options_impl(|_| true)?;
+    // Same-thread startup (postmaster, --single): replay definitions that
+    // were recorded before this store existed. Child threads replay from
+    // initialize_guc_options_for_child instead.
+    crate::redefine_inherited_custom_variables()
 }
 
 // Child-thread bring-up (SubPostmasterMain shape). C's re-init writes only the
