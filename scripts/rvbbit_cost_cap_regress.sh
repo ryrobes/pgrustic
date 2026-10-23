@@ -139,7 +139,7 @@ expect_capped() {
   local before after out status
   before=$(calls)
   set +e
-  out=$("${PSQL[@]}" -d rvbbit_regress <<SQL
+  out=$("${PSQL[@]}" -d rvbbit_regress <<SQL 2>&1
 SET semantic.max_cost = '0';
 $sql
 SQL
@@ -179,7 +179,7 @@ expect_planned() {
 
 echo "=== SELECT, WHERE, and nested IS NOT NULL under max_cost=0 ==="
 # label, plan needle, select, where, nested
-while IFS='|' read -r label needle select_sql where_sql nested_sql; do
+while IFS='~' read -r label needle select_sql where_sql nested_sql; do
   [[ -z "${label:-}" ]] && continue
   expect_planned "$label select" "$needle" "$select_sql"
   expect_planned "$label where" "$needle" "$where_sql"
@@ -188,15 +188,15 @@ while IFS='|' read -r label needle select_sql where_sql nested_sql; do
   expect_capped "$label where" "$where_sql"
   expect_capped "$label nested" "$nested_sql"
 done <<'OPS'
-means|Semantic|SELECT body MEANS 'road' FROM docs|SELECT id FROM docs WHERE body MEANS 'road'|SELECT (body MEANS 'road') IS NOT NULL FROM docs
-about|Semantic|SELECT body ABOUT 'road' FROM docs|SELECT id FROM docs WHERE body ABOUT 'road'|SELECT (body ABOUT 'road') IS NOT NULL FROM docs
-classify|Semantic|SELECT CLASSIFY(body INTO 'road', 'lake') FROM docs|SELECT id FROM docs WHERE CLASSIFY(body INTO 'road', 'lake') = 'road'|SELECT CLASSIFY(body INTO 'road', 'lake') IS NOT NULL FROM docs
-extract|Semantic|SELECT EXTRACT(text FROM body ON ERROR '') FROM docs|SELECT id FROM docs WHERE EXTRACT(text FROM body ON ERROR '') = 'road'|SELECT EXTRACT(text FROM body ON ERROR '') IS NOT NULL FROM docs
-rerank|Semantic|SELECT body |> RERANK 'road' FROM docs|SELECT id FROM docs WHERE (body |> RERANK 'road') > 0|SELECT (body |> RERANK 'road') IS NOT NULL FROM docs
-similarity|Semantic|SELECT rvbbit.semantic_similarity(body, 'road') FROM docs|SELECT id FROM docs WHERE rvbbit.semantic_similarity(body, 'road') > 0|SELECT rvbbit.semantic_similarity(body, 'road') IS NOT NULL FROM docs
-user_fn|Semantic|SELECT is_road(body) FROM docs|SELECT id FROM docs WHERE is_road(body)|SELECT is_road(body) IS NOT NULL FROM docs
-decide|Semantic|SELECT sighting_of(body) FROM docs|SELECT id FROM docs WHERE sighting_of(body) = 'road'|SELECT sighting_of(body) IS NOT NULL FROM docs
-summarize|Semantic|SELECT SUMMARIZE(body) FROM docs|SELECT id FROM docs WHERE (SELECT SUMMARIZE(body) FROM docs d2) IS NOT NULL|SELECT SUMMARIZE(body) IS NOT NULL FROM docs
+means~Semantic~SELECT body MEANS 'road' FROM docs~SELECT id FROM docs WHERE body MEANS 'road'~SELECT (body MEANS 'road') IS NOT NULL FROM docs
+about~Semantic~SELECT body ABOUT 'road' FROM docs~SELECT id FROM docs WHERE body ABOUT 'road'~SELECT (body ABOUT 'road') IS NOT NULL FROM docs
+classify~Semantic~SELECT CLASSIFY(body INTO 'road', 'lake') FROM docs~SELECT id FROM docs WHERE CLASSIFY(body INTO 'road', 'lake') = 'road'~SELECT CLASSIFY(body INTO 'road', 'lake') IS NOT NULL FROM docs
+extract~Semantic~SELECT EXTRACT(text FROM body) FROM docs~SELECT id FROM docs WHERE EXTRACT(text FROM body) = 'road'~SELECT EXTRACT(text FROM body) IS NOT NULL FROM docs
+rerank~Semantic~SELECT body |> RERANK 'road' FROM docs~SELECT id FROM docs WHERE (body |> RERANK 'road') > 0~SELECT (body |> RERANK 'road') IS NOT NULL FROM docs
+similarity~Semantic~SELECT rvbbit.semantic_similarity(body, 'road') FROM docs~SELECT id FROM docs WHERE rvbbit.semantic_similarity(body, 'road') > 0~SELECT rvbbit.semantic_similarity(body, 'road') IS NOT NULL FROM docs
+user_fn~Semantic~SELECT rvbbit.is_road(body) FROM docs~SELECT id FROM docs WHERE rvbbit.is_road(body)~SELECT rvbbit.is_road(body) IS NOT NULL FROM docs
+decide~Semantic~SELECT rvbbit.sighting_of(body) FROM docs~SELECT id FROM docs WHERE rvbbit.sighting_of(body) = 'road'~SELECT rvbbit.sighting_of(body) IS NOT NULL FROM docs
+summarize~Semantic~SELECT SUMMARIZE(body) FROM docs~SELECT id FROM docs WHERE (SELECT SUMMARIZE(body) FROM docs d2) IS NOT NULL~SELECT SUMMARIZE(body) IS NOT NULL FROM docs
 OPS
 
 echo "=== MEANS worst case is above the discounted estimate ==="
@@ -252,7 +252,7 @@ BETWEEN=$(cat "$RUNDIR/between.txt")
 echo "cap between expected and worst: $BETWEEN"
 before=$(calls)
 set +e
-out=$("${PSQL[@]}" -d rvbbit_regress <<SQL
+out=$("${PSQL[@]}" -d rvbbit_regress <<SQL 2>&1
 SET semantic.max_cost = '${BETWEEN}';
 SELECT body MEANS 'road' FROM docs;
 SQL
