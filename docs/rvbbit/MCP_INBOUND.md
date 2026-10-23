@@ -109,7 +109,9 @@ An explicit issuer is used as written (one trailing slash is stripped).
 The link says Google when the provider is `google` or the issuer is
 Google's. Any other issuer says "Sign in with OIDC".
 `RVBBIT_OIDC_DOMAINS` is an optional comma or whitespace list. An empty
-list does not check the domain.
+list does not check the domain. A non-empty list trusts the email's
+domain or the `hd` claim. `RVBBIT_OIDC_REQUIRE_EMAIL_DOMAIN=on` requires
+the email's own domain and does not let `hd` pass the gate.
 
 Discovery is `GET {issuer}/.well-known/openid-configuration`. The
 document's `issuer` must match. `authorization_endpoint`,
@@ -145,9 +147,17 @@ code, or the secret.
 | `read_only` | Default true. `false` is the only way to open a write session. |
 
 An exact email row wins over an `hd` row. No row is `no role mapping`.
-When `RVBBIT_OIDC_DOMAINS` is set, the email's domain or `hd` must be
-in the list before the mapping is considered. The access token's `sub`
-is the email. A password login's `sub` stays the role name.
+When `RVBBIT_OIDC_DOMAINS` is set, the email's own domain **or** the
+`hd` claim satisfies the allowlist. `hd` is trusted by itself: an
+address at `foreign@other.test` with `hd=example.com` passes a list that
+contains only `example.com`, and can then match an `hd` role row.
+
+`RVBBIT_OIDC_REQUIRE_EMAIL_DOMAIN=on` (also `true`, `1`, or `yes`)
+changes that gate. The email's own domain must be in the list. `hd` no
+longer satisfies it. Role mapping can still use an `hd` row after the
+address has passed. The default is off, which keeps the `hd`-or-email
+behavior. An empty allowlist is still no domain gate. The access
+token's `sub` is the email. A password login's `sub` stays the role name.
 
 ```sql
 INSERT INTO rvbbit.oidc_role (claim, value, role, read_only) VALUES

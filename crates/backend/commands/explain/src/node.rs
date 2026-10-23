@@ -110,6 +110,7 @@ fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
                 ExplainPropertyFloat("MCP Provider Calls", None, est.provider_calls, 2, es);
                 ExplainPropertyFloat("MCP Latency", Some("ms"), est.latency_ms, 1, es);
                 ExplainPropertyFloat("MCP USD", None, est.usd, 8, es);
+                ExplainPropertyFloat("MCP Worst USD", None, est.usd_worst, 8, es);
                 if let Some((server, tool)) = mcp_target(&est.model) {
                     ExplainPropertyText("MCP Server", &server, es);
                     ExplainPropertyText("MCP Tool", &tool, es);
@@ -120,6 +121,7 @@ fn show_semantic_cost(node: Node<'_>, es: &mut ExplainState<'_>) {
                 ExplainPropertyFloat("Semantic Provider Calls", None, est.provider_calls, 2, es);
                 ExplainPropertyFloat("Semantic HTTP Batches", None, est.http_batches, 2, es);
                 ExplainPropertyFloat("Semantic USD", None, est.usd, 8, es);
+                ExplainPropertyFloat("Semantic Worst USD", None, est.usd_worst, 8, es);
                 ExplainPropertyFloat("Semantic Latency", Some("ms"), est.latency_ms, 1, es);
                 if !est.model.is_empty() {
                     ExplainPropertyText("Semantic Model", &est.model, es);
@@ -193,10 +195,12 @@ fn show_semantic_totals(root: Node<'_>, es: &mut ExplainState<'_>) {
                 ExplainPropertyFloat("MCP Total Provider Calls", None, total.provider_calls, 2, es);
                 ExplainPropertyFloat("MCP Total Latency", Some("ms"), total.latency_ms, 1, es);
                 ExplainPropertyFloat("MCP Total USD", None, total.usd, 8, es);
+                ExplainPropertyFloat("MCP Worst Total USD", None, total.usd_worst, 8, es);
             } else {
                 ExplainPropertyFloat("Semantic Total Provider Calls", None, total.provider_calls, 2, es);
                 ExplainPropertyFloat("Semantic Total HTTP Batches", None, total.http_batches, 2, es);
                 ExplainPropertyFloat("Semantic Total USD", None, total.usd, 8, es);
+                ExplainPropertyFloat("Semantic Worst Total USD", None, total.usd_worst, 8, es);
                 ExplainPropertyFloat("Semantic Total Latency", Some("ms"), total.latency_ms, 1, es);
             }
         }

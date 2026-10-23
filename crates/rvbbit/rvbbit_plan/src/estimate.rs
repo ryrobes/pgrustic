@@ -19,6 +19,9 @@ pub struct Shown {
     /// HTTP batches. One batch carries up to `batch_rows` fan-out calls.
     pub http_batches: f64,
     pub usd: f64,
+    /// USD with the cache hit rate ignored. The cap uses this, so a miss
+    /// cannot spend more than the statement was allowed.
+    pub usd_worst: f64,
     pub latency_ms: f64,
     pub model: String,
     pub selectivity: f64,
@@ -30,16 +33,13 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
     let plan = node.as_plan()?;
     let rows = input_rows(node);
     let mut works = Vec::new();
-    if node.node_tag() == NodeTag::T_Result || node.node_tag() == NodeTag::T_Agg {
-        collect(node, &plan.qual, &mut works);
-        collect_tlist(&plan.targetlist, &mut works);
-    } else {
-        // A tool projected by a scan (VALUES, Seq Scan) never reaches a
-        // Result node. Cost those calls here. Semantic work stays on
-        // Result and Agg so a mixed plan is not charged twice.
-        collect_tlist(&plan.targetlist, &mut works);
-        works.retain(|w| w.op == Op::Mcp);
-    }
+    // Every plan node, after setrefs. A SELECT-list call stays on the scan.
+    // A WHERE MEANS/ABOUT lives on the Result qual. A project or decide call
+    // is only on the Result. Subplan bodies are costed from glob.subplans,
+    // not from a second walk of the expressions that point at them.
+    collect(node, &plan.qual, &mut works);
+    collect_tlist(&plan.targetlist, &mut works);
+    collect_extra(node, &mut works);
     if works.is_empty() {
         return None;
     }
@@ -47,6 +47,7 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
         provider_calls: 0.0,
         http_batches: 0.0,
         usd: 0.0,
+        usd_worst: 0.0,
         latency_ms: 0.0,
         model: String::new(),
         selectivity: 1.0,
@@ -84,6 +85,7 @@ pub fn node_estimate(node: Node<'_>) -> Option<Shown> {
     shown.provider_calls = est.items;
     shown.http_batches = est.calls;
     shown.usd = est.usd;
+    shown.usd_worst = est.usd_worst;
     shown.latency_ms = est.latency_ms;
     shown.model = est.model;
     if !shown.filters {
@@ -97,6 +99,7 @@ pub fn tree_estimate(node: Node<'_>) -> Option<Shown> {
         provider_calls: 0.0,
         http_batches: 0.0,
         usd: 0.0,
+        usd_worst: 0.0,
         latency_ms: 0.0,
         model: String::new(),
         selectivity: 1.0,
@@ -114,6 +117,7 @@ fn walk_tree(node: Node<'_>, total: &mut Shown, any: &mut bool) {
         total.provider_calls += one.provider_calls;
         total.http_batches += one.http_batches;
         total.usd += one.usd;
+        total.usd_worst += one.usd_worst;
         total.latency_ms += one.latency_ms;
         if total.model.is_empty() {
             total.model = one.model;
@@ -175,6 +179,74 @@ fn collect_tlist(tlist: &types_nodes::list::NodeList<'_>, out: &mut Vec<Found>) 
     }
 }
 
+/// Qualls and projections that are not on `Plan` itself. EXPLAIN-only
+/// copies (`indexqualorig`, `bitmapqualorig`) are skipped so a clause is
+/// not priced twice. Hash keys are the outer side of `hashclauses`.
+fn collect_extra(node: Node<'_>, out: &mut Vec<Found>) {
+    let in_agg = node.node_tag() == NodeTag::T_Agg;
+    if let Some(plan) = node.as_plan() {
+        collect_list(&plan.initPlan, true, in_agg, out);
+    }
+    if let Some(result) = node.as_result() {
+        if let Some(qual) = result.resconstantqual {
+            collect_expr(qual, true, in_agg, out);
+        }
+    }
+    if let Some(join) = node.as_nest_loop() {
+        collect_list(&join.join.joinqual, true, in_agg, out);
+        for param in join.nestParams.iter() {
+            if let Some(param) = param.as_nest_loop_param() {
+                collect_expr(param.paramval, true, in_agg, out);
+            }
+        }
+    }
+    if let Some(join) = node.as_hash_join() {
+        collect_list(&join.join.joinqual, true, in_agg, out);
+        collect_list(&join.hashclauses, true, in_agg, out);
+    }
+    if let Some(join) = node.as_merge_join() {
+        collect_list(&join.join.joinqual, true, in_agg, out);
+        collect_list(&join.mergeclauses, true, in_agg, out);
+    }
+    if let Some(scan) = node.as_index_scan() {
+        collect_list(&scan.indexqual, true, in_agg, out);
+        collect_list(&scan.indexorderby, true, in_agg, out);
+    }
+    if let Some(scan) = node.as_index_only_scan() {
+        collect_list(&scan.indexqual, true, in_agg, out);
+        collect_list(&scan.recheckqual, true, in_agg, out);
+        collect_list(&scan.indexorderby, true, in_agg, out);
+    }
+    if let Some(scan) = node.as_bitmap_index_scan() {
+        collect_list(&scan.indexqual, true, in_agg, out);
+    }
+    if let Some(scan) = node.as_tid_scan() {
+        collect_list(&scan.tidquals, true, in_agg, out);
+    }
+    if let Some(scan) = node.as_tid_range_scan() {
+        collect_list(&scan.tidrangequals, true, in_agg, out);
+    }
+    if let Some(scan) = node.as_function_scan() {
+        for func in scan.functions.iter() {
+            if let Some(expr) = func.as_range_tbl_function().and_then(|f| f.funcexpr) {
+                collect_expr(expr, false, in_agg, out);
+            }
+        }
+    }
+}
+
+fn collect_list(list: &types_nodes::list::NodeList<'_>, in_qual: bool, in_agg: bool, out: &mut Vec<Found>) {
+    for arg in list.iter() {
+        collect_expr(arg, in_qual, in_agg, out);
+    }
+}
+
+fn collect_opt(node: Option<Node<'_>>, in_qual: bool, in_agg: bool, out: &mut Vec<Found>) {
+    if let Some(node) = node {
+        collect_expr(node, in_qual, in_agg, out);
+    }
+}
+
 fn collect_expr(node: Node<'_>, in_qual: bool, in_agg: bool, out: &mut Vec<Found>) {
     match node.node_tag() {
         NodeTag::T_FuncExpr => {
@@ -191,9 +263,18 @@ fn collect_expr(node: Node<'_>, in_qual: bool, in_agg: bool, out: &mut Vec<Found
             if let Some(found) = found_agg(agg.aggfnoid) {
                 out.push(found);
             }
-            for arg in agg.args.iter() {
-                collect_expr(arg, in_qual, true, out);
-            }
+            collect_list(&agg.args, in_qual, true, out);
+            collect_list(&agg.aggdirectargs, in_qual, true, out);
+            collect_opt(agg.aggfilter, true, true, out);
+        }
+        NodeTag::T_WindowFunc => {
+            let win = node.as_window_func().expect("WindowFunc");
+            collect_list(&win.args, in_qual, in_agg, out);
+            collect_opt(win.aggfilter, true, in_agg, out);
+            collect_list(&win.runCondition, in_qual, in_agg, out);
+        }
+        NodeTag::T_WindowFuncRunCondition => {
+            collect_expr(node.as_window_func_run_condition().expect("WindowFuncRunCondition").arg, in_qual, in_agg, out);
         }
         NodeTag::T_TargetEntry => {
             if let Some(te) = node.as_target_entry() {
@@ -206,21 +287,143 @@ fn collect_expr(node: Node<'_>, in_qual: bool, in_agg: bool, out: &mut Vec<Found
         NodeTag::T_CoerceViaIO => {
             collect_expr(node.as_coerce_via_io().expect("CoerceViaIO").arg, in_qual, in_agg, out);
         }
+        NodeTag::T_ArrayCoerceExpr => {
+            let coerce = node.as_array_coerce_expr().expect("ArrayCoerce");
+            collect_expr(coerce.arg, in_qual, in_agg, out);
+            collect_opt(coerce.elemexpr, in_qual, in_agg, out);
+        }
+        NodeTag::T_ConvertRowtypeExpr => {
+            collect_expr(node.as_convert_rowtype_expr().expect("ConvertRowtype").arg, in_qual, in_agg, out);
+        }
+        NodeTag::T_CoerceToDomain => {
+            collect_expr(node.as_coerce_to_domain().expect("CoerceToDomain").arg, in_qual, in_agg, out);
+        }
+        NodeTag::T_CollateExpr => {
+            collect_expr(node.as_collate_expr().expect("Collate").arg, in_qual, in_agg, out);
+        }
+        NodeTag::T_FieldSelect => {
+            collect_expr(node.as_field_select().expect("FieldSelect").arg, in_qual, in_agg, out);
+        }
+        NodeTag::T_FieldStore => {
+            let store = node.as_field_store().expect("FieldStore");
+            collect_expr(store.arg, in_qual, in_agg, out);
+            collect_list(&store.newvals, in_qual, in_agg, out);
+        }
+        NodeTag::T_NamedArgExpr => {
+            collect_opt(node.as_named_arg_expr().expect("NamedArg").arg, in_qual, in_agg, out);
+        }
         NodeTag::T_OpExpr => {
-            for arg in node.as_op_expr().expect("OpExpr").args.iter() {
-                collect_expr(arg, in_qual, in_agg, out);
-            }
+            collect_list(&node.as_op_expr().expect("OpExpr").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_DistinctExpr => {
+            collect_list(&node.as_distinct_expr().expect("Distinct").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_NullIfExpr => {
+            collect_list(&node.as_null_if_expr().expect("NullIf").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_ScalarArrayOpExpr => {
+            collect_list(&node.as_scalar_array_op_expr().expect("ScalarArrayOp").args, in_qual, in_agg, out);
         }
         NodeTag::T_BoolExpr => {
-            for arg in node.as_bool_expr().expect("BoolExpr").args.iter() {
+            collect_list(&node.as_bool_expr().expect("BoolExpr").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_NullTest => {
+            collect_opt(node.as_null_test().expect("NullTest").arg, in_qual, in_agg, out);
+        }
+        NodeTag::T_BooleanTest => {
+            collect_opt(node.as_boolean_test().expect("BooleanTest").arg, in_qual, in_agg, out);
+        }
+        NodeTag::T_CaseExpr => {
+            let case = node.as_case_expr().expect("CaseExpr");
+            collect_opt(case.arg, in_qual, in_agg, out);
+            collect_list(&case.args, in_qual, in_agg, out);
+            collect_opt(case.defresult, in_qual, in_agg, out);
+        }
+        NodeTag::T_CaseWhen => {
+            let when = node.as_case_when().expect("CaseWhen");
+            collect_opt(when.expr, in_qual, in_agg, out);
+            collect_opt(when.result, in_qual, in_agg, out);
+        }
+        NodeTag::T_CoalesceExpr => {
+            collect_list(&node.as_coalesce_expr().expect("Coalesce").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_MinMaxExpr => {
+            collect_list(&node.as_min_max_expr().expect("MinMax").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_ArrayExpr => {
+            collect_list(&node.as_array_expr().expect("Array").elements, in_qual, in_agg, out);
+        }
+        NodeTag::T_RowExpr => {
+            collect_list(&node.as_row_expr().expect("Row").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_RowCompareExpr => {
+            let cmp = node.as_row_compare_expr().expect("RowCompare");
+            collect_list(&cmp.largs, in_qual, in_agg, out);
+            collect_list(&cmp.rargs, in_qual, in_agg, out);
+        }
+        NodeTag::T_SubscriptingRef => {
+            let sub = node.as_subscripting_ref().expect("Subscript");
+            for arg in sub.refupperindexpr.iter().flatten() {
                 collect_expr(arg, in_qual, in_agg, out);
             }
+            for arg in sub.reflowerindexpr.iter().flatten() {
+                collect_expr(arg, in_qual, in_agg, out);
+            }
+            collect_opt(sub.refexpr, in_qual, in_agg, out);
+            collect_opt(sub.refassgnexpr, in_qual, in_agg, out);
+        }
+        NodeTag::T_GroupingFunc => {
+            collect_list(&node.as_grouping_func().expect("GroupingFunc").args, in_qual, in_agg, out);
+        }
+        NodeTag::T_PlaceHolderVar => {
+            collect_expr(node.as_place_holder_var().expect("PlaceHolderVar").phexpr, in_qual, in_agg, out);
+        }
+        NodeTag::T_ReturningExpr => {
+            collect_expr(node.as_returning_expr().expect("Returning").retexpr, in_qual, in_agg, out);
+        }
+        NodeTag::T_SubPlan => {
+            // `plan_id` names a plan in glob.subplans. The planner costs
+            // that tree on its own. Walking it here would charge it twice.
+            let sub = node.as_sub_plan().expect("SubPlan");
+            collect_opt(sub.testexpr, in_qual, in_agg, out);
+            collect_list(&sub.args, in_qual, in_agg, out);
+        }
+        NodeTag::T_SubLink => {
+            collect_opt(node.as_sub_link().expect("SubLink").testexpr, in_qual, in_agg, out);
+        }
+        NodeTag::T_XmlExpr => {
+            let xml = node.as_xml_expr().expect("XmlExpr");
+            collect_list(&xml.args, in_qual, in_agg, out);
+            collect_list(&xml.named_args, in_qual, in_agg, out);
+        }
+        NodeTag::T_JsonExpr => {
+            let json = node.as_json_expr().expect("JsonExpr");
+            collect_opt(json.formatted_expr, in_qual, in_agg, out);
+            collect_opt(json.path_spec, in_qual, in_agg, out);
+            collect_list(&json.passing_values, in_qual, in_agg, out);
+            collect_opt(json.on_empty, in_qual, in_agg, out);
+            collect_opt(json.on_error, in_qual, in_agg, out);
+        }
+        NodeTag::T_JsonValueExpr => {
+            let json = node.as_json_value_expr().expect("JsonValue");
+            collect_opt(json.raw_expr, in_qual, in_agg, out);
+            collect_opt(json.formatted_expr, in_qual, in_agg, out);
+        }
+        NodeTag::T_JsonConstructorExpr => {
+            let json = node.as_json_constructor_expr().expect("JsonConstructor");
+            collect_list(&json.args, in_qual, in_agg, out);
+            collect_opt(json.func, in_qual, in_agg, out);
+            collect_opt(json.coercion, in_qual, in_agg, out);
+        }
+        NodeTag::T_JsonIsPredicate => {
+            collect_opt(node.as_json_is_predicate().expect("JsonIs").expr, in_qual, in_agg, out);
+        }
+        NodeTag::T_JsonBehavior => {
+            collect_opt(node.as_json_behavior().expect("JsonBehavior").expr, in_qual, in_agg, out);
         }
         NodeTag::T_List => {
             if let Some(list) = node.as_list() {
-                for arg in list.iter() {
-                    collect_expr(arg, in_qual, in_agg, out);
-                }
+                collect_list(&list, in_qual, in_agg, out);
             }
         }
         _ => {}
@@ -254,11 +457,17 @@ fn found_agg(oid: u32) -> Option<Found> {
 fn found_func(func: &FuncExpr<'_>, in_qual: bool, in_agg: bool) -> Option<Found> {
     let oid = func.funcid;
     if let Some(tool) = rvbbit_resolve::mcp_tool_by_oid(oid) {
+        let mut knobs = Knobs::default();
+        // Results are cached only when the tool is read-only and has a
+        // TTL. Anything else must not inherit a hit rate from history.
+        if !tool.read_only || tool.cache_ttl_ms == 0 {
+            knobs.cache_off = true;
+        }
         return Some(Found {
             op: Op::Mcp,
             model: format!("mcp:{}/{}", tool.server, tool.tool),
             per_row: 1.0,
-            knobs: Knobs::default(),
+            knobs,
             grouping: if tool.returns_table || in_agg { Grouping::PerGroup } else { Grouping::Batched },
             filters: false,
             unit_usd: tool.cost_usd,
@@ -642,6 +851,8 @@ pub fn apply_costs(node: Node<'_>) {
 }
 
 struct Frame {
+    /// Worst-case USD (cache hit rate ignored). `preflight` compares this
+    /// with `semantic.max_cost`, `semantic.budget`, and a clause BUDGET.
     usd: f64,
     budget: Option<f64>,
     unpriced: Vec<String>,
@@ -751,7 +962,7 @@ fn account(est: &Shown) {
     let Some(frame) = a.frames.last_mut() else {
         return;
     };
-    frame.usd += est.usd;
+    frame.usd += est.usd_worst;
     if let Some(b) = est.clause_budget {
         frame.budget = Some(frame.budget.map_or(b, |c| c.min(b)));
     }

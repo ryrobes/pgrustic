@@ -174,9 +174,29 @@ pub fn apply(cmd: Command) -> PgResult<()> {
             import(&server, &schema, limit.as_deref(), except.as_deref(), false)
         }
         Command::AlterMcpTool { schema, name, options } => alter(&schema, &name, &options),
+        Command::AlterMcpServer { name, cost_usd, drop_cost } => alter_server(&name, cost_usd.as_deref(), drop_cost),
         Command::RefreshMcpTools { server } => refresh(&server),
         other => Err(pg(format!("mcp catalog does not run {other:?}"))),
     }
+}
+
+fn alter_server(name: &str, cost_usd: Option<&str>, drop_cost: bool) -> PgResult<()> {
+    let price = if drop_cost {
+        None
+    } else {
+        parse_cost_usd(cost_usd.unwrap_or(""))?
+    };
+    let exists = scalar(&format!("SELECT 1 FROM mcp.server WHERE name = {}", qlit(name)))?.is_some();
+    if !exists {
+        return Err(pg(format!("MCP server \"{name}\" does not exist")));
+    }
+    exec(&format!(
+        "UPDATE mcp.server SET cost_usd = {} WHERE name = {}",
+        sql_f64(price),
+        qlit(name)
+    ))?;
+    let _ = load();
+    Ok(())
 }
 
 fn create_server(or_replace: bool, if_not_exists: bool, name: &str, options: &BTreeMap<String, String>) -> PgResult<()> {

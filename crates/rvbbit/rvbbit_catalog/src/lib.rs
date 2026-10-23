@@ -587,6 +587,7 @@ fn apply(cmd: Command) -> PgResult<()> {
         other @ (Command::CreateMcpServer { .. }
         | Command::ImportMcpTools { .. }
         | Command::AlterMcpTool { .. }
+        | Command::AlterMcpServer { .. }
         | Command::RefreshMcpTools { .. }) => mcp::apply(other),
     }
 }

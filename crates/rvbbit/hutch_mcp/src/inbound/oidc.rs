@@ -24,6 +24,10 @@ pub struct OidcConfig {
     pub client_id: String,
     pub client_secret: String,
     pub domains: Vec<String>,
+    /// When true, `domains` must contain the email's own domain.
+    /// `hd` does not satisfy the allowlist. Role mapping can still use `hd`
+    /// after the address has passed.
+    pub require_email_domain: bool,
     /// Button label. Google's preset says so; anything else says OIDC.
     pub label: String,
 }
@@ -35,6 +39,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
             .field("domains", &self.domains)
+            .field("require_email_domain", &self.require_email_domain)
             .field("label", &self.label)
             .finish()
     }
@@ -83,6 +88,7 @@ pub fn config_from_env() -> Option<OidcConfig> {
         std::env::var("RVBBIT_OIDC_CLIENT_ID").ok().as_deref(),
         std::env::var("RVBBIT_OIDC_CLIENT_SECRET").ok().as_deref(),
         std::env::var("RVBBIT_OIDC_DOMAINS").ok().as_deref(),
+        std::env::var("RVBBIT_OIDC_REQUIRE_EMAIL_DOMAIN").ok().as_deref(),
     )
 }
 
@@ -92,6 +98,7 @@ pub fn config_from_values(
     client_id: Option<&str>,
     client_secret: Option<&str>,
     domains: Option<&str>,
+    require_email_domain: Option<&str>,
 ) -> Option<OidcConfig> {
     let provider = provider.unwrap_or("").trim();
     let explicit = issuer.unwrap_or("").trim().trim_end_matches('/').to_string();
@@ -118,10 +125,26 @@ pub fn config_from_values(
         .map(|s| s.trim().trim_start_matches('@').to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect();
-    Some(OidcConfig { issuer, client_id, client_secret, domains, label: label.into() })
+    let require_email_domain = require_email_domain.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")
+    });
+    Some(OidcConfig {
+        issuer,
+        client_id,
+        client_secret,
+        domains,
+        require_email_domain,
+        label: label.into(),
+    })
 }
 
-pub fn resolve_role(email: &str, hd: Option<&str>, domains: &[String], maps: &[RoleMapping]) -> Result<MappedRole, String> {
+pub fn resolve_role(
+    email: &str,
+    hd: Option<&str>,
+    domains: &[String],
+    maps: &[RoleMapping],
+    require_email_domain: bool,
+) -> Result<MappedRole, String> {
     let email = email.trim().to_ascii_lowercase();
     let Some((local, domain)) = email.rsplit_once('@') else {
         return Err("id_token email is not an address".into());
@@ -131,9 +154,12 @@ pub fn resolve_role(email: &str, hd: Option<&str>, domains: &[String], maps: &[R
     }
     if !domains.is_empty() {
         let email_ok = domains.iter().any(|d| d.eq_ignore_ascii_case(domain));
-        let hd_ok = hd
-            .map(|h| domains.iter().any(|d| d.eq_ignore_ascii_case(h.trim())))
-            .unwrap_or(false);
+        // The default allowlist trusts `hd` by itself. `require_email_domain`
+        // keeps that claim for role mapping and ignores it for the gate.
+        let hd_ok = !require_email_domain
+            && hd
+                .map(|h| domains.iter().any(|d| d.eq_ignore_ascii_case(h.trim())))
+                .unwrap_or(false);
         if !email_ok && !hd_ok {
             return Err("email domain is not allowed".into());
         }
@@ -245,7 +271,13 @@ impl Oauth {
             return Err("email is not verified".into());
         }
         let maps = self.role_maps()?;
-        let mapped = resolve_role(&claims.email, claims.hd.as_deref(), &cfg.domains, &maps)?;
+        let mapped = resolve_role(
+            &claims.email,
+            claims.hd.as_deref(),
+            &cfg.domains,
+            &maps,
+            cfg.require_email_domain,
+        )?;
         if !super::oauth::ident_ok(&mapped.role) {
             return Err("mapped role is not an identifier".into());
         }
@@ -532,14 +564,16 @@ mod tests {
 
     #[test]
     fn google_preset_and_domain_list() {
-        let cfg = config_from_values(Some("google"), None, Some("client"), Some("secret"), Some("Example.com, acme.com")).unwrap();
+        let cfg = config_from_values(Some("google"), None, Some("client"), Some("secret"), Some("Example.com, acme.com"), None).unwrap();
         assert_eq!(cfg.issuer, GOOGLE_ISSUER);
         assert_eq!(cfg.label, "Google");
+        assert!(!cfg.require_email_domain);
         assert_eq!(cfg.domains, vec!["example.com".to_string(), "acme.com".to_string()]);
-        let explicit = config_from_values(None, Some("http://127.0.0.1:9/"), Some("id"), Some("sec"), None).unwrap();
+        let explicit = config_from_values(None, Some("http://127.0.0.1:9/"), Some("id"), Some("sec"), None, Some("yes")).unwrap();
         assert_eq!(explicit.issuer, "http://127.0.0.1:9");
         assert_eq!(explicit.label, "OIDC");
-        assert!(config_from_values(Some("google"), None, Some(""), Some("secret"), None).is_none());
+        assert!(explicit.require_email_domain);
+        assert!(config_from_values(Some("google"), None, Some(""), Some("secret"), None, None).is_none());
     }
 
     #[test]
@@ -548,19 +582,26 @@ mod tests {
             RoleMapping { claim: "email".into(), value: "ada@example.com".into(), role: "analyst".into(), read_only: true },
             RoleMapping { claim: "hd".into(), value: "example.com".into(), role: "intern".into(), read_only: false },
         ];
-        let email = resolve_role("Ada@Example.com", Some("example.com"), &[], &maps).unwrap();
+        let email = resolve_role("Ada@Example.com", Some("example.com"), &[], &maps, false).unwrap();
         assert_eq!(email.role, "analyst");
         assert!(email.read_only);
         assert_eq!(email.subject, "ada@example.com");
-        let hd = resolve_role("other@example.com", Some("Example.com"), &[], &maps).unwrap();
+        let hd = resolve_role("other@example.com", Some("Example.com"), &[], &maps, false).unwrap();
         assert_eq!(hd.role, "intern");
         assert!(!hd.read_only);
-        let denied = resolve_role("ada@elsewhere.test", Some("elsewhere.test"), &[], &maps).unwrap_err();
+        let denied = resolve_role("ada@elsewhere.test", Some("elsewhere.test"), &[], &maps, false).unwrap_err();
         assert!(denied.contains("no role mapping"), "{denied}");
-        let domain = resolve_role("ada@example.com", None, &["acme.com".into()], &maps).unwrap_err();
+        let domain = resolve_role("ada@example.com", None, &["acme.com".into()], &maps, false).unwrap_err();
         assert!(domain.contains("not allowed"), "{domain}");
-        let allowed = resolve_role("other@example.com", Some("example.com"), &["example.com".into()], &maps).unwrap();
+        let allowed = resolve_role("other@example.com", Some("example.com"), &["example.com".into()], &maps, false).unwrap();
         assert_eq!(allowed.role, "intern");
+        // `hd` alone satisfies the allowlist unless the email domain is required.
+        let hd_only = resolve_role("foreign@other.test", Some("example.com"), &["example.com".into()], &maps, false).unwrap();
+        assert_eq!(hd_only.role, "intern");
+        let strict = resolve_role("foreign@other.test", Some("example.com"), &["example.com".into()], &maps, true).unwrap_err();
+        assert!(strict.contains("not allowed"), "{strict}");
+        let still = resolve_role("ada@example.com", Some("other.test"), &["example.com".into()], &maps, true).unwrap();
+        assert_eq!(still.role, "analyst");
     }
 
     #[test]
@@ -613,7 +654,7 @@ mod tests {
 
     #[test]
     fn config_debug_hides_the_secret() {
-        let cfg = config_from_values(Some("google"), None, Some("client"), Some("super-secret"), None).unwrap();
+        let cfg = config_from_values(Some("google"), None, Some("client"), Some("super-secret"), None, None).unwrap();
         let text = format!("{cfg:?}");
         assert!(text.contains("<redacted>"), "{text}");
         assert!(!text.contains("super-secret"), "{text}");

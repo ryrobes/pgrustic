@@ -74,11 +74,32 @@ the tool's schema hash.
 `cost_usd` is USD per tool call. A tool value overrides the server
 default from `CREATE SERVER ... OPTIONS (cost_usd '0.001')`.
 `cost_usd 'default'` clears the tool price so the server default
-applies again. Unpriced tools cost 0. `SET semantic.mcp_require_price
+applies again. Change the server price without rewriting the rest of
+the server:
+
+```sql
+ALTER SERVER demo OPTIONS (SET cost_usd '0.001');
+ALTER SERVER demo OPTIONS (ADD cost_usd '0.001');
+ALTER SERVER demo OPTIONS (DROP cost_usd);
+```
+
+`SET` and `ADD` store the price. `DROP` sets it back to NULL. The server
+is the `mcp.server` row. It does not have to exist in `pg_foreign_server`.
+A missing name is `MCP server "demo" does not exist`.
+
+Unpriced tools cost 0. `SET semantic.mcp_require_price
 = 'on'` rejects a call that has neither price. A cache hit costs 0 and
-records the avoided charge in `cost_saved`. `semantic.max_cost` and an
-inbound token cap include this estimate: `EXPLAIN` shows `MCP USD`, and
-a statement whose estimate is over the cap errors before the tool runs.
+records the avoided charge in `cost_saved`. Results are cached only when
+`read_only` is set and `cache_ttl` is greater than 0. A tool that cannot
+cache is not discounted by an older hit rate.
+
+`semantic.max_cost`, `semantic.budget`, a clause `BUDGET`, and an inbound
+token cap use the worst case: every call is a miss. `EXPLAIN` still shows
+the expected cost (`MCP USD`, `Semantic USD`, and the `Total USD` lines)
+and the worst case beside it (`MCP Worst USD`, `Semantic Worst USD`,
+`MCP Worst Total USD`, `Semantic Worst Total USD`). A statement whose
+worst case is over the cap errors before the tool runs. The inbound
+`validate_sql` / `run_sql` cap reads the larger total.
 
 `REFRESH` lists the server again and raises a notice with
 `unchanged`, `added`, `changed`, and `removed`. A changed hash drops

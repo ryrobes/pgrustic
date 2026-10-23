@@ -101,6 +101,19 @@ impl Stats {
 
     fn calls_json(&self, limit: usize) -> String {
         let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        if log.is_empty() && seed_hits() {
+            // 3 hits and 2 misses of predict/jev: hit rate 0.60. The cost
+            // cap regress uses this so EXPLAIN's expected USD is below the
+            // worst case before any real call. `/stats` stays at zero.
+            return r#"{"calls":[
+                {"op":"predict","model":"jev","cost_usd":0,"latency_ms":1,"cache":"hit"},
+                {"op":"predict","model":"jev","cost_usd":0,"latency_ms":1,"cache":"hit"},
+                {"op":"predict","model":"jev","cost_usd":0,"latency_ms":1,"cache":"hit"},
+                {"op":"predict","model":"jev","cost_usd":0.0000126,"latency_ms":50,"cache":"miss"},
+                {"op":"predict","model":"jev","cost_usd":0.0000126,"latency_ms":50,"cache":"miss"}
+            ]}"#
+                .to_string();
+        }
         let start = log.len().saturating_sub(limit);
         serde_json::json!({ "calls": &log[start..] }).to_string()
     }
@@ -277,6 +290,12 @@ fn is_operation(path: &str) -> bool {
         "/v1/predict" | "/v1/classify" | "/v1/extract" | "/v1/embed" | "/v1/rerank" | "/v1/decide"
             | "/v1/means"
     )
+}
+
+fn seed_hits() -> bool {
+    std::env::var("RVBBIT_MOCK_SEED_HITS").ok().is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")
+    })
 }
 
 fn path_only(path: &str) -> &str {
